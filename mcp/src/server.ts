@@ -274,6 +274,77 @@ const geometraWaitForResumeParseInputSchema = z
   .strict()
 
 const timeoutMsInput = z.number().int().min(50).max(60_000).optional()
+const HOST_SAFE_TOOL_TIMEOUT_MS = 20_000
+const HOST_SAFE_TIMEOUT_RESERVE_MS = 750
+const HOST_SAFE_REVEAL_TIMEOUT_MS = 8_000
+const MIN_ACTION_TIMEOUT_MS = 50
+
+function softTimeoutMsInput() {
+  return z
+    .number()
+    .int()
+    .min(1_000)
+    .max(55_000)
+    .optional()
+    .default(HOST_SAFE_TOOL_TIMEOUT_MS)
+    .describe(
+      'Server-side soft deadline for this MCP call. When reached, the tool returns partial progress plus a resume hint before the MCP host request deadline can kill the call.',
+    )
+}
+
+function remainingUntil(deadlineAt: number): number {
+  return Math.max(0, Math.floor(deadlineAt - performance.now()))
+}
+
+function hasSoftBudget(deadlineAt: number, reserveMs = HOST_SAFE_TIMEOUT_RESERVE_MS): boolean {
+  return remainingUntil(deadlineAt) > reserveMs
+}
+
+function timeoutCapFromDeadline(deadlineAt: number, reserveMs = HOST_SAFE_TIMEOUT_RESERVE_MS): number {
+  return Math.max(MIN_ACTION_TIMEOUT_MS, remainingUntil(deadlineAt) - reserveMs)
+}
+
+function capTimeoutMs(timeoutMs: number | undefined, capMs: number, fallbackMs: number): number {
+  return Math.max(MIN_ACTION_TIMEOUT_MS, Math.min(timeoutMs ?? fallbackMs, Math.max(MIN_ACTION_TIMEOUT_MS, Math.floor(capMs))))
+}
+
+function capFillFieldTimeout<T extends FillFieldInput | ResolvedFillFieldInput>(field: T, capMs: number, fallbackMs = 5_000): T {
+  return {
+    ...field,
+    timeoutMs: capTimeoutMs(field.timeoutMs, capMs, fallbackMs),
+  } as T
+}
+
+function capBatchActionTimeouts(action: BatchAction, capMs: number): BatchAction {
+  switch (action.type) {
+    case 'click':
+      return {
+        ...action,
+        timeoutMs: capTimeoutMs(action.timeoutMs, capMs, 5_000),
+        revealTimeoutMs: capTimeoutMs(action.revealTimeoutMs, capMs, 2_500),
+        ...(action.waitFor ? { waitFor: { ...action.waitFor, timeoutMs: capTimeoutMs(action.waitFor.timeoutMs, capMs, 10_000) } } : {}),
+      }
+    case 'type':
+    case 'key':
+    case 'select_option':
+    case 'set_checked':
+    case 'wheel':
+      return { ...action, timeoutMs: capTimeoutMs(action.timeoutMs, capMs, 5_000) }
+    case 'upload_files':
+      return { ...action, timeoutMs: capTimeoutMs(action.timeoutMs, capMs, 8_000) }
+    case 'pick_listbox_option':
+      return { ...action, timeoutMs: capTimeoutMs(action.timeoutMs, capMs, 4_500) }
+    case 'wait_for':
+      return { ...action, timeoutMs: capTimeoutMs(action.timeoutMs, capMs, 10_000) }
+    case 'fill_fields':
+      return {
+        ...action,
+        fields: action.fields.map(field => capFillFieldTimeout(field, capMs)),
+      }
+    case 'expand_section':
+      return action
+  }
+}
 
 const fillFieldSchema = z.union([
   z.object({
@@ -1501,11 +1572,15 @@ Pass \`pageUrl\`/\`url\` to auto-connect in the same call — use \`isolated: tr
       submitTimeoutMs: z.number().int().min(50).max(60_000).optional().default(15_000).describe('Action wait timeout for the submit click (default 15000ms). Increase for slow backends.'),
       waitFor: z.object(waitConditionShape()).optional().describe('Optional semantic condition to wait for after the submit click (success banner, navigation, submit gone, etc.)'),
       skipFill: z.boolean().optional().default(false).describe('Skip the fill phase and go straight to submit+wait. Use when values have already been filled by a previous call.'),
+      softTimeoutMs: softTimeoutMsInput(),
       failOnInvalid: z.boolean().optional().default(false).describe('Return an error if invalid fields remain after the submit wait resolves.'),
       detail: detailInput(),
       sessionId: sessionIdInput,
     },
-    async ({ url, pageUrl, port, headless, width, height, slowMo, isolated, formId, valuesById, valuesByLabel, submit, submitIndex, submitTimeoutMs, waitFor, skipFill, failOnInvalid, detail, sessionId }) => {
+    async ({ url, pageUrl, port, headless, width, height, slowMo, isolated, formId, valuesById, valuesByLabel, submit, submitIndex, submitTimeoutMs, waitFor, skipFill, softTimeoutMs, failOnInvalid, detail, sessionId }) => {
+      const toolStartedAt = performance.now()
+      const effectiveSoftTimeoutMs = softTimeoutMs ?? HOST_SAFE_TOOL_TIMEOUT_MS
+      const deadlineAt = toolStartedAt + effectiveSoftTimeoutMs
       const resolved = await ensureToolSession(
         { sessionId, url, pageUrl, port, headless, width, height, slowMo, isolated },
         'Not connected. Call geometra_connect first, or pass pageUrl/url to geometra_submit_form.',
@@ -1513,16 +1588,36 @@ Pass \`pageUrl\`/\`url\` to auto-connect in the same call — use \`isolated: tr
       if (!resolved.ok) return err(resolved.error)
       const session = resolved.session
       const connection = autoConnectionPayload(resolved)
+      let fillSummary: Record<string, unknown> | undefined
+      let fillFallback: { attempted: true; used: true; reason: 'batched-threw'; attempts: number } | undefined
+      const pausedPayload = (phase: string, resumeHint?: Record<string, unknown>, extra?: Record<string, unknown>): Record<string, unknown> => ({
+        ...connection,
+        completed: false,
+        paused: true,
+        phase,
+        pauseReason: 'soft-timeout',
+        softTimeoutMs: effectiveSoftTimeoutMs,
+        elapsedMs: Number((performance.now() - toolStartedAt).toFixed(1)),
+        ...(resumeHint ? { resumeHint } : {}),
+        ...(fillSummary ? { fill: fillSummary } : {}),
+        ...(fillFallback ? { fill_fallback: fillFallback } : {}),
+        ...(extra ?? {}),
+      })
 
       if (!session.tree || !session.layout) {
-        await waitForUiCondition(session, () => Boolean(session.tree && session.layout), 2_000)
+        await waitForUiCondition(
+          session,
+          () => Boolean(session.tree && session.layout),
+          capTimeoutMs(2_000, timeoutCapFromDeadline(deadlineAt), 2_000),
+        )
       }
       const entryA11y = sessionA11y(session)
       if (!entryA11y) return err('No UI tree available for form submission')
       const entryUrl = entryA11y.meta?.pageUrl
+      if (!hasSoftBudget(deadlineAt)) {
+        return ok(JSON.stringify(pausedPayload('before-fill', { retrySameCall: true }), null, detail === 'verbose' ? 2 : undefined))
+      }
 
-      let fillSummary: Record<string, unknown> | undefined
-      let fillFallback: { attempted: true; used: true; reason: 'batched-threw'; attempts: number } | undefined
       if (!skipFill) {
         const entryCount = Object.keys(valuesById ?? {}).length + Object.keys(valuesByLabel ?? {}).length
         if (entryCount === 0) {
@@ -1542,15 +1637,29 @@ Pass \`pageUrl\`/\`url\` to auto-connect in the same call — use \`isolated: tr
         let usedBatch = true
         try {
           const startRevision = session.updateRevision
-          const wait = await sendFillFields(session, planned.fields)
+          const wait = await sendFillFields(
+            session,
+            planned.fields.map(field => capFillFieldTimeout(field, timeoutCapFromDeadline(deadlineAt))),
+            capTimeoutMs(undefined, timeoutCapFromDeadline(deadlineAt), HOST_SAFE_TOOL_TIMEOUT_MS),
+          )
           const ack = parseProxyFillAckResult(wait.result)
           await waitForDeferredBatchUpdate(session, startRevision, wait)
           fillSummary = {
             formId: schema.formId,
             execution: 'batched',
             fieldCount: planned.fields.length,
+            ...waitStatusPayload(wait),
             ...(ack ? { invalidCount: ack.invalidCount, alertCount: ack.alertCount } : {}),
             ...(entryCount !== planned.fields.length ? { requestedValueCount: entryCount } : {}),
+          }
+          if (wait.status === 'timed_out') {
+            return ok(JSON.stringify(pausedPayload('fill', {
+              tool: 'geometra_submit_form',
+              skipFill: true,
+              submit: submit ?? { role: 'button', name: 'Submit' },
+              submitIndex,
+              ...(waitFor ? { waitFor } : {}),
+            }), null, detail === 'verbose' ? 2 : undefined))
           }
         } catch (e) {
           if (!canFallbackToSequentialFill(e)) {
@@ -1565,8 +1674,24 @@ Pass \`pageUrl\`/\`url\` to auto-connect in the same call — use \`isolated: tr
           let successCount = 0
           let firstErr: string | undefined
           for (const field of planned.fields) {
+            if (!hasSoftBudget(deadlineAt)) {
+              fillSummary = {
+                formId: schema.formId,
+                execution: 'sequential',
+                fieldCount: planned.fields.length,
+                successCount,
+                ...(entryCount !== planned.fields.length ? { requestedValueCount: entryCount } : {}),
+              }
+              return ok(JSON.stringify(pausedPayload('fill', {
+                tool: 'geometra_submit_form',
+                skipFill: true,
+                submit: submit ?? { role: 'button', name: 'Submit' },
+                submitIndex,
+                ...(waitFor ? { waitFor } : {}),
+              }), null, detail === 'verbose' ? 2 : undefined))
+            }
             try {
-              await executeFillField(session, field, detail)
+              await executeFillField(session, capFillFieldTimeout(field, timeoutCapFromDeadline(deadlineAt)), detail)
               successCount += 1
             } catch (e) {
               firstErr = e instanceof Error ? e.message : String(e)
@@ -1586,12 +1711,23 @@ Pass \`pageUrl\`/\`url\` to auto-connect in the same call — use \`isolated: tr
         }
       }
 
+      const submitResumeHint = {
+        tool: 'geometra_submit_form',
+        skipFill: true,
+        submit: submit ?? { role: 'button', name: 'Submit' },
+        submitIndex,
+        ...(waitFor ? { waitFor } : {}),
+      }
+      if (!hasSoftBudget(deadlineAt)) {
+        return ok(JSON.stringify(pausedPayload('submit', submitResumeHint), null, detail === 'verbose' ? 2 : undefined))
+      }
+
       const submitFilter: NodeFilter = submit ?? { role: 'button', name: 'Submit' }
       const resolvedClick = await resolveClickLocationWithFallback(session, {
         filter: submitFilter,
         index: submitIndex,
         fullyVisible: true,
-        revealTimeoutMs: 2_500,
+        revealTimeoutMs: capTimeoutMs(2_500, timeoutCapFromDeadline(deadlineAt), 2_500),
       })
       if (!resolvedClick.ok) {
         const payload = {
@@ -1605,11 +1741,50 @@ Pass \`pageUrl\`/\`url\` to auto-connect in the same call — use \`isolated: tr
         return err(JSON.stringify(payload, null, detail === 'verbose' ? 2 : undefined))
       }
 
+      if (!hasSoftBudget(deadlineAt)) {
+        return ok(JSON.stringify(pausedPayload('submit', submitResumeHint), null, detail === 'verbose' ? 2 : undefined))
+      }
       const beforeSubmit = sessionA11y(session)
-      const clickWait = await sendClick(session, resolvedClick.value.x, resolvedClick.value.y, submitTimeoutMs)
+      const clickWait = await sendClick(
+        session,
+        resolvedClick.value.x,
+        resolvedClick.value.y,
+        capTimeoutMs(submitTimeoutMs, timeoutCapFromDeadline(deadlineAt), 15_000),
+      )
 
       let waitResult: WaitConditionResult | undefined
       if (waitFor) {
+        if (!hasSoftBudget(deadlineAt)) {
+          return ok(JSON.stringify(pausedPayload('wait_for', {
+            tool: 'geometra_wait_for',
+            filter: compactFilterPayload({
+              id: waitFor.id,
+              role: waitFor.role,
+              name: waitFor.name,
+              text: waitFor.text,
+              contextText: waitFor.contextText,
+              promptText: waitFor.promptText,
+              sectionText: waitFor.sectionText,
+              itemText: waitFor.itemText,
+              value: waitFor.value,
+              checked: waitFor.checked,
+              disabled: waitFor.disabled,
+              focused: waitFor.focused,
+              selected: waitFor.selected,
+              expanded: waitFor.expanded,
+              invalid: waitFor.invalid,
+              required: waitFor.required,
+              busy: waitFor.busy,
+            }),
+            present: waitFor.present ?? true,
+          }, {
+            submit: {
+              at: { x: resolvedClick.value.x, y: resolvedClick.value.y },
+              ...(resolvedClick.value.target ? { target: compactNodeReference(resolvedClick.value.target) } : {}),
+              ...waitStatusPayload(clickWait),
+            },
+          }), null, detail === 'verbose' ? 2 : undefined))
+        }
         const postWait = await waitForSemanticCondition(session, {
           filter: {
             id: waitFor.id,
@@ -1631,7 +1806,7 @@ Pass \`pageUrl\`/\`url\` to auto-connect in the same call — use \`isolated: tr
             busy: waitFor.busy,
           },
           present: waitFor.present ?? true,
-          timeoutMs: waitFor.timeoutMs ?? 15_000,
+          timeoutMs: capTimeoutMs(waitFor.timeoutMs, timeoutCapFromDeadline(deadlineAt), 15_000),
         })
         if (!postWait.ok) {
           const preErrFallbacks: Array<Record<string, unknown>> = []
@@ -1725,6 +1900,14 @@ Supported step types: \`click\`, \`type\`, \`key\`, \`upload_files\`, \`pick_lis
         .default(false)
         .describe('When auto-connecting via pageUrl/url, request an isolated proxy. See geometra_connect for details.'),
       actions: z.array(batchActionSchema).min(1).max(80).describe('Ordered high-level action steps to run sequentially'),
+      resumeFromIndex: z
+        .number()
+        .int()
+        .min(0)
+        .optional()
+        .default(0)
+        .describe('Resume a previous partial geometra_run_actions result from this action index. Use the returned resumeFromIndex when a call pauses.'),
+      softTimeoutMs: softTimeoutMsInput(),
       stopOnError: z.boolean().optional().default(true).describe('Stop at the first failing step (default true)'),
       includeSteps: z
         .boolean()
@@ -1735,7 +1918,10 @@ Supported step types: \`click\`, \`type\`, \`key\`, \`upload_files\`, \`pick_lis
       detail: detailInput(),
       sessionId: sessionIdInput,
     },
-    async ({ url, pageUrl, port, headless, width, height, slowMo, isolated, actions, stopOnError, includeSteps, output, detail, sessionId }) => {
+    async ({ url, pageUrl, port, headless, width, height, slowMo, isolated, actions, resumeFromIndex, softTimeoutMs, stopOnError, includeSteps, output, detail, sessionId }) => {
+      const toolStartedAt = performance.now()
+      const effectiveSoftTimeoutMs = softTimeoutMs ?? HOST_SAFE_TOOL_TIMEOUT_MS
+      const deadlineAt = toolStartedAt + effectiveSoftTimeoutMs
       const resolved = await ensureToolSession(
         {
           sessionId,
@@ -1754,24 +1940,42 @@ Supported step types: \`click\`, \`type\`, \`key\`, \`upload_files\`, \`pick_lis
       if (!resolved.ok) return err(resolved.error)
       const session = resolved.session
       const connection = autoConnectionPayload(resolved)
+      const startIndex = resumeFromIndex ?? 0
+      if (startIndex > actions.length) {
+        return err(`resumeFromIndex ${startIndex} exceeds actions length ${actions.length}`)
+      }
 
       const steps: Array<Record<string, unknown>> = []
       let stoppedAt: number | undefined
+      let pausedAt: number | undefined
       const batchStartedAt = performance.now()
       // Collect transparent-fallback signals from each step so run_actions
       // surfaces them at top level regardless of `includeSteps` — otherwise
       // the telemetry is dead code when callers opt out of the steps listing.
       const fallbackRecords: Array<{ stepIndex: number; type: string; attempted: true; used: true; reason: string; attempts: number }> = []
 
-      for (let index = 0; index < actions.length; index++) {
-        const action = actions[index]!
+      for (let index = startIndex; index < actions.length; index++) {
+        if (!hasSoftBudget(deadlineAt)) {
+          pausedAt = index
+          break
+        }
+
+        const action = capBatchActionTimeouts(actions[index]!, timeoutCapFromDeadline(deadlineAt))
         const startedAt = performance.now()
         let uiTreeWaitMs = 0
         try {
           if (actionNeedsUiTree(action) && (!session.tree || !session.layout)) {
             const uiTreeWaitStartedAt = performance.now()
-            await waitForUiCondition(session, () => Boolean(session.tree && session.layout), 2_000)
+            await waitForUiCondition(
+              session,
+              () => Boolean(session.tree && session.layout),
+              capTimeoutMs(2_000, timeoutCapFromDeadline(deadlineAt), 2_000),
+            )
             uiTreeWaitMs = performance.now() - uiTreeWaitStartedAt
+          }
+          if (!hasSoftBudget(deadlineAt)) {
+            pausedAt = index
+            break
           }
           const result = await executeBatchAction(session, action, detail, includeSteps)
           const stepFallback = (result.compact as { fallback?: { attempted: true; used: true; reason: string; attempts: number } }).fallback
@@ -1816,6 +2020,10 @@ Supported step types: \`click\`, \`type\`, \`key\`, \`upload_files\`, \`pick_lis
                 ...result.compact,
                 ...(stepSignals ? { signals: stepSignals } : {}),
               })
+          if (index + 1 < actions.length && !hasSoftBudget(deadlineAt)) {
+            pausedAt = index + 1
+            break
+          }
         } catch (e) {
           const message = e instanceof Error ? e.message : String(e)
           const elapsedMs = Number((performance.now() - startedAt).toFixed(1))
@@ -1839,20 +2047,37 @@ Supported step types: \`click\`, \`type\`, \`key\`, \`upload_files\`, \`pick_lis
       const after = sessionA11y(session)
       const successCount = steps.filter(step => step.ok === true).length
       const errorCount = steps.length - successCount
+      const elapsedMs = Number((performance.now() - toolStartedAt).toFixed(1))
+      const completed = stoppedAt === undefined && pausedAt === undefined && startIndex + steps.length >= actions.length
+      const resumePayload = {
+        ...(startIndex > 0 ? { resumedFromIndex: startIndex } : {}),
+        ...(pausedAt !== undefined
+          ? {
+              paused: true,
+              pausedAt,
+              resumeFromIndex: pausedAt,
+              pauseReason: 'soft-timeout',
+              softTimeoutMs: effectiveSoftTimeoutMs,
+              elapsedMs,
+            }
+          : {}),
+      }
       const payload = output === 'final'
         ? {
             ...connection,
-            completed: stoppedAt === undefined && steps.length === actions.length,
+            completed,
+            ...resumePayload,
             ...(stoppedAt !== undefined ? { stoppedAt } : {}),
             ...(fallbackRecords.length > 0 ? { fallbacks: fallbackRecords } : {}),
             ...(after ? { final: sessionSignalsPayload(collectSessionSignals(after), detail) } : {}),
           }
         : {
             ...connection,
-            completed: stoppedAt === undefined && steps.length === actions.length,
+            completed,
             stepCount: actions.length,
             successCount,
             errorCount,
+            ...resumePayload,
             ...(includeSteps ? { steps } : {}),
             ...(stoppedAt !== undefined ? { stoppedAt } : {}),
             ...(fallbackRecords.length > 0 ? { fallbacks: fallbackRecords } : {}),
@@ -3597,13 +3822,25 @@ async function revealSemanticTarget(
     timeoutMs: number
   },
 ): Promise<{ ok: true; value: RevealTargetResult } | { ok: false; error: string }> {
-  const initialTreeReady = await ensureSessionUiTree(session, Math.max(4_000, options.timeoutMs))
+  const revealStartedAt = performance.now()
+  const revealDeadlineAt = revealStartedAt + HOST_SAFE_REVEAL_TIMEOUT_MS
+  const initialTreeReady = await ensureSessionUiTree(
+    session,
+    capTimeoutMs(Math.max(4_000, options.timeoutMs), timeoutCapFromDeadline(revealDeadlineAt, 100), HOST_SAFE_REVEAL_TIMEOUT_MS),
+  )
   if (!initialTreeReady) {
     return { ok: false, error: 'Timed out waiting for the initial UI tree after connect.' }
   }
   let attempts = 0
   let stepBudget = options.maxSteps
   while (attempts <= (stepBudget ?? 48)) {
+    if (!hasSoftBudget(revealDeadlineAt, 100)) {
+      return {
+        ok: false,
+        error: `Reveal exceeded the host-safe ${HOST_SAFE_REVEAL_TIMEOUT_MS}ms budget after ${attempts} step(s). Retry with a more specific filter/id or reveal the target in smaller geometra_scroll_to calls.`,
+      }
+    }
+
     const a11y = sessionA11y(session)
     if (!a11y) return { ok: false, error: 'No UI tree available to reveal from' }
 
@@ -3661,7 +3898,7 @@ async function revealSemanticTarget(
       deltaX,
       x: formatted.center.x,
       y: formatted.center.y,
-    }, options.timeoutMs)
+    }, capTimeoutMs(options.timeoutMs, timeoutCapFromDeadline(revealDeadlineAt, 100), 2_500))
     attempts++
   }
 

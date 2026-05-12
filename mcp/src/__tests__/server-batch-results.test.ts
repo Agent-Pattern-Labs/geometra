@@ -345,6 +345,39 @@ describe('batch MCP result shaping', () => {
     expect((final.alerts as unknown[]).length).toBe(1)
   })
 
+  it('caps run_actions step timeouts under the soft deadline and resumes from an action index', async () => {
+    const handler = getToolHandler('geometra_run_actions')
+
+    const result = await handler({
+      actions: [
+        { type: 'click', x: 10, y: 20, timeoutMs: 60_000 },
+        { type: 'click', x: 30, y: 40, timeoutMs: 60_000 },
+      ],
+      resumeFromIndex: 1,
+      softTimeoutMs: 1_000,
+      includeSteps: true,
+      detail: 'terse',
+    })
+
+    expect(mockState.sendClick).toHaveBeenCalledTimes(1)
+    const call = mockState.sendClick.mock.calls[0]!
+    expect(call[1]).toBe(30)
+    expect(call[2]).toBe(40)
+    expect(call[3]).toBeGreaterThanOrEqual(50)
+    expect(call[3]).toBeLessThanOrEqual(300)
+
+    const payload = JSON.parse(result.content[0]!.text) as Record<string, unknown>
+    const steps = payload.steps as Array<Record<string, unknown>>
+    expect(payload).toMatchObject({
+      completed: true,
+      resumedFromIndex: 1,
+      stepCount: 2,
+      successCount: 1,
+      errorCount: 0,
+    })
+    expect(steps[0]).toMatchObject({ index: 1, type: 'click', ok: true })
+  })
+
   it('uses the proxy batch path for fill_fields when step output is omitted', async () => {
     const handler = getToolHandler('geometra_fill_fields')
 
@@ -431,6 +464,38 @@ describe('batch MCP result shaping', () => {
     })
     expect(payload).not.toHaveProperty('steps')
     expect(payload).not.toHaveProperty('stepCount')
+  })
+
+  it('caps submit_form submit clicks under the soft deadline', async () => {
+    const handler = getToolHandler('geometra_submit_form')
+
+    mockState.currentA11yRoot = node('group', undefined, {
+      bounds: { x: 0, y: 0, width: 1280, height: 720 },
+      meta: { pageUrl: 'https://jobs.example.com/application', scrollX: 0, scrollY: 0 },
+      children: [
+        node('button', 'Submit', { path: [0], bounds: { x: 100, y: 180, width: 120, height: 40 } }),
+      ],
+    })
+
+    const result = await handler({
+      skipFill: true,
+      submitTimeoutMs: 60_000,
+      softTimeoutMs: 1_000,
+      detail: 'terse',
+    })
+
+    expect(mockState.sendClick).toHaveBeenCalledTimes(1)
+    const call = mockState.sendClick.mock.calls[0]!
+    expect(call[1]).toBe(160)
+    expect(call[2]).toBe(200)
+    expect(call[3]).toBeGreaterThanOrEqual(50)
+    expect(call[3]).toBeLessThanOrEqual(300)
+
+    const payload = JSON.parse(result.content[0]!.text) as Record<string, unknown>
+    expect(payload).toMatchObject({
+      completed: true,
+      submit: { wait: 'updated' },
+    })
   })
 
   it('attaches verifyFills readback results to run_actions fill_fields step', async () => {
@@ -1922,7 +1987,7 @@ describe('query and reveal tools', () => {
     const steps = payload.steps as Array<Record<string, unknown>>
 
     expect(mockState.sendWheel).toHaveBeenCalledTimes(1)
-    expect(mockState.sendClick).toHaveBeenCalledWith(mockState.session, 150, 340, undefined)
+    expect(mockState.sendClick).toHaveBeenCalledWith(mockState.session, 150, 340, expect.any(Number))
     expect(steps[0]).toMatchObject({
       index: 0,
       type: 'click',
