@@ -8,6 +8,7 @@ import {
 } from './geometry-ws.js'
 
 export interface ProxyRuntimeTrace {
+  browserFlavor?: 'chromium' | 'stealth'
   browserLaunchMs?: number
   newPageMs?: number
   wsListeningMs?: number
@@ -58,6 +59,8 @@ export interface LaunchProxyRuntimeOptions {
   slowMo?: number
   debounceMs?: number
   eagerInitialExtract?: boolean
+  /** Use CloakBrowser's patched Chromium binary instead of stock Playwright Chromium. */
+  stealth?: boolean
   /** Outbound HTTP/SOCKS proxy for Chromium (BYO residential/mobile IP). */
   proxy?: ProxyConfig
   onListening?: (wsUrl: string) => void
@@ -84,7 +87,25 @@ export function formatProxyFatalError(err: unknown): string {
   if (/Executable doesn't exist|playwright install chromium|browserType\.launch/i.test(base)) {
     return `${base}\nInstall Chromium with: npx playwright install chromium`
   }
+  if (/cloakbrowser|CLOAKBROWSER|ERR_MODULE_NOT_FOUND|Cannot find package/i.test(base)) {
+    return `${base}\nStealth mode uses CloakBrowser. Install dependencies with: npm install, or disable stealth with --no-stealth / GEOMETRA_STEALTH=0. To prefetch the patched Chromium binary, run: npx cloakbrowser install`
+  }
   return base
+}
+
+function envRequestsStealth(): boolean {
+  const explicit = process.env.GEOMETRA_STEALTH
+  if (explicit !== undefined) {
+    const v = explicit.toLowerCase()
+    return v === '1' || v === 'true' || v === 'yes' || v === 'stealth' || v === 'cloak'
+  }
+
+  const browser = (process.env.GEOMETRA_BROWSER ?? '').toLowerCase()
+  return browser === 'stealth' || browser === 'cloak' || browser === 'cloakbrowser'
+}
+
+export function resolveStealthMode(stealth?: boolean): boolean {
+  return stealth ?? envRequestsStealth()
 }
 
 function createDeferred<T>(): {
@@ -167,28 +188,55 @@ export async function launchProxyRuntime(options: LaunchProxyRuntimeOptions): Pr
       width: options.width ?? 1280,
       height: options.height ?? 720,
     }
+    const stealth = resolveStealthMode(options.stealth)
+    trace.browserFlavor = stealth ? 'stealth' : 'chromium'
     const browserLaunchStartedAt = performance.now()
-    const launchOpts: Parameters<typeof chromium.launch>[0] = {
-      headless: options.headed !== true,
-      args: [
-        '--disable-blink-features=AutomationControlled',
-        '--disable-dev-shm-usage',
-        '--no-sandbox',
-        '--disable-setuid-sandbox',
-        '--disable-web-security',
-        '--disable-features=IsolateOrigins,site-per-process',
-      ]
-    }
-    if (options.slowMo && options.slowMo > 0) launchOpts.slowMo = options.slowMo
-    if (options.proxy?.server) {
-      launchOpts.proxy = {
-        server: options.proxy.server,
-        ...(options.proxy.username !== undefined && { username: options.proxy.username }),
-        ...(options.proxy.password !== undefined && { password: options.proxy.password }),
-        ...(options.proxy.bypass !== undefined && { bypass: options.proxy.bypass }),
+    const headless = options.headed !== true
+    const args = [
+      '--disable-blink-features=AutomationControlled',
+      '--disable-dev-shm-usage',
+      '--no-sandbox',
+      '--disable-setuid-sandbox',
+      '--disable-web-security',
+      '--disable-features=IsolateOrigins,site-per-process',
+    ]
+    const proxy = options.proxy?.server
+      ? {
+          server: options.proxy.server,
+          ...(options.proxy.username !== undefined && { username: options.proxy.username }),
+          ...(options.proxy.password !== undefined && { password: options.proxy.password }),
+          ...(options.proxy.bypass !== undefined && { bypass: options.proxy.bypass }),
+        }
+      : undefined
+
+    if (stealth) {
+      const cloak = await import('cloakbrowser') as {
+        launch(options?: {
+          headless?: boolean
+          args?: string[]
+          proxy?: ProxyConfig
+          launchOptions?: Record<string, unknown>
+        }): Promise<Browser>
       }
+      const launchOptions: Record<string, unknown> = {}
+      if (options.slowMo && options.slowMo > 0) launchOptions.slowMo = options.slowMo
+      browser = await cloak.launch({
+        headless,
+        args,
+        ...(proxy && { proxy }),
+        ...(Object.keys(launchOptions).length > 0 && { launchOptions }),
+      })
+    } else {
+      const launchOpts: Parameters<typeof chromium.launch>[0] = {
+        headless,
+        args: [
+          ...args,
+        ],
+      }
+      if (options.slowMo && options.slowMo > 0) launchOpts.slowMo = options.slowMo
+      if (proxy) launchOpts.proxy = proxy
+      browser = await chromium.launch(launchOpts)
     }
-    browser = await chromium.launch(launchOpts)
     trace.browserLaunchMs = performance.now() - browserLaunchStartedAt
     browser?.on('disconnected', () => {
       handleUnexpectedClosure('browser')

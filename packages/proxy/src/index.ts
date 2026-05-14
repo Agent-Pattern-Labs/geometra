@@ -1,15 +1,16 @@
 #!/usr/bin/env node
-import { formatProxyFatalError, launchProxyRuntime, parseHttpPageUrl } from './runtime.js'
+import { formatProxyFatalError, launchProxyRuntime, parseHttpPageUrl, resolveStealthMode } from './runtime.js'
 
 const READY_SIGNAL_TYPE = 'geometra-proxy-ready'
 
 function printUsage(): void {
-  console.error(`Usage: geometra-proxy <url> [--port <n>] [--width <n>] [--height <n>] [--headless] [--headed] [--slow-mo <ms>] [--lazy-initial-extract] [--proxy-server <url> [--proxy-username <u>] [--proxy-password <p>] [--proxy-bypass <list>]]
+  console.error(`Usage: geometra-proxy <url> [--port <n>] [--width <n>] [--height <n>] [--headless] [--headed] [--stealth] [--no-stealth] [--slow-mo <ms>] [--lazy-initial-extract] [--proxy-server <url> [--proxy-username <u>] [--proxy-password <p>] [--proxy-bypass <list>]]
 
 Open <url> in Chromium and stream GEOM v1 frames on WebSocket (JSON text).
 
 Default is a visible browser window (headed) so you can watch MCP-driven automation.
 Use --headless or env GEOMETRA_HEADLESS=1 for CI / servers without a display.
+Use --stealth or env GEOMETRA_STEALTH=1 to launch CloakBrowser's patched Chromium.
 
 Use --proxy-server to route all Chromium traffic through a residential / mobile / SOCKS proxy.
 Pair with --proxy-username/--proxy-password if the proxy requires auth. Helps bypass
@@ -20,9 +21,11 @@ Examples:
   geometra-proxy https://example.com --port 3200 --width 1440 --height 900
   geometra-proxy https://jobs.example.com/apply --slow-mo 40
   geometra-proxy http://localhost:3000 --headless
+  geometra-proxy https://jobs.example.com/apply --stealth
   geometra-proxy https://jobs.ashbyhq.com/foo --proxy-server http://res-proxy.example.com:8080 --proxy-username me --proxy-password secret
 
 Requires Chromium for Playwright:  npx playwright install chromium
+Stealth mode uses CloakBrowser and downloads its patched Chromium on first launch:  npx cloakbrowser install
 `)
 }
 
@@ -65,6 +68,7 @@ function parseArgs(argv: string[]): {
   width: number
   height: number
   headed: boolean
+  stealth?: boolean
   slowMo: number
   eagerInitialExtract: boolean
   proxyServer?: string
@@ -77,6 +81,7 @@ function parseArgs(argv: string[]): {
   let width = 1280
   let height = 720
   let headed = !envRequestsHeadless()
+  let stealth: boolean | undefined
   let slowMo = 0
   let eagerInitialExtract = !envRequestsLazyInitialExtract()
   let proxyServer: string | undefined = process.env.GEOMETRA_PROXY_SERVER || undefined
@@ -102,6 +107,10 @@ function parseArgs(argv: string[]): {
       headed = true
     } else if (a === '--headless') {
       headed = false
+    } else if (a === '--stealth') {
+      stealth = true
+    } else if (a === '--no-stealth' || a === '--stock-chromium') {
+      stealth = false
     } else if (a === '--slow-mo' || a === '--slowMo') {
       const n = Number(argv[++i] ?? '')
       if (Number.isFinite(n) && n >= 0) slowMo = Math.floor(n)
@@ -123,11 +132,11 @@ function parseArgs(argv: string[]): {
       process.exit(1)
     }
   }
-  return { url, port, width, height, headed, slowMo, eagerInitialExtract, proxyServer, proxyUsername, proxyPassword, proxyBypass }
+  return { url, port, width, height, headed, stealth, slowMo, eagerInitialExtract, proxyServer, proxyUsername, proxyPassword, proxyBypass }
 }
 
 async function main(): Promise<void> {
-  const { url: rawUrl, port, width, height, headed, slowMo, eagerInitialExtract, proxyServer, proxyUsername, proxyPassword, proxyBypass } = parseArgs(process.argv.slice(2))
+  const { url: rawUrl, port, width, height, headed, stealth, slowMo, eagerInitialExtract, proxyServer, proxyUsername, proxyPassword, proxyBypass } = parseArgs(process.argv.slice(2))
   if (!rawUrl) {
     printUsage()
     process.exit(1)
@@ -135,9 +144,10 @@ async function main(): Promise<void> {
   const url = parseHttpPageUrl(rawUrl)
 
   const mode = headed ? 'headed (visible window)' : 'headless'
+  const engine = resolveStealthMode(stealth) ? 'CloakBrowser stealth Chromium' : 'Chromium'
   const pace = slowMo > 0 ? `, slowMo ${slowMo}ms` : ''
   const proxyTag = proxyServer ? `, proxy ${proxyServer}` : ''
-  console.error(`[geometra-proxy] Chromium ${mode}${pace}${proxyTag}`)
+  console.error(`[geometra-proxy] ${engine} ${mode}${pace}${proxyTag}`)
   console.error(`[geometra-proxy] Loading ${url} …`)
   const runtime = await launchProxyRuntime({
     url,
@@ -145,6 +155,7 @@ async function main(): Promise<void> {
     width,
     height,
     headed,
+    ...(stealth !== undefined && { stealth }),
     slowMo,
     eagerInitialExtract,
     debounceMs: 50,

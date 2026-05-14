@@ -40,6 +40,16 @@
         "vite": "^8.0.3",
       },
     },
+    "demos/agent-native-ops": {
+      "name": "@geometra/demo-agent-native-ops",
+      "dependencies": {
+        "@geometra/core": "*",
+        "@geometra/renderer-canvas": "*",
+      },
+      "devDependencies": {
+        "vite": "^8.0.3",
+      },
+    },
     "demos/ai-on-demand": {
       "name": "@geometra/demo-ai-on-demand",
       "dependencies": {
@@ -203,7 +213,7 @@
     },
     "packages/agent": {
       "name": "@geometra/agent",
-      "version": "1.58.0",
+      "version": "1.61.3",
       "dependencies": {
         "@geometra/core": "^1.6.0",
         "@geometra/server": "^1.6.0",
@@ -212,7 +222,7 @@
     },
     "packages/cli": {
       "name": "@geometra/cli",
-      "version": "1.58.0",
+      "version": "1.61.3",
       "bin": {
         "geometra": "./dist/bin.js",
       },
@@ -229,14 +239,14 @@
     },
     "packages/client": {
       "name": "@geometra/client",
-      "version": "1.58.0",
+      "version": "1.61.3",
       "dependencies": {
         "@geometra/core": "^1.6.0",
       },
     },
     "packages/core": {
       "name": "@geometra/core",
-      "version": "1.58.0",
+      "version": "1.61.3",
       "dependencies": {
         "textura": "^1.6.0",
       },
@@ -244,13 +254,24 @@
         "@napi-rs/canvas": "^0.1.65",
       },
     },
+    "packages/gateway": {
+      "name": "@geometra/gateway",
+      "version": "1.61.3",
+      "dependencies": {
+        "@geometra/core": "^1.61.0",
+      },
+      "devDependencies": {
+        "@types/node": "^22.0.0",
+      },
+    },
     "packages/proxy": {
       "name": "@geometra/proxy",
-      "version": "1.58.0",
+      "version": "1.61.3",
       "bin": {
         "geometra-proxy": "./dist/index.js",
       },
       "dependencies": {
+        "cloakbrowser": "^0.3.28",
         "playwright": "^1.54.0",
         "ws": "^8.18.0",
       },
@@ -262,7 +283,7 @@
     },
     "packages/renderer-canvas": {
       "name": "@geometra/renderer-canvas",
-      "version": "1.58.0",
+      "version": "1.61.3",
       "dependencies": {
         "@geometra/client": "^1.6.0",
         "@geometra/core": "^1.6.0",
@@ -270,14 +291,14 @@
     },
     "packages/renderer-pdf": {
       "name": "@geometra/renderer-pdf",
-      "version": "1.58.0",
+      "version": "1.61.3",
       "dependencies": {
         "@geometra/core": "^1.6.0",
       },
     },
     "packages/renderer-terminal": {
       "name": "@geometra/renderer-terminal",
-      "version": "1.58.0",
+      "version": "1.61.3",
       "dependencies": {
         "@geometra/core": "^1.6.0",
       },
@@ -287,7 +308,7 @@
     },
     "packages/renderer-three": {
       "name": "@geometra/renderer-three",
-      "version": "1.58.0",
+      "version": "1.61.3",
       "dependencies": {
         "@geometra/client": "^1.6.0",
         "@geometra/core": "^1.6.0",
@@ -303,21 +324,21 @@
     },
     "packages/renderer-webgpu": {
       "name": "@geometra/renderer-webgpu",
-      "version": "1.58.0",
+      "version": "1.61.3",
       "dependencies": {
         "@geometra/core": "^1.2.1",
       },
     },
     "packages/router": {
       "name": "@geometra/router",
-      "version": "1.58.0",
+      "version": "1.61.3",
       "dependencies": {
         "@geometra/core": "^1.2.1",
       },
     },
     "packages/server": {
       "name": "@geometra/server",
-      "version": "1.58.0",
+      "version": "1.61.3",
       "dependencies": {
         "@geometra/core": "^1.6.0",
         "ws": "^8.18.0",
@@ -328,7 +349,7 @@
     },
     "packages/textura": {
       "name": "textura",
-      "version": "1.58.0",
+      "version": "1.61.3",
       "dependencies": {
         "@chenglou/pretext": "^0.0.3",
         "yoga-layout": "^3.2.1",
@@ -336,7 +357,7 @@
     },
     "packages/tw": {
       "name": "@geometra/tw",
-      "version": "1.58.0",
+      "version": "1.61.3",
       "dependencies": {
         "@geometra/core": "^1.6.0",
         "textura": "^1.6.0",
@@ -344,7 +365,7 @@
     },
     "packages/ui": {
       "name": "@geometra/ui",
-      "version": "1.58.0",
+      "version": "1.61.3",
       "dependencies": {
         "@geometra/core": "^1.6.0",
       },
@@ -457,6 +478,8 @@
 
     "@geometra/demo-agent": ["@geometra/demo-agent@workspace:demos/agent-demo"],
 
+    "@geometra/demo-agent-native-ops": ["@geometra/demo-agent-native-ops@workspace:demos/agent-native-ops"],
+
     "@geometra/demo-ai-on-demand": ["@geometra/demo-ai-on-demand@workspace:demos/ai-on-demand"],
 
     "@geometra/demo-auth-registry-server-client": ["@geometra/demo-auth-registry-server-client@workspace:demos/auth-registry-server-client"],
@@ -482,6 +505,8 @@
     "@geometra/demo-text-input-canvas": ["@geometra/demo-text-input-canvas@workspace:demos/text-input-canvas"],
 
     "@geometra/demo-virtualized-canvas": ["@geometra/demo-virtualized-canvas@workspace:demos/virtualized-canvas"],
+
+    "@geometra/gateway": ["@geometra/gateway@workspace:packages/gateway"],
 
     "@geometra/proxy": ["@geometra/proxy@workspace:packages/proxy"],
 
@@ -546,6 +571,8 @@
     "@img/sharp-win32-arm64": ["@img/sharp-win32-arm64@0.34.5", "", { "os": "win32", "cpu": "arm64" }, "sha512-WQ3AgWCWYSb2yt+IG8mnC6Jdk9Whs7O0gxphblsLvdhSpSTtmu69ZG1Gkb6NuvxsNACwiPV6cNSZNzt0KPsw7g=="],
 
     "@img/sharp-win32-x64": ["@img/sharp-win32-x64@0.34.5", "", { "os": "win32", "cpu": "x64" }, "sha512-+29YMsqY2/9eFEiW93eqWnuLcWcufowXewwSNIT6UwZdUUCrM3oFjMWH/Z6/TMmb4hlFenmfAVbpWeup2jryCw=="],
+
+    "@isaacs/fs-minipass": ["@isaacs/fs-minipass@4.0.1", "", { "dependencies": { "minipass": "^7.0.4" } }, "sha512-wgm9Ehl2jpeqP3zw/7mo3kRHFp5MEDhqAdwy1fTGkHAwnkGOVsgpvQhL8B5n1qlb01jV3n/bI0ZfZp5lWA1k4w=="],
 
     "@jridgewell/gen-mapping": ["@jridgewell/gen-mapping@0.3.13", "", { "dependencies": { "@jridgewell/sourcemap-codec": "^1.5.0", "@jridgewell/trace-mapping": "^0.3.24" } }, "sha512-2kkt/7niJ6MgEPxF0bYdQ6etZaA+fQvDcLKckhy1yIQOzaoKjBBjSj63/aLVjYE3qhRt5dvM+uUyfCg6UKCBbA=="],
 
@@ -761,9 +788,11 @@
 
     "chalk": ["chalk@4.1.2", "", { "dependencies": { "ansi-styles": "^4.1.0", "supports-color": "^7.1.0" } }, "sha512-oKnbhFyRIXpUuez8iBMmyEa4nbj4IOQyuhc/wy9kY7/WVPcwIO9VA668Pu8RkO7+0G76SLROeyw9CpQ061i4mA=="],
 
-    "chownr": ["chownr@1.1.4", "", {}, "sha512-jJ0bqzaylmJtVnNgzTeSOs8DPavpbYgEr/b0YL8/2GO3xJEhInFmhKMUnEJQjZumK7KXGFhUy89PrsJWlakBVg=="],
+    "chownr": ["chownr@3.0.0", "", {}, "sha512-+IxzY9BZOQd/XuYPRmrvEVjF/nqj5kgT4kEq7VofrDoM1MxoRjEWkrCC3EtLi59TVawxTAn+orJwFQcrqEN1+g=="],
 
     "cliui": ["cliui@8.0.1", "", { "dependencies": { "string-width": "^4.2.0", "strip-ansi": "^6.0.1", "wrap-ansi": "^7.0.0" } }, "sha512-BSeNnyus75C4//NQ9gQt1/csTXyo/8Sb+afLAkzAptFuMsod9HFokGNudZpi/oQV73hnVK+sR+5PVRMd+Dr7YQ=="],
+
+    "cloakbrowser": ["cloakbrowser@0.3.28", "", { "dependencies": { "tar": "^7.0.0" }, "peerDependencies": { "mmdb-lib": ">=2.0.0", "playwright-core": ">=1.53.0", "puppeteer-core": ">=21.0.0", "socks-proxy-agent": ">=10.0.0" }, "optionalPeers": ["mmdb-lib", "playwright-core", "puppeteer-core", "socks-proxy-agent"], "bin": { "cloakbrowser": "dist/cli.js" } }, "sha512-33IeHiST1V2vbWbLmCFI/tykMsrd6zOwjgM1+669AclA2n0p4RTBLUk5WLUe5AuaTLcjfkE7uKdLi79H39XeAg=="],
 
     "color-convert": ["color-convert@2.0.1", "", { "dependencies": { "color-name": "~1.1.4" } }, "sha512-RRECPsj7iu/xb5oKYcsFHSppFNnsj/52OVTRKb4zP5onXwVF3zVmmToNcOfGC+CRDpfK/U584fMg38ZHCaElKQ=="],
 
@@ -1027,6 +1056,10 @@
 
     "minimist": ["minimist@1.2.8", "", {}, "sha512-2yyAR8qBkN3YuheJanUpWC5U3bb5osDywNB8RzDVlDwDHbocAJveqqj1u8+SVD7jkWT4yvsHCpWqqWqAxb0zCA=="],
 
+    "minipass": ["minipass@7.1.3", "", {}, "sha512-tEBHqDnIoM/1rXME1zgka9g6Q2lcoCkxHLuc7ODJ5BxbP5d4c2Z5cGgtXAku59200Cx7diuHTOYfSBD8n6mm8A=="],
+
+    "minizlib": ["minizlib@3.1.0", "", { "dependencies": { "minipass": "^7.1.2" } }, "sha512-KZxYo1BUkWD2TVFLr0MQoM8vUUigWD3LlD83a/75BqC+4qE0Hb1Vo5v1FgcfaNXvfXzr+5EhQ6ing/CaBijTlw=="],
+
     "mkdirp-classic": ["mkdirp-classic@0.5.3", "", {}, "sha512-gKLcREMhtuZRwRAfqP3RFW+TK4JqApVBtOIftVgjuABpAtpxhPGaDcfvbhNvD0B8iD1oUr/txX35NjcaY6Ns/A=="],
 
     "ms": ["ms@2.1.3", "", {}, "sha512-6FlzubTLZG3J2a/NVCAleEhjzq5oxgHyaCU9yYXvcLsvoVaHJq/s5xXI6/XXP6tz7R9xAOtHnSO/tXtF3WRTlA=="],
@@ -1205,6 +1238,8 @@
 
     "supports-preserve-symlinks-flag": ["supports-preserve-symlinks-flag@1.0.0", "", {}, "sha512-ot0WnXS9fgdkgIcePe6RHNk1WA8+muPa6cSjeR3V8K27q9BB1rTE3R1p7Hv0z1ZyAc8s6Vvv8DIyWf681MAt0w=="],
 
+    "tar": ["tar@7.5.15", "", { "dependencies": { "@isaacs/fs-minipass": "^4.0.0", "chownr": "^3.0.0", "minipass": "^7.1.2", "minizlib": "^3.1.0", "yallist": "^5.0.0" } }, "sha512-dzGK0boVlC4W5QFuQN1EFSl3bIDYsk7Tj40U6eIBnK2k/8ml7TZ5agbI5j5+qnoVcAA+rNtBml8SEiLxZpNqRQ=="],
+
     "tar-fs": ["tar-fs@2.1.4", "", { "dependencies": { "chownr": "^1.1.1", "mkdirp-classic": "^0.5.2", "pump": "^3.0.0", "tar-stream": "^2.1.4" } }, "sha512-mDAjwmZdh7LTT6pNleZ05Yt65HC3E+NiQzl672vQG38jIrehtJk/J3mNwIg+vShQPcLF/LV7CMnDW6vjj6sfYQ=="],
 
     "tar-stream": ["tar-stream@2.2.0", "", { "dependencies": { "bl": "^4.0.3", "end-of-stream": "^1.4.1", "fs-constants": "^1.0.0", "inherits": "^2.0.3", "readable-stream": "^3.1.1" } }, "sha512-ujeqbceABgwMZxEJnk2HDY2DlnUZ+9oEcb1KzTVfYHio0UE6dG71n60d8D2I4qNvleWrrXpmjpt7vZeF1LnMZQ=="],
@@ -1279,7 +1314,7 @@
 
     "y18n": ["y18n@5.0.8", "", {}, "sha512-0pfFzegeDWJHJIAmTLRP2DwHjdF5s7jo9tuztdQxAhINCdvS+3nGINqPd00AphqJR/0LhANUS6/+7SCb98YOfA=="],
 
-    "yallist": ["yallist@3.1.1", "", {}, "sha512-a4UGQaWPH59mOXUYnAG2ewncQS4i4F43Tv3JoAM+s2VDAmS9NsK8GpDMLrCHPksFT7h3K6TOoUNn2pb7RoXx4g=="],
+    "yallist": ["yallist@5.0.0", "", {}, "sha512-YgvUTfwqyc7UXVMrB+SImsVYSmTS8X/tSrtdNZMImM+n7+QTriRXyXim0mBrTXNeqzVF0KWGgHPeiyViFFrNDw=="],
 
     "yaml": ["yaml@1.10.3", "", {}, "sha512-vIYeF1u3CjlhAFekPPAk2h/Kv4T3mAkMox5OymRiJQB0spDP10LHvt+K7G9Ny6NuuMAb25/6n1qyUjAcGNf/AA=="],
 
@@ -1313,9 +1348,13 @@
 
     "chalk/supports-color": ["supports-color@7.2.0", "", { "dependencies": { "has-flag": "^4.0.0" } }, "sha512-qpCAvRl9stuOHveKsn7HncJRvv501qIacKzQlO/+Lwxc9+0q2wLyv4Dfvt80/DPn2pqOBsJdDiogXGR9+OvwRw=="],
 
+    "lru-cache/yallist": ["yallist@3.1.1", "", {}, "sha512-a4UGQaWPH59mOXUYnAG2ewncQS4i4F43Tv3JoAM+s2VDAmS9NsK8GpDMLrCHPksFT7h3K6TOoUNn2pb7RoXx4g=="],
+
     "playwright/fsevents": ["fsevents@2.3.2", "", { "os": "darwin" }, "sha512-xiqMQR4xAeHTuB9uWm+fFRcIOgKBMiOBP+eXiyT7jsgVCq1bkVygt00oASowB7EdtpOHaaPgKt812P9ab+DDKA=="],
 
     "rolldown/@rolldown/pluginutils": ["@rolldown/pluginutils@1.0.0-rc.12", "", {}, ""],
+
+    "tar-fs/chownr": ["chownr@1.1.4", "", {}, "sha512-jJ0bqzaylmJtVnNgzTeSOs8DPavpbYgEr/b0YL8/2GO3xJEhInFmhKMUnEJQjZumK7KXGFhUy89PrsJWlakBVg=="],
 
     "@modelcontextprotocol/sdk/ajv/json-schema-traverse": ["json-schema-traverse@1.0.0", "", {}, "sha512-NM8/P9n3XjXhIZn1lLhkFaACTOURQXjWhV4BA/RnOv8xvgqtqpAX9IO4mRQxSx1Rlo4tqzeqb0sOlruaOy3dug=="],
 

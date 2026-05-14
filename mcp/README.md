@@ -18,14 +18,14 @@ Geometra proxy:       Chromium → DOM geometry → same WebSocket as native →
 
 Use Geometra MCP when an LLM needs to explore, interpret, and operate a real UI with compact semantic state instead of repeatedly consuming large browser snapshots. Keep Playwright-style tooling for deterministic scripts, DOM-oriented test automation, and compatibility fallback paths while Geometra closes remaining live-site gaps.
 
-Proxy-backed sessions stay warm by default on disconnect, and MCP now keeps a small warm pool so compatible headed and headless workflows do not immediately evict each other.
+Proxy-backed sessions stay warm by default on disconnect, and MCP now keeps a small warm pool so compatible headed, headless, and stealth workflows do not immediately evict each other.
 
 ## Tools
 
 | Tool | Description |
 |---|---|
-| `geometra_connect` | Connect with `url` (ws://…) **or** `pageUrl` (https://…) to auto-start geometra-proxy; can inline `formSchema` and/or `pageModel`, or defer the page model for a faster first connect response |
-| `geometra_prepare_browser` | Pre-launch and pre-navigate a reusable proxy/browser for `pageUrl` without creating an active session; best when the agent can prepare before the user-facing task starts |
+| `geometra_connect` | Connect with `url` (ws://…) **or** `pageUrl` (https://…) to auto-start geometra-proxy; pass `stealth: true` for CloakBrowser's patched Chromium; can inline `formSchema` and/or `pageModel`, or defer the page model for a faster first connect response |
+| `geometra_prepare_browser` | Pre-launch and pre-navigate a reusable proxy/browser for `pageUrl` without creating an active session; supports the same headed/headless/stealth browser settings as `geometra_connect` |
 | `geometra_query` | Find elements by stable id, role, name, text content, prompt/section/item context, current value, or semantic state such as `invalid`, `required`, or `busy` |
 | `geometra_wait_for` | Wait for a semantic condition instead of guessing sleeps (`busy`, `disabled`, alerts, values, etc.). **Strict parameters** — use `text` plus `present: false` to wait until a substring disappears (e.g. “Parsing your resume”); there is no `textGone` field |
 | `geometra_wait_for_resume_parse` | Convenience wait until a parsing banner is gone (defaults: `text`: `"Parsing"`, `present` implied false). Same engine as `geometra_wait_for` |
@@ -252,9 +252,10 @@ In another terminal (from repo root after `npm install` / `bun install` and `bun
 ```bash
 npx geometra-proxy http://localhost:8080 --port 3200
 # Requires Chromium: npx playwright install chromium
+# Optional stealth prefetch: npx cloakbrowser install
 ```
 
-`geometra-proxy` opens a **visible Chromium window by default**. For servers or CI, pass **`--headless`** or set **`GEOMETRA_HEADLESS=1`**. Optional **`--slow-mo <ms>`** slows Playwright actions so they are easier to watch. Headed vs headless usually does **not** materially change token usage, since token usage is driven by MCP tool output rather than whether Chromium is visible.
+`geometra-proxy` opens a **visible Chromium window by default**. For servers or CI, pass **`--headless`** or set **`GEOMETRA_HEADLESS=1`**. Pass **`--stealth`**, **`stealth: true`** on MCP tools, or **`GEOMETRA_STEALTH=1`** to use CloakBrowser's patched Chromium through the same proxy protocol. Optional **`--slow-mo <ms>`** slows Playwright actions so they are easier to watch. Headed vs headless usually does **not** materially change token usage, since token usage is driven by MCP tool output rather than whether Chromium is visible.
 
 Point MCP at `ws://127.0.0.1:3200` instead of a native Geometra server. The proxy translates clicks and keyboard messages into Playwright actions and streams updated geometry.
 
@@ -341,7 +342,7 @@ For long application flows, prefer one of these patterns:
 4. `geometra_snapshot({ view: "form-required" })` when you need the remaining required fields including offscreen ones
 5. `geometra_reveal` for far-below-fold targets such as submit buttons (auto-scales reveal steps when you omit `maxSteps`)
 6. `geometra_click({ ..., waitFor: ... })` when one action should also wait for the next semantic state
-7. `geometra_prepare_browser({ pageUrl, headless, width, height })` when you can hide browser startup before the real task and want the next proxy-backed flow to attach warm
+7. `geometra_prepare_browser({ pageUrl, headless, stealth, width, height })` when you can hide browser startup before the real task and want the next proxy-backed flow to attach warm
 8. `geometra_run_actions` when you need mixed navigation + waits + field entry, especially with `pageUrl` / `url` for a one-call flow
 9. `geometra_connect({ pageUrl, returnPageModel: true })` when you want connect + summary-first exploration in one turn
 10. `geometra_connect({ pageUrl, returnPageModel: true, pageModelMode: "deferred" })` when first-response latency matters more than inlining the page model; follow with `geometra_page_model`

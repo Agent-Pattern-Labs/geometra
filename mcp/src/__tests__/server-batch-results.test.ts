@@ -728,6 +728,48 @@ describe('batch MCP result shaping', () => {
     expect(mockState.connectThroughProxy).not.toHaveBeenCalled()
   })
 
+  it('passes stealth browser mode through proxy-backed connect and prewarm', async () => {
+    const connectHandler = getToolHandler('geometra_connect')
+
+    await connectHandler({
+      pageUrl: 'https://jobs.example.com/application',
+      headless: true,
+      stealth: true,
+    })
+
+    expect(mockState.connectThroughProxy).toHaveBeenCalledWith(expect.objectContaining({
+      pageUrl: 'https://jobs.example.com/application',
+      headless: true,
+      stealth: true,
+    }))
+
+    vi.clearAllMocks()
+    mockState.prewarmProxy.mockResolvedValue({
+      prepared: true,
+      reused: false,
+      transport: 'embedded',
+      pageUrl: 'https://jobs.example.com/application',
+      wsUrl: 'ws://127.0.0.1:3200',
+      headless: true,
+      stealth: true,
+      width: 1280,
+      height: 720,
+    })
+    const prepareHandler = getToolHandler('geometra_prepare_browser')
+
+    await prepareHandler({
+      pageUrl: 'https://jobs.example.com/application',
+      headless: true,
+      stealth: true,
+    })
+
+    expect(mockState.prewarmProxy).toHaveBeenCalledWith(expect.objectContaining({
+      pageUrl: 'https://jobs.example.com/application',
+      headless: true,
+      stealth: true,
+    }))
+  })
+
   it('can inline a packed form schema into connect for the low-turn form path', async () => {
     const handler = getToolHandler('geometra_connect')
     mockState.formSchemas = [

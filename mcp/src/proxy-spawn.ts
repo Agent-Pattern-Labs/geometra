@@ -175,8 +175,24 @@ export interface SpawnProxyParams {
   width?: number
   height?: number
   slowMo?: number
+  stealth?: boolean
   eagerInitialExtract?: boolean
   proxy?: SpawnProxyConfig
+}
+
+function envRequestsStealth(): boolean {
+  const explicit = process.env.GEOMETRA_STEALTH
+  if (explicit !== undefined) {
+    const v = explicit.toLowerCase()
+    return v === '1' || v === 'true' || v === 'yes' || v === 'stealth' || v === 'cloak'
+  }
+
+  const browser = (process.env.GEOMETRA_BROWSER ?? '').toLowerCase()
+  return browser === 'stealth' || browser === 'cloak' || browser === 'cloakbrowser'
+}
+
+export function resolveStealthMode(stealth?: boolean): boolean {
+  return stealth ?? envRequestsStealth()
 }
 
 export async function startEmbeddedGeometraProxy(
@@ -191,6 +207,7 @@ export async function startEmbeddedGeometraProxy(
       height?: number
       headed?: boolean
       slowMo?: number
+      stealth?: boolean
       eagerInitialExtract?: boolean
       proxy?: SpawnProxyConfig
     }) => Promise<EmbeddedProxyRuntime>
@@ -206,6 +223,7 @@ export async function startEmbeddedGeometraProxy(
     height: opts.height,
     headed: opts.headless !== true,
     slowMo: opts.slowMo,
+    ...(opts.stealth !== undefined && { stealth: opts.stealth }),
     eagerInitialExtract: opts.eagerInitialExtract,
     ...(opts.proxy && { proxy: opts.proxy }),
   })
@@ -242,6 +260,12 @@ export function formatProxyStartupFailure(message: string, opts: SpawnProxyParam
     hints.push('Install Chromium with: npx playwright install chromium')
   }
 
+  if (/cloakbrowser|CLOAKBROWSER|ERR_MODULE_NOT_FOUND|Cannot find package/i.test(message)) {
+    hints.push(
+      'Stealth mode uses CloakBrowser. Install dependencies with npm install, or disable stealth with stealth=false / GEOMETRA_STEALTH=0. To prefetch the patched Chromium binary, run: npx cloakbrowser install',
+    )
+  }
+
   if (opts.port > 0 && /EADDRINUSE|address already in use/i.test(message)) {
     hints.push(
       `Requested port ${opts.port} is unavailable. Omit the port to use an ephemeral OS-assigned port, or choose another local port.`,
@@ -263,6 +287,8 @@ export function spawnGeometraProxy(opts: SpawnProxyParams): Promise<{ child: Chi
   if (opts.slowMo != null && opts.slowMo > 0) args.push('--slow-mo', String(opts.slowMo))
   if (opts.headless === true) args.push('--headless')
   else if (opts.headless === false) args.push('--headed')
+  if (opts.stealth === true) args.push('--stealth')
+  else if (opts.stealth === false) args.push('--no-stealth')
   if (opts.eagerInitialExtract === false) args.push('--lazy-initial-extract')
   if (opts.proxy?.server) {
     args.push('--proxy-server', opts.proxy.server)

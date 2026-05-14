@@ -7,6 +7,7 @@ const mockState = vi.hoisted(() => ({
 }))
 
 vi.mock('../proxy-spawn.js', () => ({
+  resolveStealthMode: (stealth?: boolean) => stealth ?? false,
   startEmbeddedGeometraProxy: mockState.startEmbeddedGeometraProxy,
   spawnGeometraProxy: mockState.spawnGeometraProxy,
 }))
@@ -208,6 +209,75 @@ describe('connectThroughProxy recovery', () => {
       expect(headlessRuntime.close).toHaveBeenCalledTimes(1)
       await closePeer(headedPeer.wss)
       await closePeer(headlessPeer.wss)
+    }
+  })
+
+  it('keeps separate warm proxies for stock and stealth browser modes', async () => {
+    const stockPeer = await createProxyPeer({
+      pageUrl: 'https://jobs.example.com/application',
+    })
+    const stealthPeer = await createProxyPeer({
+      pageUrl: 'https://jobs.example.com/application',
+    })
+
+    const stockRuntime = {
+      wsUrl: stockPeer.wsUrl,
+      ready: Promise.resolve(),
+      closed: false,
+      close: vi.fn(async () => {
+        stockRuntime.closed = true
+      }),
+    }
+    const stealthRuntime = {
+      wsUrl: stealthPeer.wsUrl,
+      ready: Promise.resolve(),
+      closed: false,
+      close: vi.fn(async () => {
+        stealthRuntime.closed = true
+      }),
+    }
+
+    mockState.startEmbeddedGeometraProxy
+      .mockResolvedValueOnce({ runtime: stockRuntime, wsUrl: stockPeer.wsUrl })
+      .mockResolvedValueOnce({ runtime: stealthRuntime, wsUrl: stealthPeer.wsUrl })
+    mockState.spawnGeometraProxy.mockRejectedValue(new Error('spawn fallback should not be used'))
+
+    try {
+      const stockSession = await connectThroughProxy({
+        pageUrl: 'https://jobs.example.com/application',
+        headless: true,
+        stealth: false,
+      })
+      expect(stockSession.proxyRuntime).toBe(stockRuntime)
+
+      disconnect()
+
+      const stealthSession = await connectThroughProxy({
+        pageUrl: 'https://jobs.example.com/application',
+        headless: true,
+        stealth: true,
+      })
+      expect(stealthSession.proxyRuntime).toBe(stealthRuntime)
+
+      disconnect()
+
+      const reusedStockSession = await connectThroughProxy({
+        pageUrl: 'https://jobs.example.com/application',
+        headless: true,
+        stealth: false,
+      })
+
+      expect(reusedStockSession.proxyRuntime).toBe(stockRuntime)
+      expect(mockState.startEmbeddedGeometraProxy).toHaveBeenCalledTimes(2)
+      expect(mockState.spawnGeometraProxy).not.toHaveBeenCalled()
+      expect(stockRuntime.close).not.toHaveBeenCalled()
+      expect(stealthRuntime.close).not.toHaveBeenCalled()
+    } finally {
+      disconnect({ closeProxy: true })
+      expect(stockRuntime.close).toHaveBeenCalledTimes(1)
+      expect(stealthRuntime.close).toHaveBeenCalledTimes(1)
+      await closePeer(stockPeer.wss)
+      await closePeer(stealthPeer.wss)
     }
   })
 

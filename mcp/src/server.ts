@@ -155,6 +155,13 @@ function detailInput() {
     .describe('`terse` returns compact machine-friendly JSON. `minimal` (default) returns short human-readable summaries. `verbose` adds fuller fallback context.')
 }
 
+function stealthInput() {
+  return z
+    .boolean()
+    .optional()
+    .describe('Launch CloakBrowser stealth Chromium for proxy-backed pageUrl sessions. Default false unless GEOMETRA_STEALTH=1 or GEOMETRA_BROWSER=stealth is set.')
+}
+
 function formSchemaFormatInput() {
   return z
     .enum(['compact', 'packed'])
@@ -617,7 +624,7 @@ export function createServer(): McpServer {
 
 Use \`url\` (ws://…) only when a Geometra/native server or an already-running proxy is listening. If you accidentally pass \`https://…\` in \`url\`, MCP treats it like \`pageUrl\` and starts the proxy for you.
 
-Chromium opens **visible** by default unless \`headless: true\`. File upload / wheel / native \`<select>\` need the proxy path (\`pageUrl\` or ws to proxy). Set \`returnForms: true\` and/or \`returnPageModel: true\` when you want a lower-turn startup response. When connect first-response latency matters more than inlining the page model, pair \`returnPageModel: true\` with \`pageModelMode: "deferred"\` and call \`geometra_page_model\` next.
+Chromium opens **visible** by default unless \`headless: true\`. Pass \`stealth: true\` (or set \`GEOMETRA_STEALTH=1\`) to launch CloakBrowser's patched Chromium instead of stock Playwright Chromium. File upload / wheel / native \`<select>\` need the proxy path (\`pageUrl\` or ws to proxy). Set \`returnForms: true\` and/or \`returnPageModel: true\` when you want a lower-turn startup response. When connect first-response latency matters more than inlining the page model, pair \`returnPageModel: true\` with \`pageModelMode: "deferred"\` and call \`geometra_page_model\` next.
 
 **Parallelism:** by default, geometra MCP pools and reuses Chromium instances across sessions for speed. That pooling is safe for read-only exploration, but it shares localStorage / cookies / page state across whichever sessions land on the same proxy — which means **two parallel form-submission flows can contaminate each other** (one job's email/autocomplete state leaks into another, or worse, two agents end up driving the same browser tab). For parallel apply / form submission, pass \`isolated: true\`. Each isolated session gets its own brand-new Chromium that is destroyed on disconnect, never enters the pool, and is guaranteed independent of every other session. The cost is ~1–2s of extra startup vs the ~50ms reusable-proxy attach.`,
     {
@@ -654,6 +661,7 @@ Chromium opens **visible** by default unless \`headless: true\`. File upload / w
         .nonnegative()
         .optional()
         .describe('Playwright slowMo (ms) on spawned proxy for easier visual following.'),
+      stealth: stealthInput(),
       isolated: z
         .boolean()
         .optional()
@@ -731,6 +739,7 @@ Chromium opens **visible** by default unless \`headless: true\`. File upload / w
             width: input.width,
             height: input.height,
             slowMo: input.slowMo,
+            ...(input.stealth !== undefined && { stealth: input.stealth }),
             isolated: input.isolated,
             proxy: input.proxy,
             awaitInitialFrame: deferInlinePageModel ? false : undefined,
@@ -807,6 +816,7 @@ Use this when you can prepare ahead of the user-facing task so the next \`geomet
         .nonnegative()
         .optional()
         .describe('Playwright slowMo (ms) for the warmed browser.'),
+      stealth: stealthInput(),
       proxy: z
         .object({
           server: z
@@ -824,9 +834,18 @@ Use this when you can prepare ahead of the user-facing task so the next \`geomet
           'BYO outbound proxy for the warmed Chromium. The pool entry is partitioned by proxy identity, so a later geometra_connect with the same proxy config will reuse this warmed browser; a different proxy config (or no proxy) will not.',
         ),
     },
-    async ({ pageUrl, port, headless, width, height, slowMo, proxy }) => {
+    async ({ pageUrl, port, headless, width, height, slowMo, stealth, proxy }) => {
       try {
-        const prepared = await prewarmProxy({ pageUrl, port, headless, width, height, slowMo, proxy })
+        const prepared = await prewarmProxy({
+          pageUrl,
+          port,
+          headless,
+          width,
+          height,
+          slowMo,
+          ...(stealth !== undefined && { stealth }),
+          proxy,
+        })
         return ok(JSON.stringify(prepared))
       } catch (e) {
         return err(`Failed to prepare browser: ${e instanceof Error ? e.message : String(e)}`)
@@ -1236,6 +1255,7 @@ Pass \`valuesById\` with field ids from \`geometra_form_schema\` for the most st
       width: z.number().int().positive().optional().describe('Viewport width for auto-connected sessions.'),
       height: z.number().int().positive().optional().describe('Viewport height for auto-connected sessions.'),
       slowMo: z.number().int().nonnegative().optional().describe('Playwright slowMo (ms) when auto-spawning a proxy.'),
+      stealth: stealthInput(),
       formId: z.string().optional().describe('Optional form id from geometra_form_schema or geometra_page_model'),
       valuesById: formValuesRecordSchema.optional().describe('Form values keyed by stable field id from geometra_form_schema'),
       valuesByLabel: formValuesRecordSchema.optional().describe('Form values keyed by schema field label'),
@@ -1274,7 +1294,7 @@ Pass \`valuesById\` with field ids from \`geometra_form_schema\` for the most st
       detail: detailInput(),
       sessionId: sessionIdInput,
     },
-    async ({ url, pageUrl, port, headless, width, height, slowMo, formId, valuesById, valuesByLabel, stopOnError, failOnInvalid, includeSteps, resumeFromIndex, verifyFills, skipPreFilled, isolated, detail, sessionId }) => {
+    async ({ url, pageUrl, port, headless, width, height, slowMo, stealth, formId, valuesById, valuesByLabel, stopOnError, failOnInvalid, includeSteps, resumeFromIndex, verifyFills, skipPreFilled, isolated, detail, sessionId }) => {
       const directFields =
         !includeSteps && !formId && Object.keys(valuesById ?? {}).length === 0
           ? directLabelBatchFields(valuesByLabel)
@@ -1290,6 +1310,7 @@ Pass \`valuesById\` with field ids from \`geometra_form_schema\` for the most st
           width,
           height,
           slowMo,
+          stealth,
           isolated,
           awaitInitialFrame: directFields ? false : undefined,
         },
@@ -1563,6 +1584,7 @@ Pass \`pageUrl\`/\`url\` to auto-connect in the same call — use \`isolated: tr
       width: z.number().int().positive().optional().describe('Viewport width for auto-connected sessions.'),
       height: z.number().int().positive().optional().describe('Viewport height for auto-connected sessions.'),
       slowMo: z.number().int().nonnegative().optional().describe('Playwright slowMo (ms) when auto-spawning a proxy.'),
+      stealth: stealthInput(),
       isolated: z.boolean().optional().default(false).describe('When auto-connecting via pageUrl/url, request an isolated proxy. Required for safe parallel form submission.'),
       formId: z.string().optional().describe('Optional form id from geometra_form_schema or geometra_page_model'),
       valuesById: formValuesRecordSchema.optional().describe('Form values keyed by stable field id from geometra_form_schema'),
@@ -1577,12 +1599,12 @@ Pass \`pageUrl\`/\`url\` to auto-connect in the same call — use \`isolated: tr
       detail: detailInput(),
       sessionId: sessionIdInput,
     },
-    async ({ url, pageUrl, port, headless, width, height, slowMo, isolated, formId, valuesById, valuesByLabel, submit, submitIndex, submitTimeoutMs, waitFor, skipFill, softTimeoutMs, failOnInvalid, detail, sessionId }) => {
+    async ({ url, pageUrl, port, headless, width, height, slowMo, stealth, isolated, formId, valuesById, valuesByLabel, submit, submitIndex, submitTimeoutMs, waitFor, skipFill, softTimeoutMs, failOnInvalid, detail, sessionId }) => {
       const toolStartedAt = performance.now()
       const effectiveSoftTimeoutMs = softTimeoutMs ?? HOST_SAFE_TOOL_TIMEOUT_MS
       const deadlineAt = toolStartedAt + effectiveSoftTimeoutMs
       const resolved = await ensureToolSession(
-        { sessionId, url, pageUrl, port, headless, width, height, slowMo, isolated },
+        { sessionId, url, pageUrl, port, headless, width, height, slowMo, stealth, isolated },
         'Not connected. Call geometra_connect first, or pass pageUrl/url to geometra_submit_form.',
       )
       if (!resolved.ok) return err(resolved.error)
@@ -1894,6 +1916,7 @@ Supported step types: \`click\`, \`type\`, \`key\`, \`upload_files\`, \`pick_lis
       width: z.number().int().positive().optional().describe('Viewport width for auto-connected sessions.'),
       height: z.number().int().positive().optional().describe('Viewport height for auto-connected sessions.'),
       slowMo: z.number().int().nonnegative().optional().describe('Playwright slowMo (ms) when auto-spawning a proxy.'),
+      stealth: stealthInput(),
       isolated: z
         .boolean()
         .optional()
@@ -1918,7 +1941,7 @@ Supported step types: \`click\`, \`type\`, \`key\`, \`upload_files\`, \`pick_lis
       detail: detailInput(),
       sessionId: sessionIdInput,
     },
-    async ({ url, pageUrl, port, headless, width, height, slowMo, isolated, actions, resumeFromIndex, softTimeoutMs, stopOnError, includeSteps, output, detail, sessionId }) => {
+    async ({ url, pageUrl, port, headless, width, height, slowMo, stealth, isolated, actions, resumeFromIndex, softTimeoutMs, stopOnError, includeSteps, output, detail, sessionId }) => {
       const toolStartedAt = performance.now()
       const effectiveSoftTimeoutMs = softTimeoutMs ?? HOST_SAFE_TOOL_TIMEOUT_MS
       const deadlineAt = toolStartedAt + effectiveSoftTimeoutMs
@@ -1932,6 +1955,7 @@ Supported step types: \`click\`, \`type\`, \`key\`, \`upload_files\`, \`pick_lis
           width,
           height,
           slowMo,
+          stealth,
           isolated,
           awaitInitialFrame: canDeferInitialFrameForRunActions(actions) ? false : undefined,
         },
@@ -2143,6 +2167,7 @@ Unlike geometra_expand_section, this collapses repeated radio/button groups into
       width: z.number().int().positive().optional().describe('Viewport width for auto-connected sessions.'),
       height: z.number().int().positive().optional().describe('Viewport height for auto-connected sessions.'),
       slowMo: z.number().int().nonnegative().optional().describe('Playwright slowMo (ms) when auto-spawning a proxy.'),
+      stealth: stealthInput(),
       isolated: z
         .boolean()
         .optional()
@@ -2158,9 +2183,9 @@ Unlike geometra_expand_section, this collapses repeated radio/button groups into
       format: formSchemaFormatInput(),
       sessionId: sessionIdInput,
     },
-    async ({ url, pageUrl, port, headless, width, height, slowMo, isolated, formId, maxFields, onlyRequiredFields, onlyInvalidFields, includeOptions, includeContext, sinceSchemaId, format, sessionId }) => {
+    async ({ url, pageUrl, port, headless, width, height, slowMo, stealth, isolated, formId, maxFields, onlyRequiredFields, onlyInvalidFields, includeOptions, includeContext, sinceSchemaId, format, sessionId }) => {
       const resolved = await ensureToolSession(
-        { sessionId, url, pageUrl, port, headless, width, height, slowMo, isolated },
+        { sessionId, url, pageUrl, port, headless, width, height, slowMo, stealth, isolated },
         'Not connected. Call geometra_connect first, or pass pageUrl/url to geometra_form_schema.',
       )
       if (!resolved.ok) return err(resolved.error)
@@ -3357,6 +3382,7 @@ async function ensureToolSession(
     width?: number
     height?: number
     slowMo?: number
+    stealth?: boolean
     awaitInitialFrame?: boolean
     /** When true and an auto-connect is needed, request an isolated proxy. */
     isolated?: boolean
@@ -3411,6 +3437,7 @@ async function ensureToolSession(
         width: target.width,
         height: target.height,
         slowMo: target.slowMo,
+        ...(target.stealth !== undefined && { stealth: target.stealth }),
         awaitInitialFrame: target.awaitInitialFrame,
         isolated: target.isolated,
       })

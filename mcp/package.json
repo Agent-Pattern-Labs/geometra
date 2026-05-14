@@ -1,6 +1,6 @@
 {
   "name": "@geometra/mcp",
-  "version": "1.61.2",
+  "version": "1.61.3",
   "description": "MCP server for Geometra — interact with running Geometra apps via the geometry protocol, no browser needed",
   "license": "MIT",
   "type": "module",

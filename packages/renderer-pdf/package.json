@@ -1,6 +1,6 @@
 {
   "name": "@geometra/renderer-pdf",
-  "version": "1.61.2",
+  "version": "1.61.3",
   "description": "PDF renderer for Geometra — consumes computed geometry and produces PDF output",
   "license": "MIT",
   "type": "module",

@@ -1,6 +1,6 @@
 {
   "name": "@geometra/renderer-terminal",
-  "version": "1.61.2",
+  "version": "1.61.3",
   "description": "Terminal/TUI renderer for Geometra — the geometry protocol for UI",
   "license": "MIT",
   "type": "module",

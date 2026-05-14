@@ -2,7 +2,13 @@ import type { ChildProcess } from 'node:child_process'
 import { randomUUID } from 'node:crypto'
 import { performance } from 'node:perf_hooks'
 import WebSocket from 'ws'
-import { spawnGeometraProxy, startEmbeddedGeometraProxy, type EmbeddedProxyRuntime, type SpawnProxyConfig } from './proxy-spawn.js'
+import {
+  resolveStealthMode,
+  spawnGeometraProxy,
+  startEmbeddedGeometraProxy,
+  type EmbeddedProxyRuntime,
+  type SpawnProxyConfig,
+} from './proxy-spawn.js'
 import {
   completeSessionLifecycle,
   failSessionLifecycle,
@@ -439,6 +445,7 @@ interface ReusableProxyEntry {
   runtime?: EmbeddedProxyRuntime
   wsUrl: string
   headless: boolean
+  stealth: boolean
   slowMo: number
   width: number
   height: number
@@ -618,16 +625,18 @@ function enforceReusableProxyPoolLimit(): void {
 function setReusableProxy(
   proxy: { child: ChildProcess } | { runtime: EmbeddedProxyRuntime },
   wsUrl: string,
-  opts: { headless?: boolean; slowMo?: number; width?: number; height?: number; pageUrl?: string; snapshotReady?: boolean; proxy?: SpawnProxyConfig },
+  opts: { headless?: boolean; stealth?: boolean; slowMo?: number; width?: number; height?: number; pageUrl?: string; snapshotReady?: boolean; proxy?: SpawnProxyConfig },
 ): void {
   clearReusableProxiesIfExited()
   const now = Date.now()
   const proxyKey = proxyKeyFor(opts.proxy)
+  const stealth = resolveStealthMode(opts.stealth)
   const existing = reusableProxies.find(entry => sameReusableProxyEntry(entry, proxy))
 
   if (existing) {
     existing.wsUrl = wsUrl
     existing.headless = opts.headless === true
+    existing.stealth = stealth
     existing.slowMo = opts.slowMo ?? 0
     existing.width = opts.width ?? 1280
     existing.height = opts.height ?? 720
@@ -644,6 +653,7 @@ function setReusableProxy(
       child,
       wsUrl,
       headless: opts.headless === true,
+      stealth,
       slowMo: opts.slowMo ?? 0,
       width: opts.width ?? 1280,
       height: opts.height ?? 720,
@@ -671,6 +681,7 @@ function setReusableProxy(
     runtime: proxy.runtime,
     wsUrl,
     headless: opts.headless === true,
+    stealth,
     slowMo: opts.slowMo ?? 0,
     width: opts.width ?? 1280,
     height: opts.height ?? 720,
@@ -901,6 +912,7 @@ function reusableProxyMatchesOptions(
   options: {
     pageUrl: string
     headless?: boolean
+    stealth?: boolean
     slowMo?: number
     width?: number
     height?: number
@@ -910,6 +922,7 @@ function reusableProxyMatchesOptions(
   return (
     entry.pageUrl === options.pageUrl &&
     entry.headless === (options.headless === true) &&
+    entry.stealth === resolveStealthMode(options.stealth) &&
     entry.slowMo === (options.slowMo ?? 0) &&
     entry.width === (options.width ?? 1280) &&
     entry.height === (options.height ?? 720) &&
@@ -920,6 +933,7 @@ function reusableProxyMatchesOptions(
 function findExactReusableProxy(options: {
   pageUrl: string
   headless?: boolean
+  stealth?: boolean
   slowMo?: number
   width?: number
   height?: number
@@ -937,6 +951,7 @@ function findExactReusableProxy(options: {
 function findReusableProxy(options: {
   pageUrl: string
   headless?: boolean
+  stealth?: boolean
   slowMo?: number
   width?: number
   height?: number
@@ -944,6 +959,7 @@ function findReusableProxy(options: {
 }): ReusableProxyEntry | undefined {
   clearReusableProxiesIfExited()
   const desiredHeadless = options.headless === true
+  const desiredStealth = resolveStealthMode(options.stealth)
   const desiredSlowMo = options.slowMo ?? 0
   const desiredWidth = options.width ?? 1280
   const desiredHeight = options.height ?? 720
@@ -952,6 +968,7 @@ function findReusableProxy(options: {
   return reusableProxies
     .filter(entry =>
       entry.headless === desiredHeadless
+      && entry.stealth === desiredStealth
       && entry.slowMo === desiredSlowMo
       // Proxy partition is hard — a session with residential proxy MUST NOT
       // attach to a pooled direct-connection Chromium (and vice versa).
@@ -974,6 +991,7 @@ export async function prewarmProxy(options: {
   pageUrl: string
   port?: number
   headless?: boolean
+  stealth?: boolean
   width?: number
   height?: number
   slowMo?: number
@@ -985,6 +1003,7 @@ export async function prewarmProxy(options: {
   pageUrl: string
   wsUrl: string
   headless: boolean
+  stealth: boolean
   width: number
   height: number
 }> {
@@ -1000,6 +1019,7 @@ export async function prewarmProxy(options: {
       pageUrl: options.pageUrl,
       wsUrl: existing.wsUrl,
       headless: options.headless === true,
+      stealth: resolveStealthMode(options.stealth),
       width: options.width ?? 1280,
       height: options.height ?? 720,
     }
@@ -1014,6 +1034,7 @@ export async function prewarmProxy(options: {
       width: options.width,
       height: options.height,
       slowMo: options.slowMo,
+      stealth: options.stealth,
       proxy: options.proxy,
     })
     try {
@@ -1025,6 +1046,7 @@ export async function prewarmProxy(options: {
     setReusableProxy({ runtime }, wsUrl, {
       headless: options.headless,
       slowMo: options.slowMo,
+      stealth: options.stealth,
       width: options.width,
       height: options.height,
       pageUrl: options.pageUrl,
@@ -1038,6 +1060,7 @@ export async function prewarmProxy(options: {
       pageUrl: options.pageUrl,
       wsUrl,
       headless: options.headless === true,
+      stealth: resolveStealthMode(options.stealth),
       width: options.width ?? 1280,
       height: options.height ?? 720,
     }
@@ -1053,11 +1076,13 @@ export async function prewarmProxy(options: {
       width: options.width,
       height: options.height,
       slowMo: options.slowMo,
+      stealth: options.stealth,
       proxy: options.proxy,
     })
     setReusableProxy({ child }, wsUrl, {
       headless: options.headless,
       slowMo: options.slowMo,
+      stealth: options.stealth,
       width: options.width,
       height: options.height,
       pageUrl: options.pageUrl,
@@ -1070,6 +1095,7 @@ export async function prewarmProxy(options: {
       pageUrl: options.pageUrl,
       wsUrl,
       headless: options.headless === true,
+      stealth: resolveStealthMode(options.stealth),
       width: options.width ?? 1280,
       height: options.height ?? 720,
     }
@@ -1166,6 +1192,7 @@ async function startFreshProxySession(options: {
   width?: number
   height?: number
   slowMo?: number
+  stealth?: boolean
   awaitInitialFrame?: boolean
   eagerInitialExtract?: boolean
   /**
@@ -1194,6 +1221,7 @@ async function startFreshProxySession(options: {
       width: options.width,
       height: options.height,
       slowMo: options.slowMo,
+      stealth: options.stealth,
       eagerInitialExtract,
       proxy: options.proxy,
     })
@@ -1221,6 +1249,7 @@ async function startFreshProxySession(options: {
       setReusableProxy({ runtime }, wsUrl, {
         headless: options.headless,
         slowMo: options.slowMo,
+        stealth: options.stealth,
         width: options.width,
         height: options.height,
         pageUrl: options.pageUrl,
@@ -1266,6 +1295,7 @@ async function startFreshProxySession(options: {
       width: options.width,
       height: options.height,
       slowMo: options.slowMo,
+      stealth: options.stealth,
       eagerInitialExtract,
       proxy: options.proxy,
     })
@@ -1287,6 +1317,7 @@ async function startFreshProxySession(options: {
         setReusableProxy({ child }, wsUrl, {
           headless: options.headless,
           slowMo: options.slowMo,
+          stealth: options.stealth,
           width: options.width,
           height: options.height,
           pageUrl: options.pageUrl,
@@ -1501,6 +1532,7 @@ export async function connectThroughProxy(options: {
   width?: number
   height?: number
   slowMo?: number
+  stealth?: boolean
   awaitInitialFrame?: boolean
   eagerInitialExtract?: boolean
   /**
