@@ -64,6 +64,7 @@
     "mcp:build": "cd mcp && npm run build",
     "mcp:check": "cd mcp && npm run check",
     "mcp:test": "cd mcp && npm run test",
+    "browsers:install": "npm run browsers:install -w @geometra/proxy",
     "clean": "node scripts/clean.mjs",
     "cursor-agent:loop": "./scripts/cursor-agent-loop.sh",
     "prepare": "husky"

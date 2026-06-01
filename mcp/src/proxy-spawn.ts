@@ -8,6 +8,8 @@ const require = createRequire(import.meta.url)
 const READY_SIGNAL_TYPE = 'geometra-proxy-ready'
 const READY_TIMEOUT_MS = 45_000
 const MODULE_DIR = path.dirname(fileURLToPath(import.meta.url))
+const PLAYWRIGHT_INSTALL_HINT =
+  'Install Chromium with the Playwright version bundled in this package: npm run browsers:install -w @geometra/proxy (repo checkout) or npx --no-install playwright install chromium.'
 
 export interface EmbeddedProxyRuntime {
   wsUrl: string
@@ -219,7 +221,7 @@ export async function startEmbeddedGeometraProxy(
   return { runtime, wsUrl: runtime.wsUrl }
 }
 
-export function parseProxyReadySignalLine(line: string): string | undefined {
+export function parseProxyReadySignalLine(line: string, options?: { allowLegacy?: boolean }): string | undefined {
   const trimmed = line.trim()
   if (!trimmed) return undefined
 
@@ -238,6 +240,8 @@ export function parseProxyReadySignalLine(line: string): string | undefined {
     }
   }
 
+  if (options?.allowLegacy === false) return undefined
+
   const fallback = trimmed.match(/WebSocket listening on (ws:\/\/127\.0\.0\.1:\d+)/)
   return fallback?.[1]
 }
@@ -246,7 +250,7 @@ export function formatProxyStartupFailure(message: string, opts: SpawnProxyParam
   const hints: string[] = []
 
   if (/Executable doesn't exist|playwright install chromium|browserType\.launch/i.test(message)) {
-    hints.push('Install Chromium with: npx playwright install chromium')
+    hints.push(PLAYWRIGHT_INSTALL_HINT)
   }
 
   if (/cloakbrowser|CLOAKBROWSER|ERR_MODULE_NOT_FOUND|Cannot find package/i.test(message)) {
@@ -303,7 +307,7 @@ export function spawnGeometraProxy(opts: SpawnProxyParams): Promise<{ child: Chi
     }
 
     const tryResolveReady = (line: string) => {
-      const wsUrl = parseProxyReadySignalLine(line)
+      const wsUrl = parseProxyReadySignalLine(line, { allowLegacy: false })
       if (!wsUrl || settled) return false
       settled = true
       cleanup()

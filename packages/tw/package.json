@@ -1,6 +1,6 @@
 {
   "name": "@geometra/tw",
-  "version": "1.61.3",
+  "version": "1.62.1",
   "description": "Tailwind-style utility classes for Geometra",
   "license": "MIT",
   "type": "module",

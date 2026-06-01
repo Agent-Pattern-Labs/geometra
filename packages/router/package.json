@@ -1,6 +1,6 @@
 {
   "name": "@geometra/router",
-  "version": "1.61.3",
+  "version": "1.62.1",
   "description": "Routing primitives for Geometra",
   "license": "MIT",
   "type": "module",

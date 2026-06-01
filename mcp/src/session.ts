@@ -814,6 +814,12 @@ function formatUnknownError(err: unknown): string {
   return err instanceof Error ? err.message : String(err)
 }
 
+function rejectOnRuntimeReadyFailure(runtime: EmbeddedProxyRuntime): Promise<never> {
+  return new Promise((_, reject) => {
+    runtime.ready.catch(reject)
+  })
+}
+
 function warnSessionLifecycleError(action: string, session: Session, err: unknown): void {
   console.warn(`geometra-mcp: failed to ${action} for session ${session.id}: ${formatUnknownError(err)}`)
 }
@@ -1227,11 +1233,14 @@ async function startFreshProxySession(options: {
     })
     pendingEmbeddedRuntime = runtime
     const proxyStartMs = performance.now() - proxyStartStartedAt
-    const session = await connect(wsUrl, {
-      skipInitialResize: true,
-      closePreviousProxy: false,
-      awaitInitialFrame: options.awaitInitialFrame,
-    })
+    const session = await Promise.race([
+      connect(wsUrl, {
+        skipInitialResize: true,
+        closePreviousProxy: false,
+        awaitInitialFrame: options.awaitInitialFrame,
+      }),
+      rejectOnRuntimeReadyFailure(runtime),
+    ])
     // Connect succeeded — the session now owns the runtime, so the
     // catch-block cleanup below must not also close it.
     pendingEmbeddedRuntime = undefined

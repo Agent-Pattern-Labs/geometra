@@ -171,6 +171,12 @@ async function main(): Promise<void> {
     },
   })
   const wsUrl = runtime.wsUrl
+  try {
+    await runtime.ready
+  } catch (err) {
+    await runtime.close().catch(() => {})
+    throw err
+  }
   console.error(`[geometra-proxy] Ready. Connect MCP with geometra_connect({ url: "${wsUrl}" })`)
   emitReadySignal(wsUrl, url)
 

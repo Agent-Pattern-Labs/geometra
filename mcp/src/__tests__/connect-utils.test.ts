@@ -334,12 +334,26 @@ describe('proxy ready helpers', () => {
     expect(wsUrl).toBe('ws://127.0.0.1:3200')
   })
 
+  it('can require structured ready JSON for managed child-process launches', () => {
+    const listening = parseProxyReadySignalLine(
+      '[geometra-proxy] WebSocket listening on ws://127.0.0.1:3200',
+      { allowLegacy: false },
+    )
+    const ready = parseProxyReadySignalLine(
+      '{"type":"geometra-proxy-ready","wsUrl":"ws://127.0.0.1:41237","pageUrl":"https://example.com"}',
+      { allowLegacy: false },
+    )
+
+    expect(listening).toBeUndefined()
+    expect(ready).toBe('ws://127.0.0.1:41237')
+  })
+
   it('adds install and port conflict hints to proxy startup failures', () => {
     const chromiumHint = formatProxyStartupFailure(
       "browserType.launch: Executable doesn't exist at /tmp/chromium",
       { pageUrl: 'https://example.com', port: 0 },
     )
-    expect(chromiumHint).toContain('npx playwright install chromium')
+    expect(chromiumHint).toContain('npx --no-install playwright install chromium')
 
     const portHint = formatProxyStartupFailure(
       'listen EADDRINUSE: address already in use 127.0.0.1:3337',

@@ -1,3 +1,6 @@
+import { spawn } from 'node:child_process'
+import { createRequire } from 'node:module'
+import path from 'node:path'
 import { performance } from 'node:perf_hooks'
 import { chromium, type Browser, type Page } from 'playwright'
 import {
@@ -6,6 +9,12 @@ import {
   type GeometryWsHub,
   type GeometryWsTrace,
 } from './geometry-ws.js'
+
+const require = createRequire(import.meta.url)
+const AUTO_INSTALL_ENV = 'GEOMETRA_PROXY_AUTO_INSTALL_BROWSERS'
+const PLAYWRIGHT_INSTALL_HINT =
+  'Install Chromium with the Playwright version bundled in this package: npm run browsers:install -w @geometra/proxy (repo checkout) or npx --no-install playwright install chromium.'
+const PROCESS_OUTPUT_TAIL_LIMIT = 6_000
 
 export interface ProxyRuntimeTrace {
   browserFlavor?: 'chromium' | 'stealth'
@@ -85,7 +94,7 @@ export function parseHttpPageUrl(raw: string): string {
 export function formatProxyFatalError(err: unknown): string {
   const base = err instanceof Error ? err.message : String(err)
   if (/Executable doesn't exist|playwright install chromium|browserType\.launch/i.test(base)) {
-    return `${base}\nInstall Chromium with: npx playwright install chromium`
+    return `${base}\n${PLAYWRIGHT_INSTALL_HINT}`
   }
   if (/cloakbrowser|CLOAKBROWSER|ERR_MODULE_NOT_FOUND|Cannot find package/i.test(base)) {
     return `${base}\nStealth mode uses CloakBrowser. Install dependencies with: npm install, or disable stealth with --no-stealth / GEOMETRA_STEALTH=0. To prefetch the patched Chromium binary, run: npx cloakbrowser install`
@@ -109,6 +118,105 @@ function createDeferred<T>(): {
     reject = rejectPromise
   })
   return { promise, resolve, reject }
+}
+
+function truthyEnv(value: string | undefined): boolean {
+  return value != null && /^(1|true|yes|on)$/i.test(value)
+}
+
+function falseyEnv(value: string | undefined): boolean {
+  return value != null && /^(0|false|no|off)$/i.test(value)
+}
+
+function autoInstallBrowsersEnabled(): boolean {
+  if (falseyEnv(process.env[AUTO_INSTALL_ENV])) return false
+  if (truthyEnv(process.env.PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD)) return false
+  return true
+}
+
+function isMissingPlaywrightChromiumExecutableError(err: unknown): boolean {
+  const message = err instanceof Error ? err.message : String(err)
+  return (
+    /Executable doesn't exist/i.test(message) &&
+    /(chromium|chrome|headless)/i.test(message)
+  ) || /Looks like Playwright was just installed or updated/i.test(message)
+}
+
+function resolvedPlaywrightCliPath(): string {
+  const packageJsonPath = require.resolve('playwright/package.json')
+  return path.join(path.dirname(packageJsonPath), 'cli.js')
+}
+
+function appendTail(existing: string, chunk: Buffer): string {
+  const next = existing + chunk.toString()
+  return next.length > PROCESS_OUTPUT_TAIL_LIMIT
+    ? next.slice(-PROCESS_OUTPUT_TAIL_LIMIT)
+    : next
+}
+
+let playwrightChromiumInstallPromise: Promise<void> | undefined
+
+function installPlaywrightChromiumForResolvedPackage(): Promise<void> {
+  playwrightChromiumInstallPromise ??= new Promise<void>((resolve, reject) => {
+    let stdoutTail = ''
+    let stderrTail = ''
+    const child = spawn(process.execPath, [resolvedPlaywrightCliPath(), 'install', 'chromium'], {
+      stdio: ['ignore', 'pipe', 'pipe'],
+      env: {
+        ...process.env,
+        PLAYWRIGHT_SKIP_BROWSER_GC: process.env.PLAYWRIGHT_SKIP_BROWSER_GC ?? '1',
+      },
+    })
+
+    child.stdout?.on('data', chunk => {
+      stdoutTail = appendTail(stdoutTail, chunk)
+    })
+    child.stderr?.on('data', chunk => {
+      stderrTail = appendTail(stderrTail, chunk)
+    })
+    child.on('error', reject)
+    child.on('exit', (code, signal) => {
+      if (code === 0) {
+        resolve()
+        return
+      }
+
+      const detail = [stdoutTail.trim(), stderrTail.trim()].filter(Boolean).join('\n')
+      reject(
+        new Error(
+          `Playwright browser install failed (code=${code} signal=${signal}).${detail ? ` Output tail:\n${detail}` : ''}`,
+        ),
+      )
+    })
+  }).finally(() => {
+    playwrightChromiumInstallPromise = undefined
+  })
+
+  return playwrightChromiumInstallPromise
+}
+
+async function launchChromiumWithBrowserInstallRetry(
+  launchOpts: Parameters<typeof chromium.launch>[0],
+): Promise<Browser> {
+  try {
+    return await chromium.launch(launchOpts)
+  } catch (err) {
+    if (!autoInstallBrowsersEnabled() || !isMissingPlaywrightChromiumExecutableError(err)) {
+      throw err
+    }
+
+    try {
+      await installPlaywrightChromiumForResolvedPackage()
+      return await chromium.launch(launchOpts)
+    } catch (retryErr) {
+      const original = err instanceof Error ? err.message : String(err)
+      const retry = retryErr instanceof Error ? retryErr.message : String(retryErr)
+      throw new Error(
+        `Chromium launch failed because the Playwright browser revision was missing. Geometra attempted to install the browser for the resolved Playwright package and retry once, but launch still failed.\nOriginal error: ${original}\nRetry error: ${retry}\n${PLAYWRIGHT_INSTALL_HINT}`,
+        { cause: retryErr },
+      )
+    }
+  }
 }
 
 export async function launchProxyRuntime(options: LaunchProxyRuntimeOptions): Promise<ProxyRuntimeHandle> {
@@ -224,7 +332,7 @@ export async function launchProxyRuntime(options: LaunchProxyRuntimeOptions): Pr
       }
       if (options.slowMo && options.slowMo > 0) launchOpts.slowMo = options.slowMo
       if (proxy) launchOpts.proxy = proxy
-      browser = await chromium.launch(launchOpts)
+      browser = await launchChromiumWithBrowserInstallRetry(launchOpts)
     }
     trace.browserLaunchMs = performance.now() - browserLaunchStartedAt
     browser?.on('disconnected', () => {
@@ -260,6 +368,7 @@ export async function launchProxyRuntime(options: LaunchProxyRuntimeOptions): Pr
     void hub.close().catch(() => {})
     throw err
   })
+  void ready.catch(() => {})
 
   const listeningWsUrl = await listeningPromise
   trace.wsListeningMs = performance.now() - runtimeStartedAt
