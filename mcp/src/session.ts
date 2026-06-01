@@ -635,7 +635,7 @@ function setReusableProxy(
 
   if (existing) {
     existing.wsUrl = wsUrl
-    existing.headless = opts.headless === true
+    existing.headless = opts.headless !== false
     existing.stealth = stealth
     existing.slowMo = opts.slowMo ?? 0
     existing.width = opts.width ?? 1280
@@ -652,7 +652,7 @@ function setReusableProxy(
     const entry: ReusableProxyEntry = {
       child,
       wsUrl,
-      headless: opts.headless === true,
+      headless: opts.headless !== false,
       stealth,
       slowMo: opts.slowMo ?? 0,
       width: opts.width ?? 1280,
@@ -680,7 +680,7 @@ function setReusableProxy(
   reusableProxies.push({
     runtime: proxy.runtime,
     wsUrl,
-    headless: opts.headless === true,
+    headless: opts.headless !== false,
     stealth,
     slowMo: opts.slowMo ?? 0,
     width: opts.width ?? 1280,
@@ -921,7 +921,7 @@ function reusableProxyMatchesOptions(
 ): boolean {
   return (
     entry.pageUrl === options.pageUrl &&
-    entry.headless === (options.headless === true) &&
+    entry.headless === (options.headless !== false) &&
     entry.stealth === resolveStealthMode(options.stealth) &&
     entry.slowMo === (options.slowMo ?? 0) &&
     entry.width === (options.width ?? 1280) &&
@@ -958,7 +958,7 @@ function findReusableProxy(options: {
   proxy?: SpawnProxyConfig
 }): ReusableProxyEntry | undefined {
   clearReusableProxiesIfExited()
-  const desiredHeadless = options.headless === true
+  const desiredHeadless = options.headless !== false
   const desiredStealth = resolveStealthMode(options.stealth)
   const desiredSlowMo = options.slowMo ?? 0
   const desiredWidth = options.width ?? 1280
@@ -1018,7 +1018,7 @@ export async function prewarmProxy(options: {
       transport: existing.runtime ? 'embedded' : 'child',
       pageUrl: options.pageUrl,
       wsUrl: existing.wsUrl,
-      headless: options.headless === true,
+      headless: options.headless !== false,
       stealth: resolveStealthMode(options.stealth),
       width: options.width ?? 1280,
       height: options.height ?? 720,
@@ -1059,7 +1059,7 @@ export async function prewarmProxy(options: {
       transport: 'embedded',
       pageUrl: options.pageUrl,
       wsUrl,
-      headless: options.headless === true,
+      headless: options.headless !== false,
       stealth: resolveStealthMode(options.stealth),
       width: options.width ?? 1280,
       height: options.height ?? 720,
@@ -1094,7 +1094,7 @@ export async function prewarmProxy(options: {
       transport: 'child',
       pageUrl: options.pageUrl,
       wsUrl,
-      headless: options.headless === true,
+      headless: options.headless !== false,
       stealth: resolveStealthMode(options.stealth),
       width: options.width ?? 1280,
       height: options.height ?? 720,

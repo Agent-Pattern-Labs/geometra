@@ -7,7 +7,7 @@ const mockState = vi.hoisted(() => ({
 }))
 
 vi.mock('../proxy-spawn.js', () => ({
-  resolveStealthMode: (stealth?: boolean) => stealth ?? false,
+  resolveStealthMode: (stealth?: boolean) => stealth ?? true,
   startEmbeddedGeometraProxy: mockState.startEmbeddedGeometraProxy,
   spawnGeometraProxy: mockState.spawnGeometraProxy,
 }))

@@ -93,19 +93,8 @@ export function formatProxyFatalError(err: unknown): string {
   return base
 }
 
-function envRequestsStealth(): boolean {
-  const explicit = process.env.GEOMETRA_STEALTH
-  if (explicit !== undefined) {
-    const v = explicit.toLowerCase()
-    return v === '1' || v === 'true' || v === 'yes' || v === 'stealth' || v === 'cloak'
-  }
-
-  const browser = (process.env.GEOMETRA_BROWSER ?? '').toLowerCase()
-  return browser === 'stealth' || browser === 'cloak' || browser === 'cloakbrowser'
-}
-
 export function resolveStealthMode(stealth?: boolean): boolean {
-  return stealth ?? envRequestsStealth()
+  return stealth ?? true
 }
 
 function createDeferred<T>(): {

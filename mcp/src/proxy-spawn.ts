@@ -180,19 +180,8 @@ export interface SpawnProxyParams {
   proxy?: SpawnProxyConfig
 }
 
-function envRequestsStealth(): boolean {
-  const explicit = process.env.GEOMETRA_STEALTH
-  if (explicit !== undefined) {
-    const v = explicit.toLowerCase()
-    return v === '1' || v === 'true' || v === 'yes' || v === 'stealth' || v === 'cloak'
-  }
-
-  const browser = (process.env.GEOMETRA_BROWSER ?? '').toLowerCase()
-  return browser === 'stealth' || browser === 'cloak' || browser === 'cloakbrowser'
-}
-
 export function resolveStealthMode(stealth?: boolean): boolean {
-  return stealth ?? envRequestsStealth()
+  return stealth ?? true
 }
 
 export async function startEmbeddedGeometraProxy(
@@ -221,7 +210,7 @@ export async function startEmbeddedGeometraProxy(
     port: opts.port,
     width: opts.width,
     height: opts.height,
-    headed: opts.headless !== true,
+    headed: opts.headless === false,
     slowMo: opts.slowMo,
     ...(opts.stealth !== undefined && { stealth: opts.stealth }),
     eagerInitialExtract: opts.eagerInitialExtract,
@@ -285,8 +274,8 @@ export function spawnGeometraProxy(opts: SpawnProxyParams): Promise<{ child: Chi
   if (opts.width != null && opts.width > 0) args.push('--width', String(opts.width))
   if (opts.height != null && opts.height > 0) args.push('--height', String(opts.height))
   if (opts.slowMo != null && opts.slowMo > 0) args.push('--slow-mo', String(opts.slowMo))
-  if (opts.headless === true) args.push('--headless')
-  else if (opts.headless === false) args.push('--headed')
+  if (opts.headless === false) args.push('--headed')
+  else args.push('--headless')
   if (opts.stealth === true) args.push('--stealth')
   else if (opts.stealth === false) args.push('--no-stealth')
   if (opts.eagerInitialExtract === false) args.push('--lazy-initial-extract')

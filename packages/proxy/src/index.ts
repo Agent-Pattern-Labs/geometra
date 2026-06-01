@@ -8,9 +8,9 @@ function printUsage(): void {
 
 Open <url> in Chromium and stream GEOM v1 frames on WebSocket (JSON text).
 
-Default is a visible browser window (headed) so you can watch MCP-driven automation.
-Use --headless or env GEOMETRA_HEADLESS=1 for CI / servers without a display.
-Use --stealth or env GEOMETRA_STEALTH=1 to launch CloakBrowser's patched Chromium.
+Default is headless with stealth enabled — no visible browser window.
+Use --headed for a visible browser window (debugging).
+Use --no-stealth to use stock Playwright Chromium instead of CloakBrowser.
 
 Use --proxy-server to route all Chromium traffic through a residential / mobile / SOCKS proxy.
 Pair with --proxy-username/--proxy-password if the proxy requires auth. Helps bypass
@@ -27,11 +27,6 @@ Examples:
 Requires Chromium for Playwright:  npx playwright install chromium
 Stealth mode uses CloakBrowser and downloads its patched Chromium on first launch:  npx cloakbrowser install
 `)
-}
-
-function envRequestsHeadless(): boolean {
-  const v = (process.env.GEOMETRA_HEADLESS ?? '').toLowerCase()
-  return v === '1' || v === 'true' || v === 'yes'
 }
 
 function envRequestsReadyJson(): boolean {
@@ -80,7 +75,7 @@ function parseArgs(argv: string[]): {
   let port = 3200
   let width = 1280
   let height = 720
-  let headed = !envRequestsHeadless()
+  let headed = false
   let stealth: boolean | undefined
   let slowMo = 0
   let eagerInitialExtract = !envRequestsLazyInitialExtract()
