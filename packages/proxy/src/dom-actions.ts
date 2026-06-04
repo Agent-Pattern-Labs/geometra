@@ -2119,6 +2119,119 @@ async function pressEnterToCommitListbox(
 }
 
 /**
+ * After a custom listbox option click, make the committed value visible to
+ * framework state managers that listen on the backing input/select instead of
+ * the popup option. This covers React controlled inputs, react-hook-form
+ * hidden inputs, and intl-tel-input country pickers without site branching.
+ */
+async function dispatchListboxCommitEvents(
+  handle: ElementHandle<Element> | null | undefined,
+): Promise<boolean> {
+  if (!handle) return false
+  try {
+    return await handle.evaluate((el) => {
+      if (!(el instanceof Element)) return false
+
+      function clearReactTracker(target: HTMLElement): void {
+        const tracker = (target as unknown as { _valueTracker?: { setValue: (value: string) => void } })._valueTracker
+        if (!tracker || typeof tracker.setValue !== 'function') return
+        try {
+          if (target instanceof HTMLInputElement && (target.type === 'checkbox' || target.type === 'radio')) {
+            tracker.setValue(String(!target.checked))
+            return
+          }
+          const current = target instanceof HTMLInputElement || target instanceof HTMLTextAreaElement
+            ? target.value
+            : target instanceof HTMLSelectElement
+              ? target.value
+              : target.textContent ?? ''
+          tracker.setValue(current === '' ? '__geometra_empty__' : '')
+        } catch { /* ignore */ }
+      }
+
+      function dispatchCommit(target: HTMLElement): void {
+        clearReactTracker(target)
+        const inputType = target instanceof HTMLInputElement ? target.type.toLowerCase() : ''
+        const isSearchQueryInput =
+          target instanceof HTMLInputElement &&
+          !['hidden', 'checkbox', 'radio', 'tel'].includes(inputType) &&
+          (
+            target.getAttribute('role') === 'combobox' ||
+            target.hasAttribute('aria-autocomplete') ||
+            target.hasAttribute('aria-activedescendant')
+          )
+        if (!isSearchQueryInput) {
+          target.dispatchEvent(new Event('input', { bubbles: true }))
+        }
+        target.dispatchEvent(new Event('change', { bubbles: true }))
+        if (
+          target instanceof HTMLInputElement &&
+          (
+            target.type === 'tel' ||
+            target.closest('.iti, .intl-tel-input, [data-intl-tel-input-id], [class*="phone"], [class*="Phone"]')
+          )
+        ) {
+          target.dispatchEvent(new Event('countrychange', { bubbles: true }))
+        }
+      }
+
+      function commitRoot(start: Element): Element {
+        let best: Element = start.parentElement ?? start
+        let current: Element | null = start.parentElement
+        let depth = 0
+        while (current && depth < 6) {
+          if (current.tagName.toLowerCase() === 'form') break
+          const className = (current.getAttribute('class') ?? '').toLowerCase()
+          const controlCount = current.querySelectorAll('input, textarea, select, [role="combobox"], [aria-haspopup="listbox"]').length
+          const looksLikeField =
+            current.querySelector('label, legend') !== null ||
+            className.includes('field') ||
+            className.includes('form-group') ||
+            className.includes('form-control') ||
+            className.includes('select') ||
+            className.includes('combo') ||
+            className.includes('phone') ||
+            className.includes('iti') ||
+            className.includes('input')
+          if (looksLikeField && controlCount > 0 && controlCount <= 10) best = current
+          current = current.parentElement
+          depth++
+        }
+        return best
+      }
+
+      const targets: HTMLElement[] = []
+      const seen = new Set<HTMLElement>()
+      const add = (candidate: Element | null | undefined): void => {
+        if (!(candidate instanceof HTMLElement)) return
+        if (seen.has(candidate)) return
+        seen.add(candidate)
+        targets.push(candidate)
+      }
+
+      add(el)
+      const root = commitRoot(el)
+      for (const candidate of Array.from(root.querySelectorAll<HTMLElement>(
+        'input, textarea, select, [role="combobox"], [aria-haspopup="listbox"]',
+      ))) {
+        if (
+          candidate.closest('[role="listbox"], [role="menu"]') &&
+          !candidate.matches('[role="combobox"], input, select, textarea')
+        ) {
+          continue
+        }
+        add(candidate)
+      }
+
+      for (const target of targets) dispatchCommit(target)
+      return targets.length > 0
+    })
+  } catch {
+    return false
+  }
+}
+
+/**
  * Read form-level invalid state for a combobox trigger.
  *
  * `readAriaInvalid` / `readTriggerShowsPlaceholder` only consult attributes
@@ -3487,11 +3600,35 @@ async function attemptNativeBatchFill(page: Page, fields: FormFieldFill[]): Prom
         target.dispatchEvent(new Event('change', { bubbles: true }))
       }
 
+      function clearReactTracker(target: HTMLInputElement | HTMLTextAreaElement | HTMLElement, nextChecked?: boolean): boolean {
+        const tracker = (target as unknown as { _valueTracker?: { setValue: (value: string) => void } })._valueTracker
+        if (!tracker || typeof tracker.setValue !== 'function') return false
+        try {
+          if (target instanceof HTMLInputElement && (target.type === 'checkbox' || target.type === 'radio')) {
+            tracker.setValue(String(!(nextChecked ?? target.checked)))
+          } else {
+            tracker.setValue('')
+          }
+          return true
+        } catch { /* ignore */ }
+        return false
+      }
+
       function setInputLikeValue(target: HTMLInputElement | HTMLTextAreaElement, next: string): void {
         const proto = target instanceof HTMLInputElement ? HTMLInputElement.prototype : HTMLTextAreaElement.prototype
         const descriptor = Object.getOwnPropertyDescriptor(proto, 'value')
         if (descriptor?.set) descriptor.set.call(target, next)
         else target.value = next
+      }
+
+      function setInputCheckedReactAware(target: HTMLInputElement, next: boolean): boolean {
+        const hadReactTracker = clearReactTracker(target, next)
+        if (!hadReactTracker && target.checked === next) return true
+        const descriptor = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'checked')
+        if (descriptor?.set) descriptor.set.call(target, next)
+        else target.checked = next
+        dispatch(target)
+        return target.checked === next
       }
 
       function currentValue(el: Element): string {
@@ -3637,6 +3774,7 @@ async function attemptNativeBatchFill(page: Page, fields: FormFieldFill[]): Prom
             const inputType = control instanceof HTMLInputElement ? control.type : 'textarea'
             const v = canonicalizeHtmlInputValueInPage(inputType, value)
             control.focus()
+            clearReactTracker(control)
             setInputLikeValue(control, v)
             dispatch(control)
             return matches(currentValue(control), v, false)
@@ -3644,6 +3782,7 @@ async function attemptNativeBatchFill(page: Page, fields: FormFieldFill[]): Prom
           if (control instanceof HTMLElement && control.isContentEditable) {
             if (!isPlainContentEditableBatch(control)) return false
             control.focus()
+            clearReactTracker(control)
             control.textContent = value
             dispatch(control)
             return matches(currentValue(control), value, false)
@@ -3721,17 +3860,12 @@ async function attemptNativeBatchFill(page: Page, fields: FormFieldFill[]): Prom
             if (!matches(choiceLabel(option), value, exact)) continue
 
             if (option instanceof HTMLInputElement) {
-              if (!option.checked) option.click()
-              if (!option.checked) {
-                option.checked = true
-                dispatch(option)
-              }
-              return option.checked
+              return setInputCheckedReactAware(option, true)
             }
             if (option instanceof HTMLLabelElement) {
-              option.click()
               const control = option.control
-              if (control instanceof HTMLInputElement) return control.checked
+              if (control instanceof HTMLInputElement) return setInputCheckedReactAware(control, true)
+              option.click()
               return true
             }
             // role=radio / role=checkbox: click and verify aria-checked
@@ -3771,13 +3905,7 @@ async function attemptNativeBatchFill(page: Page, fields: FormFieldFill[]): Prom
           if (!(input instanceof HTMLInputElement) || !visible(input)) continue
           if (controlType && input.type !== controlType) continue
           if (!matches(explicitLabelText(input), label, exact)) continue
-          if (input.checked !== checked) {
-            input.click()
-            if (input.checked !== checked) {
-              input.checked = checked
-              dispatch(input)
-            }
-          }
+          if (!setInputCheckedReactAware(input, checked)) return false
           return input.checked === checked
         }
 
@@ -3788,11 +3916,7 @@ async function attemptNativeBatchFill(page: Page, fields: FormFieldFill[]): Prom
           const control = labelEl.control
           if (!(control instanceof HTMLInputElement)) continue
           if (controlType && control.type !== controlType) continue
-          if (control.checked !== checked) labelEl.click()
-          if (control.checked !== checked) {
-            control.checked = checked
-            dispatch(control)
-          }
+          if (!setInputCheckedReactAware(control, checked)) return false
           return control.checked === checked
         }
 
@@ -4547,6 +4671,32 @@ async function chooseValueFromLabeledGroup(
         }).join('||')
       }
 
+      function dispatch(target: HTMLElement): void {
+        target.dispatchEvent(new Event('input', { bubbles: true }))
+        target.dispatchEvent(new Event('change', { bubbles: true }))
+      }
+
+      function clearReactTracker(target: HTMLInputElement, next: boolean): boolean {
+        const tracker = (target as unknown as { _valueTracker?: { setValue: (value: string) => void } })._valueTracker
+        if (tracker && typeof tracker.setValue === 'function') {
+          try {
+            tracker.setValue(String(!next))
+            return true
+          } catch { /* ignore */ }
+        }
+        return false
+      }
+
+      function setInputCheckedReactAware(target: HTMLInputElement, next: boolean): boolean {
+        const hadReactTracker = clearReactTracker(target, next)
+        if (!hadReactTracker && target.checked === next) return true
+        const descriptor = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'checked')
+        if (descriptor?.set) descriptor.set.call(target, next)
+        else target.checked = next
+        dispatch(target)
+        return target.checked === next
+      }
+
       for (const candidate of candidates) {
         const options = Array.from(
           candidate.root.querySelectorAll('input[type="radio"], input[type="checkbox"], [role="radio"], [role="checkbox"], label, button'),
@@ -4557,14 +4707,13 @@ async function chooseValueFromLabeledGroup(
           if (!matchesChoice(choiceLabel(option))) continue
 
           if (option instanceof HTMLInputElement) {
-            option.click()
-            return option.checked
+            return setInputCheckedReactAware(option, true)
           }
           if (option instanceof HTMLLabelElement) {
             const labelBeforeSig = selectionSignature(options)
-            option.click()
             const control = option.control
-            if (control instanceof HTMLInputElement) return control.checked
+            if (control instanceof HTMLInputElement) return setInputCheckedReactAware(control, true)
+            option.click()
             // No backing input — verify via group signature change so we don't
             // silently no-op on label wrappers whose target is unparented.
             const labelAfterSig = selectionSignature(options)
@@ -5006,6 +5155,7 @@ export async function pickListboxOption(
     // commit path, which ALL tested libraries honor. No-op for native
     // <select> / plain ARIA listboxes — see isAutocompleteCombobox.
     await pressEnterToCommitListbox(page, openedHandle)
+    await dispatchListboxCommitEvents(openedHandle)
     if (
       !opts?.fieldLabel ||
       await confirmListboxSelection(page, opts.fieldLabel, label, exact, anchor, openedHandle, selectedOptionText, {
@@ -5115,6 +5265,7 @@ export async function pickListboxOption(
     if (keyboardSelection) {
       selectedOptionText = keyboardSelection
       attemptedSelection = true
+      await dispatchListboxCommitEvents(openedHandle)
       if (
         !opts?.fieldLabel ||
         await confirmListboxSelection(page, opts.fieldLabel, label, exact, anchor, openedHandle, selectedOptionText, {
@@ -5252,6 +5403,32 @@ export async function setCheckedControl(page: Page, label: string, opts?: SetChe
           return el instanceof HTMLElement ? el : null
         }
 
+        function dispatch(target: HTMLElement): void {
+          target.dispatchEvent(new Event('input', { bubbles: true }))
+          target.dispatchEvent(new Event('change', { bubbles: true }))
+        }
+
+        function clearReactTracker(target: HTMLInputElement, next: boolean): boolean {
+          const tracker = (target as unknown as { _valueTracker?: { setValue: (value: string) => void } })._valueTracker
+          if (tracker && typeof tracker.setValue === 'function') {
+            try {
+              tracker.setValue(String(!next))
+              return true
+            } catch { /* ignore */ }
+          }
+          return false
+        }
+
+        function setInputCheckedReactAware(target: HTMLInputElement, next: boolean): boolean {
+          const hadReactTracker = clearReactTracker(target, next)
+          if (!hadReactTracker && target.checked === next) return true
+          const descriptor = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'checked')
+          if (descriptor?.set) descriptor.set.call(target, next)
+          else target.checked = next
+          dispatch(target)
+          return target.checked === next
+        }
+
         const selector = 'input[type="checkbox"], input[type="radio"], [role="checkbox"], [role="radio"], [role="switch"]'
         const candidates = Array.from(document.querySelectorAll(selector)).filter(
           (el): el is HTMLElement => el instanceof HTMLElement && visible(el),
@@ -5274,15 +5451,13 @@ export async function setCheckedControl(page: Page, label: string, opts?: SetChe
           return { matched: true as const, success: before === false, reason: 'radio-uncheck' as const, kind, name }
         }
 
-        if (before !== payload.checked) {
+        if (before !== payload.checked && !(target instanceof HTMLInputElement)) {
           clickTarget(target)?.click()
         }
 
         let after = readChecked(target)
-        if (after !== payload.checked && target instanceof HTMLInputElement) {
-          target.checked = payload.checked
-          target.dispatchEvent(new Event('input', { bubbles: true }))
-          target.dispatchEvent(new Event('change', { bubbles: true }))
+        if (target instanceof HTMLInputElement) {
+          setInputCheckedReactAware(target, payload.checked)
           after = target.checked
         }
 

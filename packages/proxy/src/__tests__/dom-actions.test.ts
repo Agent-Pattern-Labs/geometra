@@ -3,7 +3,7 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { afterAll, beforeAll, describe, expect, it } from 'vitest'
 import { chromium, type Browser } from 'playwright'
-import { attachFiles, fillFields, fillOtp, pickListboxOption, setFieldChoice, setFieldText, wheelAt } from '../dom-actions.ts'
+import { attachFiles, fillFields, fillOtp, pickListboxOption, setCheckedControl, setFieldChoice, setFieldText, wheelAt } from '../dom-actions.ts'
 
 describe('pickListboxOption', () => {
   let browser: Browser
@@ -1050,6 +1050,101 @@ describe('pickListboxOption', () => {
     await page.close()
   }, 60_000)
 
+  it('dispatches framework-visible commit events after a listbox visually updates its hidden input', async () => {
+    // Regression for Greenhouse/Twilio-style phone country widgets: the
+    // option click updates visible chrome and writes the hidden input value,
+    // but the app-level controlled state only updates from the hidden input's
+    // change event. Without the generic post-click commit dispatch,
+    // pickListboxOption reports success while Submit remains disabled.
+    const page = await browser.newPage({ viewport: { width: 900, height: 700 } })
+    await page.setContent(`
+      <style>
+        body { margin: 24px; font-family: sans-serif; }
+        .field { width: 360px; display: grid; gap: 8px; }
+        .country-control { border: 1px solid #ccc; min-height: 40px; display: flex; align-items: center; padding: 0 12px; cursor: pointer; }
+        .country-single-value { color: #111; }
+        .country-placeholder { color: #777; }
+        .country-menu[hidden], #country-message[hidden] { display: none; }
+        .country-menu { border: 1px solid #ccc; margin-top: 4px; padding: 4px 0; }
+        .country-option { padding: 6px 12px; cursor: pointer; }
+      </style>
+      <form>
+        <div class="field">
+          <label id="country-label">Country</label>
+          <div
+            id="country-control"
+            class="country-control"
+            role="combobox"
+            aria-labelledby="country-label"
+            aria-haspopup="listbox"
+            aria-expanded="false"
+            tabindex="0"
+          >
+            <span id="country-value" class="country-placeholder">Select...</span>
+          </div>
+          <input id="country-hidden" type="hidden" name="country" required value="" />
+          <div id="country-message">Select a country</div>
+          <div id="country-menu" class="country-menu" role="listbox" hidden>
+            <div class="country-option" role="option" data-value="US">United States (+1)</div>
+            <div class="country-option" role="option" data-value="CA">Canada (+1)</div>
+          </div>
+        </div>
+        <button id="submit" type="submit" disabled>Submit</button>
+      </form>
+      <script>
+        const control = document.getElementById('country-control')
+        const valueEl = document.getElementById('country-value')
+        const hidden = document.getElementById('country-hidden')
+        const message = document.getElementById('country-message')
+        const submit = document.getElementById('submit')
+        const menu = document.getElementById('country-menu')
+        const options = Array.from(menu.querySelectorAll('.country-option'))
+        const nativeValueSetter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value').set
+        let countryState = ''
+
+        function render() {
+          submit.disabled = countryState === ''
+          message.hidden = countryState !== ''
+        }
+        function open() {
+          menu.hidden = false
+          control.setAttribute('aria-expanded', 'true')
+        }
+        function close() {
+          menu.hidden = true
+          control.setAttribute('aria-expanded', 'false')
+        }
+
+        control.addEventListener('click', open)
+        hidden.addEventListener('change', () => {
+          countryState = hidden.value
+          render()
+        })
+        for (const option of options) {
+          option.addEventListener('click', (event) => {
+            event.stopPropagation()
+            valueEl.textContent = option.textContent
+            valueEl.classList.remove('country-placeholder')
+            valueEl.classList.add('country-single-value')
+            nativeValueSetter.call(hidden, option.getAttribute('data-value'))
+            close()
+          })
+        }
+        render()
+      </script>
+    `)
+
+    await pickListboxOption(page, 'United States', {
+      fieldLabel: 'Country',
+      exact: false,
+    })
+
+    expect(await page.locator('#country-hidden').inputValue()).toBe('US')
+    expect(await page.locator('#submit').isDisabled()).toBe(false)
+    expect(await page.locator('#country-message').isHidden()).toBe(true)
+    await page.close()
+  }, 60_000)
+
   it('opens a GitHub-Primer-style menu trigger whose accessible name is the current value, not the field name', async () => {
     // Regression: GitHub's "Add deployment branch or tag rule" dialog (and
     // many Primer-based admin UIs) renders dropdowns as
@@ -1570,6 +1665,105 @@ describe('fillFields auto', () => {
       sponsorshipNo: true,
       hybridNo: true,
     })
+    await page.close()
+  })
+
+  it('commits checkbox-backed grouped choices through framework-visible change events', async () => {
+    // Regression for Greenhouse/Betterment-style checkbox pairs that model a
+    // binary answer. A low-level click can move the DOM checked bit while the
+    // app's controlled state remains unset. fillFields must not report success
+    // until the underlying input receives the input/change events validators
+    // listen for.
+    const page = await browser.newPage({ viewport: { width: 900, height: 700 } })
+    await page.setContent(`
+      <style>
+        body { margin: 24px; font-family: sans-serif; }
+        fieldset { display: grid; gap: 8px; width: 420px; }
+        .choice { display: flex; gap: 8px; align-items: center; }
+      </style>
+      <form>
+        <fieldset>
+          <legend>Will you require sponsorship?</legend>
+          <div class="choice"><input id="sponsor-yes" type="checkbox" aria-label="Yes" value="yes" /> <span>Yes</span></div>
+          <div class="choice"><input id="sponsor-no" type="checkbox" aria-label="No" value="no" /> <span>No</span></div>
+        </fieldset>
+        <button id="submit" type="submit" disabled>Submit</button>
+      </form>
+      <script>
+        const yes = document.getElementById('sponsor-yes')
+        const no = document.getElementById('sponsor-no')
+        const submit = document.getElementById('submit')
+        const nativeCheckedSetter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'checked').set
+        let answer = null
+
+        function render() {
+          yes.checked = answer === 'yes'
+          no.checked = answer === 'no'
+          submit.disabled = answer === null
+        }
+        for (const input of [yes, no]) {
+          input._valueTracker = {
+            value: 'false',
+            setValue(value) { this.value = value }
+          }
+          input.addEventListener('change', (event) => {
+            const next = String(event.target.checked)
+            if (event.target._valueTracker.value === next) return
+            event.target._valueTracker.setValue(next)
+            answer = event.target.value
+            render()
+          })
+        }
+        no.click = function() {
+          nativeCheckedSetter.call(no, true)
+        }
+        render()
+      </script>
+    `)
+
+    await fillFields(page, [
+      { kind: 'choice', fieldLabel: 'Will you require sponsorship?', value: 'No', choiceType: 'group' },
+    ])
+
+    const result = await page.evaluate(() => ({
+      yes: (document.getElementById('sponsor-yes') as HTMLInputElement).checked,
+      no: (document.getElementById('sponsor-no') as HTMLInputElement).checked,
+      submitDisabled: (document.getElementById('submit') as HTMLButtonElement).disabled,
+    }))
+    expect(result).toEqual({ yes: false, no: true, submitDisabled: false })
+    await page.close()
+  })
+
+  it('commits setCheckedControl through framework-visible change events', async () => {
+    const page = await browser.newPage({ viewport: { width: 900, height: 700 } })
+    await page.setContent(`
+      <input id="share-profile" type="checkbox" aria-label="Share my profile" />
+      <span>Share my profile</span>
+      <div id="state">off</div>
+      <script>
+        const checkbox = document.getElementById('share-profile')
+        const state = document.getElementById('state')
+        const nativeCheckedSetter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'checked').set
+        checkbox._valueTracker = {
+          value: 'false',
+          setValue(value) { this.value = value }
+        }
+        checkbox.addEventListener('change', () => {
+          const next = String(checkbox.checked)
+          if (checkbox._valueTracker.value === next) return
+          checkbox._valueTracker.setValue(next)
+          state.textContent = checkbox.checked ? 'on' : 'off'
+        })
+        checkbox.click = function() {
+          nativeCheckedSetter.call(checkbox, true)
+        }
+      </script>
+    `)
+
+    await setCheckedControl(page, 'Share my profile', { checked: true, controlType: 'checkbox' })
+
+    expect(await page.locator('#share-profile').isChecked()).toBe(true)
+    expect(await page.locator('#state').textContent()).toBe('on')
     await page.close()
   })
 
