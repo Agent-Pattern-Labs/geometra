@@ -1,6 +1,6 @@
 {
   "name": "textura",
-  "version": "1.62.1",
+  "version": "1.62.2",
   "description": "DOM-free layout engine combining Yoga flexbox with Pretext text measurement",
   "license": "MIT",
   "type": "module",
