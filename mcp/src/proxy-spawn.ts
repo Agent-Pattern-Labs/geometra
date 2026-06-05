@@ -157,11 +157,9 @@ function buildLocalProxyDistIfPossible(packageDir: string, entryFile: string, er
 }
 
 /**
- * BYO outbound proxy for the spawned Chromium. JobForge sets this when the
- * user configures a residential / mobile / SOCKS proxy in `profile.yml` to
- * bypass datacenter-IP fingerprinting on apply portals (Ashby class B,
- * Lever Mapbox geocoder, Cloudflare Bot Management, etc.). Geometra is the
- * wire — the user supplies the proxy.
+ * BYO outbound proxy for the spawned Chromium. Geometra only passes the
+ * caller-provided network route through to Playwright; callers are responsible
+ * for using proxies with authorization and in line with the target site's rules.
  */
 export interface SpawnProxyConfig {
   server: string
@@ -183,7 +181,27 @@ export interface SpawnProxyParams {
 }
 
 export function resolveStealthMode(stealth?: boolean): boolean {
-  return stealth ?? true
+  if (stealth !== undefined) return stealth
+
+  const explicit = process.env.GEOMETRA_STEALTH
+  if (truthyEnv(explicit)) return true
+  if (falseyEnv(explicit)) return false
+
+  const browser = process.env.GEOMETRA_BROWSER?.trim().toLowerCase()
+  if (browser === 'stealth' || browser === 'cloakbrowser' || browser === 'cloak') return true
+  if (browser === 'chromium' || browser === 'chrome' || browser === 'stock' || browser === 'playwright') {
+    return false
+  }
+
+  return false
+}
+
+function truthyEnv(value: string | undefined): boolean {
+  return value != null && /^(1|true|yes|on)$/i.test(value)
+}
+
+function falseyEnv(value: string | undefined): boolean {
+  return value != null && /^(0|false|no|off)$/i.test(value)
 }
 
 export async function startEmbeddedGeometraProxy(
@@ -255,7 +273,7 @@ export function formatProxyStartupFailure(message: string, opts: SpawnProxyParam
 
   if (/cloakbrowser|CLOAKBROWSER|ERR_MODULE_NOT_FOUND|Cannot find package/i.test(message)) {
     hints.push(
-      'Stealth mode uses CloakBrowser. Install dependencies with npm install, or disable stealth with stealth=false / GEOMETRA_STEALTH=0. To prefetch the patched Chromium binary, run: npx cloakbrowser install',
+      'Stealth mode uses CloakBrowser. Install dependencies with npm install, or disable stealth with stealth=false / GEOMETRA_STEALTH=0. To prefetch the browser binary for authorized testing, run: npx cloakbrowser install',
     )
   }
 

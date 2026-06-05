@@ -156,6 +156,21 @@ export interface CaptchaDetection {
   hint?: string
 }
 
+export interface BlockedSiteDetection {
+  detected: boolean
+  type?:
+    | 'captcha'
+    | 'cloudflare-challenge'
+    | 'automation-detected'
+    | 'access-denied'
+    | 'unsupported-browser'
+    | 'rate-limited'
+    | 'unknown'
+  hint?: string
+  evidence?: string[]
+  recommendedAction?: 'manual-handoff' | 'retry-later' | 'review-site-rules'
+}
+
 export interface VerificationDetection {
   detected: boolean
   type?: 'email_code' | 'sms_code' | 'security_question' | 'unknown'
@@ -172,6 +187,7 @@ export interface PageModel {
     listCount: number
     focusableCount: number
   }
+  blockedSite?: BlockedSiteDetection
   captcha?: CaptchaDetection
   verification?: VerificationDetection
   primaryActions: PagePrimaryAction[]
@@ -976,8 +992,8 @@ function findReusableProxy(options: {
       entry.headless === desiredHeadless
       && entry.stealth === desiredStealth
       && entry.slowMo === desiredSlowMo
-      // Proxy partition is hard — a session with residential proxy MUST NOT
-      // attach to a pooled direct-connection Chromium (and vice versa).
+      // Proxy partition is hard: a session with a caller-provided proxy MUST
+      // NOT attach to a pooled direct-connection Chromium (and vice versa).
       // Different proxy credentials also get separate pool entries.
       && entry.proxyKey === desiredProxyKey,
     )
@@ -1207,7 +1223,7 @@ async function startFreshProxySession(options: {
    * session and is destroyed on disconnect.
    */
   isolated?: boolean
-  /** Outbound residential/SOCKS proxy for Chromium. */
+  /** Outbound HTTP/SOCKS proxy for Chromium. */
   proxy?: SpawnProxyConfig
 }): Promise<Session> {
   const startedAt = performance.now()
@@ -1554,10 +1570,9 @@ export async function connectThroughProxy(options: {
    */
   isolated?: boolean
   /**
-   * BYO outbound proxy for the Chromium. Routes all browser traffic through
-   * the supplied residential / mobile / SOCKS proxy. The reusable pool is
-   * partitioned by proxy identity so two callers with different proxy
-   * configs never share a Chromium instance.
+   * BYO outbound proxy for Chromium. The reusable pool is partitioned by proxy
+   * identity so two callers with different proxy configs never share a
+   * Chromium instance.
    */
   proxy?: SpawnProxyConfig
 }): Promise<Session> {
@@ -3326,6 +3341,96 @@ function detectCaptcha(root: A11yNode): CaptchaDetection {
   return found ?? { detected: false }
 }
 
+const BLOCKED_SITE_PATTERNS: Array<{
+  pattern: RegExp
+  type: BlockedSiteDetection['type']
+  hint: string
+  recommendedAction: BlockedSiteDetection['recommendedAction']
+}> = [
+  {
+    pattern: /cloudflare.*challenge|challenge-platform|just a moment|checking your browser|cdn-cgi\/challenge/i,
+    type: 'cloudflare-challenge',
+    hint: 'Cloudflare challenge page detected',
+    recommendedAction: 'manual-handoff',
+  },
+  {
+    pattern: /verify (you are|that you are|you're|you.re) human|are you human|human verification|i.m not a robot|not a robot/i,
+    type: 'captcha',
+    hint: 'Human verification challenge detected',
+    recommendedAction: 'manual-handoff',
+  },
+  {
+    pattern: /automated access|automation detected|bot detected|bot activity|unusual traffic|suspicious traffic|browser automation/i,
+    type: 'automation-detected',
+    hint: 'Automation block detected',
+    recommendedAction: 'manual-handoff',
+  },
+  {
+    pattern: /access denied|forbidden|blocked from accessing|temporarily blocked|request blocked|not authorized/i,
+    type: 'access-denied',
+    hint: 'Access denied or request blocked page detected',
+    recommendedAction: 'review-site-rules',
+  },
+  {
+    pattern: /unsupported browser|browser is not supported|please update your browser|enable javascript/i,
+    type: 'unsupported-browser',
+    hint: 'Unsupported browser or JavaScript requirement detected',
+    recommendedAction: 'manual-handoff',
+  },
+  {
+    pattern: /too many requests|rate limit|temporarily unavailable|try again later/i,
+    type: 'rate-limited',
+    hint: 'Rate limit or temporary block detected',
+    recommendedAction: 'retry-later',
+  },
+]
+
+function detectBlockedSite(root: A11yNode, captcha: CaptchaDetection): BlockedSiteDetection {
+  if (captcha.detected) {
+    return {
+      detected: true,
+      type: captcha.type === 'cloudflare-challenge' ? 'cloudflare-challenge' : 'captcha',
+      ...(captcha.hint ? { hint: captcha.hint } : {}),
+      recommendedAction: 'manual-handoff',
+    }
+  }
+
+  let found: BlockedSiteDetection | undefined
+  const evidence: string[] = []
+
+  const checkText = (raw: string | undefined) => {
+    if (!raw || found) return
+    const text = raw.replace(/\s+/g, ' ').trim()
+    if (!text) return
+    for (const candidate of BLOCKED_SITE_PATTERNS) {
+      if (!candidate.pattern.test(text)) continue
+      found = {
+        detected: true,
+        type: candidate.type,
+        hint: candidate.hint,
+        recommendedAction: candidate.recommendedAction,
+      }
+      evidence.push(truncateUiText(text, 140))
+      return
+    }
+  }
+
+  checkText(root.meta?.pageUrl)
+
+  function walk(node: A11yNode) {
+    if (found) return
+    checkText([node.name, node.value, node.validation?.error, node.validation?.description].filter(Boolean).join(' '))
+    for (const child of node.children) walk(child)
+  }
+
+  walk(root)
+  if (!found) return { detected: false }
+  return {
+    ...found,
+    ...(evidence.length > 0 ? { evidence: evidence.slice(0, 3) } : {}),
+  }
+}
+
 const VERIFICATION_FIELD_PATTERN = /verif|security.?code|confirm.*(code|email)|one.?time|otp|2fa|mfa|passcode/i
 const VERIFICATION_CONTEXT_PATTERN = /sent.*(code|email|sms|text)|enter.*code|check.your.(email|phone|inbox)|we.sent|verification/i
 
@@ -3363,6 +3468,7 @@ export function buildPageModel(
   options?: {
     maxPrimaryActions?: number
     maxSectionsPerKind?: number
+    blockDetection?: boolean
   },
 ): PageModel {
   const maxPrimaryActions = options?.maxPrimaryActions ?? 6
@@ -3463,9 +3569,11 @@ export function buildPageModel(
   }
 
   const captcha = detectCaptcha(root)
+  const blockedSite = options?.blockDetection === false ? { detected: false } : detectBlockedSite(root, captcha)
   const verification = detectVerification(root)
   return {
     ...baseModel,
+    ...(blockedSite.detected ? { blockedSite } : {}),
     ...(captcha.detected ? { captcha } : {}),
     ...(verification.detected ? { verification } : {}),
     archetypes: inferPageArchetypes(baseModel),
@@ -3700,6 +3808,10 @@ export function summarizePageModel(model: PageModel, maxLines = 10): string {
 
   if (model.archetypes.length > 0) {
     lines.push(`archetypes: ${model.archetypes.join(', ')}`)
+  }
+
+  if (model.blockedSite?.detected) {
+    lines.push(`blocked: ${model.blockedSite.type ?? 'unknown'}${model.blockedSite.hint ? ` - ${model.blockedSite.hint}` : ''}`)
   }
 
   lines.push(

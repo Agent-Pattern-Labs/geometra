@@ -1,6 +1,6 @@
 {
   "name": "@geometra/gateway",
-  "version": "1.62.2",
+  "version": "1.62.3",
   "description": "HTTP transport for Geometra agent-safe workflow gateways",
   "license": "MIT",
   "type": "module",

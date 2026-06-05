@@ -24,7 +24,7 @@ Proxy-backed sessions stay warm by default on disconnect, and MCP now keeps a sm
 
 | Tool | Description |
 |---|---|
-| `geometra_connect` | Connect with `url` (ws://…) **or** `pageUrl` (https://…) to auto-start geometra-proxy; pass `stealth: true` for CloakBrowser's patched Chromium; can inline `formSchema` and/or `pageModel`, or defer the page model for a faster first connect response |
+| `geometra_connect` | Connect with `url` (ws://…) **or** `pageUrl` (https://…) to auto-start geometra-proxy; pass `browserMode: "stock" | "cloakbrowser"` for explicit authorized testing modes; can inline `formSchema` and/or `pageModel`, or defer the page model for a faster first connect response |
 | `geometra_prepare_browser` | Pre-launch and pre-navigate a reusable proxy/browser for `pageUrl` without creating an active session; supports the same headed/headless/stealth browser settings as `geometra_connect` |
 | `geometra_query` | Find elements by stable id, role, name, text content, prompt/section/item context, current value, or semantic state such as `invalid`, `required`, or `busy` |
 | `geometra_wait_for` | Wait for a semantic condition instead of guessing sleeps (`busy`, `disabled`, alerts, values, etc.). **Strict parameters** — use `text` plus `present: false` to wait until a substring disappears (e.g. “Parsing your resume”); there is no `textGone` field |
@@ -33,7 +33,7 @@ Proxy-backed sessions stay warm by default on disconnect, and MCP now keeps a sm
 | `geometra_fill_form` | Fill a form from `valuesById` / `valuesByLabel` in one MCP call; can auto-connect from `pageUrl` / `url` for the lowest-token known-form path |
 | `geometra_fill_fields` | Fill text/choice/toggle/file fields in one MCP call; text-only batches now use the proxy fast path when step output is omitted, and text/choice/toggle entries can use `fieldId` from `geometra_form_schema` without repeating the label |
 | `geometra_run_actions` | Execute a batch of high-level actions in one MCP round trip; can auto-connect from `pageUrl` / `url` and return a final-only payload for the smallest multi-step responses |
-| `geometra_page_model` | Summary-first webpage model: archetypes, stable section ids, counts, top-level sections, and primary actions with nearby section/item context when available |
+| `geometra_page_model` | Summary-first webpage model: archetypes, stable section ids, counts, top-level sections, primary actions, and `blockedSite` metadata for CAPTCHA/challenge/access-denied states |
 | `geometra_find_action` | Resolve a repeated button/link by action label plus optional `sectionText`, `promptText`, or `itemText` before clicking |
 | `geometra_expand_section` | Expand one form/dialog/list/landmark from `geometra_page_model` on demand, with paging/filtering for long sections |
 | `geometra_reveal` | Scroll until a matching node is visible instead of guessing wheel deltas; auto-scales reveal steps for tall forms when omitted |
@@ -252,10 +252,12 @@ In another terminal (from repo root after `npm install` / `bun install` and `bun
 ```bash
 npx geometra-proxy http://localhost:8080 --port 3200
 # Requires Chromium: npx playwright install chromium
-# Optional stealth prefetch: npx cloakbrowser install
+# Optional authorized stealth-testing prefetch: npx cloakbrowser install
 ```
 
-`geometra-proxy` opens a **visible Chromium window by default**. For servers or CI, pass **`--headless`** or set **`GEOMETRA_HEADLESS=1`**. Pass **`--stealth`**, **`stealth: true`** on MCP tools, or **`GEOMETRA_STEALTH=1`** to use CloakBrowser's patched Chromium through the same proxy protocol. Optional **`--slow-mo <ms>`** slows Playwright actions so they are easier to watch. Headed vs headless usually does **not** materially change token usage, since token usage is driven by MCP tool output rather than whether Chromium is visible.
+`geometra-proxy` runs **headless by default**. Pass **`--headed`** or **`headless: false`** on MCP tools when you need a visible Chromium window. Pass **`--stealth`**, **`stealth: true`** on MCP tools, or **`GEOMETRA_STEALTH=1`** to use CloakBrowser's Chromium through the same proxy protocol for authorized testing. Optional **`--slow-mo <ms>`** slows Playwright actions so they are easier to watch. Headed vs headless usually does **not** materially change token usage, since token usage is driven by MCP tool output rather than whether Chromium is visible.
+
+For blocked/challenge pages, keep `blockDetection: true` (default). Set `blockedSitePolicy` to `"continue"` (default), `"manual-handoff"` to return retry guidance for a visible user handoff, or `"error"` to stop immediately with structured `blockedSite` details.
 
 Point MCP at `ws://127.0.0.1:3200` instead of a native Geometra server. The proxy translates clicks and keyboard messages into Playwright actions and streams updated geometry.
 

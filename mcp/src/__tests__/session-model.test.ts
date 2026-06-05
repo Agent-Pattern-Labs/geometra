@@ -104,6 +104,43 @@ describe('buildPageModel', () => {
     ])
   })
 
+  it('surfaces blocked-site detection from challenge copy', () => {
+    const tree = node('group', undefined, { x: 0, y: 0, width: 1024, height: 768 }, {
+      meta: { pageUrl: 'https://jobs.example.com/apply' },
+      children: [
+        node('main', 'Checking your browser before accessing this page', { x: 0, y: 0, width: 1024, height: 768 }, {
+          path: [0],
+          children: [
+            node('group', 'Please verify you are human', { x: 320, y: 240, width: 400, height: 120 }, {
+              path: [0, 0],
+            }),
+          ],
+        }),
+      ],
+    })
+
+    const model = buildPageModel(tree)
+
+    expect(model.blockedSite).toMatchObject({
+      detected: true,
+      type: 'cloudflare-challenge',
+      recommendedAction: 'manual-handoff',
+    })
+  })
+
+  it('can disable blocked-site detection while keeping the rest of the page model', () => {
+    const tree = node('group', undefined, { x: 0, y: 0, width: 1024, height: 768 }, {
+      children: [
+        node('main', 'Access denied', { x: 0, y: 0, width: 1024, height: 768 }, { path: [0] }),
+      ],
+    })
+
+    const model = buildPageModel(tree, { blockDetection: false })
+
+    expect(model.blockedSite).toBeUndefined()
+    expect(model.summary.landmarkCount).toBe(1)
+  })
+
   it('adds nearby item context to repeated primary actions', () => {
     const tree = node('group', undefined, { x: 0, y: 0, width: 1024, height: 768 }, {
       children: [

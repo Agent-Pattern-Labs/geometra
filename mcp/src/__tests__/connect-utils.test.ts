@@ -12,9 +12,30 @@ import {
 import {
   formatProxyStartupFailure,
   parseProxyReadySignalLine,
+  resolveStealthMode as resolveMcpStealthMode,
   resolveProxyScriptPath,
   resolveProxyScriptPathWith,
 } from '../proxy-spawn.js'
+import { resolveStealthMode as resolveProxyRuntimeStealthMode } from '../../../packages/proxy/src/runtime.js'
+
+function withEnv<T>(patch: Record<string, string | undefined>, fn: () => T): T {
+  const previous = new Map<string, string | undefined>()
+  for (const key of Object.keys(patch)) {
+    previous.set(key, process.env[key])
+    const value = patch[key]
+    if (value === undefined) delete process.env[key]
+    else process.env[key] = value
+  }
+
+  try {
+    return fn()
+  } finally {
+    for (const [key, value] of previous) {
+      if (value === undefined) delete process.env[key]
+      else process.env[key] = value
+    }
+  }
+}
 
 describe('normalizeConnectTarget', () => {
   it('accepts explicit pageUrl for http(s) pages', () => {
@@ -195,6 +216,42 @@ describe('formatConnectFailureMessage', () => {
 })
 
 describe('proxy ready helpers', () => {
+  it('resolves stock Chromium as the default browser mode in MCP and proxy runtime', () => {
+    withEnv({ GEOMETRA_STEALTH: undefined, GEOMETRA_BROWSER: undefined }, () => {
+      expect(resolveMcpStealthMode()).toBe(false)
+      expect(resolveProxyRuntimeStealthMode()).toBe(false)
+    })
+  })
+
+  it('honors explicit stealth arguments before environment defaults', () => {
+    withEnv({ GEOMETRA_STEALTH: '1', GEOMETRA_BROWSER: 'stealth' }, () => {
+      expect(resolveMcpStealthMode(false)).toBe(false)
+      expect(resolveProxyRuntimeStealthMode(false)).toBe(false)
+    })
+
+    withEnv({ GEOMETRA_STEALTH: '0', GEOMETRA_BROWSER: 'chromium' }, () => {
+      expect(resolveMcpStealthMode(true)).toBe(true)
+      expect(resolveProxyRuntimeStealthMode(true)).toBe(true)
+    })
+  })
+
+  it('honors GEOMETRA_STEALTH and GEOMETRA_BROWSER as opt-in defaults', () => {
+    withEnv({ GEOMETRA_STEALTH: '1', GEOMETRA_BROWSER: undefined }, () => {
+      expect(resolveMcpStealthMode()).toBe(true)
+      expect(resolveProxyRuntimeStealthMode()).toBe(true)
+    })
+
+    withEnv({ GEOMETRA_STEALTH: undefined, GEOMETRA_BROWSER: 'stealth' }, () => {
+      expect(resolveMcpStealthMode()).toBe(true)
+      expect(resolveProxyRuntimeStealthMode()).toBe(true)
+    })
+
+    withEnv({ GEOMETRA_STEALTH: '0', GEOMETRA_BROWSER: 'stealth' }, () => {
+      expect(resolveMcpStealthMode()).toBe(false)
+      expect(resolveProxyRuntimeStealthMode()).toBe(false)
+    })
+  })
+
   it('resolves the bundled proxy CLI entry in the source tree', () => {
     const scriptPath = resolveProxyScriptPath()
 

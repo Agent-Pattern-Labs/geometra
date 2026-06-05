@@ -45,9 +45,11 @@ import {
 } from './session.js'
 import type {
   A11yNode,
+  BlockedSiteDetection,
   FormSchemaBuildOptions,
   FormSchemaField,
   FormSchemaModel,
+  PageModel,
   Session,
   UpdateWaitResult,
 } from './session.js'
@@ -55,6 +57,8 @@ import type {
 type NodeStateFilterValue = boolean | 'mixed'
 type ResponseDetail = 'terse' | 'minimal' | 'verbose'
 type FormSchemaFormat = 'compact' | 'packed'
+type BrowserMode = 'stock' | 'cloakbrowser'
+type BlockedSitePolicy = 'continue' | 'manual-handoff' | 'error'
 
 interface NodeFilter {
   id?: string
@@ -159,7 +163,38 @@ function stealthInput() {
   return z
     .boolean()
     .optional()
-    .describe('Launch CloakBrowser stealth Chromium for proxy-backed pageUrl sessions. Default false unless GEOMETRA_STEALTH=1 or GEOMETRA_BROWSER=stealth is set.')
+    .describe('Launch CloakBrowser Chromium for authorized proxy-backed pageUrl testing. Default false unless GEOMETRA_STEALTH=1 or GEOMETRA_BROWSER=stealth is set.')
+}
+
+function browserModeInput() {
+  return z
+    .enum(['stock', 'cloakbrowser'])
+    .optional()
+    .describe('Explicit browser engine for proxy-backed sessions. `stock` forces Playwright Chromium; `cloakbrowser` opts into CloakBrowser for authorized testing. Conflicts with a contradictory stealth value.')
+}
+
+function blockDetectionInput() {
+  return z
+    .boolean()
+    .optional()
+    .default(true)
+    .describe('Detect CAPTCHA/challenge/blocked/unsupported-browser pages and surface `blockedSite` metadata (default true).')
+}
+
+function blockedSitePolicyInput() {
+  return z
+    .enum(['continue', 'manual-handoff', 'error'])
+    .optional()
+    .default('continue')
+    .describe('How to respond when blockDetection finds a blocked/challenge page: continue (default), manual-handoff (return handoff metadata), or error.')
+}
+
+function manualHandoffInput() {
+  return z
+    .boolean()
+    .optional()
+    .default(false)
+    .describe('Shortcut for blockedSitePolicy="manual-handoff" when a blocked/challenge page is detected.')
 }
 
 function formSchemaFormatInput() {
@@ -178,6 +213,104 @@ function pageModelModeInput() {
     .describe(
       'When returnPageModel=true, `inline` includes the full page model in the connect response. `deferred` returns connect as soon as the transport is ready and lets the caller fetch geometra_page_model separately.',
     )
+}
+
+function resolveBrowserStealth(input: {
+  stealth?: boolean
+  browserMode?: BrowserMode
+}): { ok: true; stealth?: boolean } | { ok: false; error: string } {
+  const modeStealth = input.browserMode === 'cloakbrowser'
+    ? true
+    : input.browserMode === 'stock'
+      ? false
+      : undefined
+
+  if (modeStealth !== undefined && input.stealth !== undefined && input.stealth !== modeStealth) {
+    return {
+      ok: false,
+      error: `Conflicting browser settings: browserMode="${input.browserMode}" implies stealth=${modeStealth}, but stealth=${input.stealth} was also provided.`,
+    }
+  }
+
+  const stealth = input.stealth ?? modeStealth
+  return stealth === undefined ? { ok: true } : { ok: true, stealth }
+}
+
+function effectiveBlockedSitePolicy(policy: BlockedSitePolicy, manualHandoff?: boolean): BlockedSitePolicy {
+  return manualHandoff ? 'manual-handoff' : policy
+}
+
+function blockedSiteManualHandoffPayload(
+  blockedSite: BlockedSiteDetection,
+  options?: { pageUrl?: string; headless?: boolean },
+): Record<string, unknown> {
+  return {
+    required: true,
+    reason: blockedSite.hint ?? 'Blocked or challenge page detected',
+    recommendedAction: blockedSite.recommendedAction ?? 'manual-handoff',
+    message: 'Pause automation and let a user complete the challenge or review access in a normal visible browser session.',
+    retry: {
+      ...(options?.pageUrl ? { pageUrl: options.pageUrl } : {}),
+      headless: false,
+      blockDetection: true,
+      blockedSitePolicy: 'continue',
+    },
+  }
+}
+
+function blockedSitePolicyErrorPayload(
+  blockedSite: BlockedSiteDetection,
+  policy: BlockedSitePolicy,
+): Record<string, unknown> {
+  return {
+    blocked: true,
+    blockedSite,
+    blockedSitePolicy: policy,
+    message: blockedSite.hint ?? 'Blocked or challenge page detected',
+  }
+}
+
+function applyBlockedSitePolicyPayload(
+  payload: Record<string, unknown>,
+  blockedSite: BlockedSiteDetection | undefined,
+  options: {
+    policy: BlockedSitePolicy
+    manualHandoff?: boolean
+    pageUrl?: string
+    headless?: boolean
+  },
+): Record<string, unknown> {
+  if (!blockedSite?.detected) return payload
+
+  const policy = effectiveBlockedSitePolicy(options.policy, options.manualHandoff)
+  const next: Record<string, unknown> = {
+    ...payload,
+    blockedSite,
+    blockedSitePolicy: policy,
+  }
+  if (policy === 'manual-handoff') {
+    next.manualHandoff = blockedSiteManualHandoffPayload(blockedSite, options)
+  }
+  return next
+}
+
+function blockedSiteFromPayload(payload: Record<string, unknown>): BlockedSiteDetection | undefined {
+  const value = payload.blockedSite
+  if (!value || typeof value !== 'object') return undefined
+  const candidate = value as BlockedSiteDetection
+  return candidate.detected ? candidate : undefined
+}
+
+function blockedSiteErrorIfNeeded(
+  payload: Record<string, unknown>,
+  policy: BlockedSitePolicy,
+  manualHandoff?: boolean,
+): ReturnType<typeof err> | undefined {
+  const effectivePolicy = effectiveBlockedSitePolicy(policy, manualHandoff)
+  if (effectivePolicy !== 'error') return undefined
+  const blockedSite = blockedSiteFromPayload(payload)
+  if (!blockedSite) return undefined
+  return err(JSON.stringify(blockedSitePolicyErrorPayload(blockedSite, effectivePolicy)))
 }
 
 function formSchemaContextInput() {
@@ -624,7 +757,7 @@ export function createServer(): McpServer {
 
 Use \`url\` (ws://…) only when a Geometra/native server or an already-running proxy is listening. If you accidentally pass \`https://…\` in \`url\`, MCP treats it like \`pageUrl\` and starts the proxy for you.
 
-Chromium opens **visible** by default unless \`headless: true\`. Pass \`stealth: true\` (or set \`GEOMETRA_STEALTH=1\`) to launch CloakBrowser's patched Chromium instead of stock Playwright Chromium. File upload / wheel / native \`<select>\` need the proxy path (\`pageUrl\` or ws to proxy). Set \`returnForms: true\` and/or \`returnPageModel: true\` when you want a lower-turn startup response. When connect first-response latency matters more than inlining the page model, pair \`returnPageModel: true\` with \`pageModelMode: "deferred"\` and call \`geometra_page_model\` next.
+Chromium runs **headless** by default unless \`headless: false\`. Pass \`stealth: true\` (or set \`GEOMETRA_STEALTH=1\`) to opt into CloakBrowser's Chromium for authorized testing instead of stock Playwright Chromium. File upload / wheel / native \`<select>\` need the proxy path (\`pageUrl\` or ws to proxy). Set \`returnForms: true\` and/or \`returnPageModel: true\` when you want a lower-turn startup response. When connect first-response latency matters more than inlining the page model, pair \`returnPageModel: true\` with \`pageModelMode: "deferred"\` and call \`geometra_page_model\` next.
 
 **Parallelism:** by default, geometra MCP pools and reuses Chromium instances across sessions for speed. That pooling is safe for read-only exploration, but it shares localStorage / cookies / page state across whichever sessions land on the same proxy — which means **two parallel form-submission flows can contaminate each other** (one job's email/autocomplete state leaks into another, or worse, two agents end up driving the same browser tab). For parallel apply / form submission, pass \`isolated: true\`. Each isolated session gets its own brand-new Chromium that is destroyed on disconnect, never enters the pool, and is guaranteed independent of every other session. The cost is ~1–2s of extra startup vs the ~50ms reusable-proxy attach.`,
     {
@@ -652,7 +785,7 @@ Chromium opens **visible** by default unless \`headless: true\`. Pass \`stealth:
       headless: z
         .boolean()
         .optional()
-        .describe('Run Chromium headless (default false = visible window).'),
+        .describe('Run Chromium headless (default true). Set false for a visible window.'),
       width: z.number().int().positive().optional().describe('Viewport width for spawned proxy.'),
       height: z.number().int().positive().optional().describe('Viewport height for spawned proxy.'),
       slowMo: z
@@ -662,6 +795,7 @@ Chromium opens **visible** by default unless \`headless: true\`. Pass \`stealth:
         .optional()
         .describe('Playwright slowMo (ms) on spawned proxy for easier visual following.'),
       stealth: stealthInput(),
+      browserMode: browserModeInput(),
       isolated: z
         .boolean()
         .optional()
@@ -681,7 +815,7 @@ Chromium opens **visible** by default unless \`headless: true\`. Pass \`stealth:
         })
         .optional()
         .describe(
-          'BYO outbound proxy for the spawned Chromium. Routes all browser traffic through the supplied residential / mobile / SOCKS proxy — useful for apply portals (Ashby, Lever, Cloudflare-fronted ATSes) that fingerprint datacenter IPs and flag headless sessions as bots. The reusable proxy pool is partitioned by proxy identity so callers with different proxy configs never share a Chromium instance.',
+          'BYO outbound proxy for the spawned Chromium. Routes browser traffic through the supplied HTTP/SOCKS proxy. Use only proxies you are authorized to use and in line with the target site rules. The reusable proxy pool is partitioned by proxy identity so callers with different proxy configs never share a Chromium instance.',
         ),
       returnForms: z
         .boolean()
@@ -694,6 +828,9 @@ Chromium opens **visible** by default unless \`headless: true\`. Pass \`stealth:
         .default(false)
         .describe('Include geometra_page_model output in the connect response so exploration can start in one turn.'),
       pageModelMode: pageModelModeInput(),
+      blockDetection: blockDetectionInput(),
+      blockedSitePolicy: blockedSitePolicyInput(),
+      manualHandoff: manualHandoffInput(),
       formId: z.string().optional().describe('Optional form id filter when returnForms=true'),
       maxFields: z.number().int().min(1).max(120).optional().default(80).describe('Cap returned fields per form when returnForms=true'),
       onlyRequiredFields: z.boolean().optional().default(false).describe('Only include required fields when returnForms=true'),
@@ -709,6 +846,8 @@ Chromium opens **visible** by default unless \`headless: true\`. Pass \`stealth:
     async input => {
       const normalized = normalizeConnectTarget({ url: input.url, pageUrl: input.pageUrl })
       if (!normalized.ok) return err(normalized.error)
+      const browser = resolveBrowserStealth({ stealth: input.stealth, browserMode: input.browserMode })
+      if (!browser.ok) return err(browser.error)
       const target = normalized.value
       const formSchema = {
         formId: input.formId,
@@ -739,7 +878,7 @@ Chromium opens **visible** by default unless \`headless: true\`. Pass \`stealth:
             width: input.width,
             height: input.height,
             slowMo: input.slowMo,
-            ...(input.stealth !== undefined && { stealth: input.stealth }),
+            ...(browser.stealth !== undefined && { stealth: browser.stealth }),
             isolated: input.isolated,
             proxy: input.proxy,
             awaitInitialFrame: deferInlinePageModel ? false : undefined,
@@ -748,7 +887,7 @@ Chromium opens **visible** by default unless \`headless: true\`. Pass \`stealth:
           if (input.returnForms) {
             await stabilizeInlineFormSchemas(session, formSchema)
           }
-          return ok(JSON.stringify(connectResponsePayload(session, {
+          const payload = connectResponsePayload(session, {
             transport: 'proxy',
             requestedPageUrl: target.pageUrl,
             autoCoercedFromUrl: target.autoCoercedFromUrl,
@@ -756,9 +895,16 @@ Chromium opens **visible** by default unless \`headless: true\`. Pass \`stealth:
             returnForms: input.returnForms,
             returnPageModel: input.returnPageModel,
             pageModelMode: input.pageModelMode,
+            blockDetection: input.blockDetection,
+            blockedSitePolicy: input.blockedSitePolicy,
+            manualHandoff: input.manualHandoff,
             formSchema,
             pageModelOptions,
-          }), null, input.detail === 'verbose' ? 2 : undefined))
+            headless: input.headless,
+          })
+          const blockedError = blockedSiteErrorIfNeeded(payload, input.blockedSitePolicy, input.manualHandoff)
+          if (blockedError) return blockedError
+          return ok(JSON.stringify(payload, null, input.detail === 'verbose' ? 2 : undefined))
         }
         const session = await connect(target.wsUrl!, {
           width: input.width,
@@ -768,7 +914,7 @@ Chromium opens **visible** by default unless \`headless: true\`. Pass \`stealth:
         if (input.returnForms) {
           await stabilizeInlineFormSchemas(session, formSchema)
         }
-        return ok(JSON.stringify(connectResponsePayload(session, {
+        const payload = connectResponsePayload(session, {
           transport: 'ws',
           requestedWsUrl: target.wsUrl,
           autoCoercedFromUrl: false,
@@ -776,9 +922,16 @@ Chromium opens **visible** by default unless \`headless: true\`. Pass \`stealth:
           returnForms: input.returnForms,
           returnPageModel: input.returnPageModel,
           pageModelMode: input.pageModelMode,
+          blockDetection: input.blockDetection,
+          blockedSitePolicy: input.blockedSitePolicy,
+          manualHandoff: input.manualHandoff,
           formSchema,
           pageModelOptions,
-        }), null, input.detail === 'verbose' ? 2 : undefined))
+          headless: input.headless,
+        })
+        const blockedError = blockedSiteErrorIfNeeded(payload, input.blockedSitePolicy, input.manualHandoff)
+        if (blockedError) return blockedError
+        return ok(JSON.stringify(payload, null, input.detail === 'verbose' ? 2 : undefined))
       } catch (e) {
         return err(`Failed to connect: ${formatConnectFailureMessage(e, target)}`)
       }
@@ -807,7 +960,7 @@ Use this when you can prepare ahead of the user-facing task so the next \`geomet
       headless: z
         .boolean()
         .optional()
-        .describe('Run Chromium headless (default false = visible window).'),
+        .describe('Run Chromium headless (default true). Set false for a visible window.'),
       width: z.number().int().positive().optional().describe('Viewport width for the warmed browser.'),
       height: z.number().int().positive().optional().describe('Viewport height for the warmed browser.'),
       slowMo: z
@@ -817,6 +970,7 @@ Use this when you can prepare ahead of the user-facing task so the next \`geomet
         .optional()
         .describe('Playwright slowMo (ms) for the warmed browser.'),
       stealth: stealthInput(),
+      browserMode: browserModeInput(),
       proxy: z
         .object({
           server: z
@@ -834,8 +988,10 @@ Use this when you can prepare ahead of the user-facing task so the next \`geomet
           'BYO outbound proxy for the warmed Chromium. The pool entry is partitioned by proxy identity, so a later geometra_connect with the same proxy config will reuse this warmed browser; a different proxy config (or no proxy) will not.',
         ),
     },
-    async ({ pageUrl, port, headless, width, height, slowMo, stealth, proxy }) => {
+    async ({ pageUrl, port, headless, width, height, slowMo, stealth, browserMode, proxy }) => {
       try {
+        const browser = resolveBrowserStealth({ stealth, browserMode })
+        if (!browser.ok) return err(browser.error)
         const prepared = await prewarmProxy({
           pageUrl,
           port,
@@ -843,7 +999,7 @@ Use this when you can prepare ahead of the user-facing task so the next \`geomet
           width,
           height,
           slowMo,
-          ...(stealth !== undefined && { stealth }),
+          ...(browser.stealth !== undefined && { stealth: browser.stealth }),
           proxy,
         })
         return ok(JSON.stringify(prepared))
@@ -1251,11 +1407,12 @@ Pass \`valuesById\` with field ids from \`geometra_form_schema\` for the most st
       url: z.string().optional().describe('Optional target URL. Use a ws:// Geometra server URL or an http(s) page URL to auto-connect before filling.'),
       pageUrl: z.string().optional().describe('Optional http(s) page URL to auto-connect before filling. Prefer this over url for browser pages.'),
       port: z.number().int().min(0).max(65535).optional().describe('Preferred local port for an auto-spawned proxy (default: ephemeral OS-assigned port).'),
-      headless: z.boolean().optional().describe('Run Chromium headless when auto-spawning a proxy (default false = visible window).'),
+      headless: z.boolean().optional().describe('Run Chromium headless when auto-spawning a proxy (default true). Set false for a visible window.'),
       width: z.number().int().positive().optional().describe('Viewport width for auto-connected sessions.'),
       height: z.number().int().positive().optional().describe('Viewport height for auto-connected sessions.'),
       slowMo: z.number().int().nonnegative().optional().describe('Playwright slowMo (ms) when auto-spawning a proxy.'),
       stealth: stealthInput(),
+      browserMode: browserModeInput(),
       formId: z.string().optional().describe('Optional form id from geometra_form_schema or geometra_page_model'),
       valuesById: formValuesRecordSchema.optional().describe('Form values keyed by stable field id from geometra_form_schema'),
       valuesByLabel: formValuesRecordSchema.optional().describe('Form values keyed by schema field label'),
@@ -1294,7 +1451,9 @@ Pass \`valuesById\` with field ids from \`geometra_form_schema\` for the most st
       detail: detailInput(),
       sessionId: sessionIdInput,
     },
-    async ({ url, pageUrl, port, headless, width, height, slowMo, stealth, formId, valuesById, valuesByLabel, stopOnError, failOnInvalid, includeSteps, resumeFromIndex, verifyFills, skipPreFilled, isolated, detail, sessionId }) => {
+    async ({ url, pageUrl, port, headless, width, height, slowMo, stealth, browserMode, formId, valuesById, valuesByLabel, stopOnError, failOnInvalid, includeSteps, resumeFromIndex, verifyFills, skipPreFilled, isolated, detail, sessionId }) => {
+      const browser = resolveBrowserStealth({ stealth, browserMode })
+      if (!browser.ok) return err(browser.error)
       const directFields =
         !includeSteps && !formId && Object.keys(valuesById ?? {}).length === 0
           ? directLabelBatchFields(valuesByLabel)
@@ -1310,7 +1469,7 @@ Pass \`valuesById\` with field ids from \`geometra_form_schema\` for the most st
           width,
           height,
           slowMo,
-          stealth,
+          stealth: browser.stealth,
           isolated,
           awaitInitialFrame: directFields ? false : undefined,
         },
@@ -1580,11 +1739,12 @@ Pass \`pageUrl\`/\`url\` to auto-connect in the same call — use \`isolated: tr
       url: z.string().optional().describe('Optional target URL. Use a ws:// Geometra server URL or an http(s) page URL to auto-connect before submitting.'),
       pageUrl: z.string().optional().describe('Optional http(s) page URL to auto-connect before submitting. Prefer this over url for browser pages.'),
       port: z.number().int().min(0).max(65535).optional().describe('Preferred local port for an auto-spawned proxy (default: ephemeral OS-assigned port).'),
-      headless: z.boolean().optional().describe('Run Chromium headless when auto-spawning a proxy (default false = visible window).'),
+      headless: z.boolean().optional().describe('Run Chromium headless when auto-spawning a proxy (default true). Set false for a visible window.'),
       width: z.number().int().positive().optional().describe('Viewport width for auto-connected sessions.'),
       height: z.number().int().positive().optional().describe('Viewport height for auto-connected sessions.'),
       slowMo: z.number().int().nonnegative().optional().describe('Playwright slowMo (ms) when auto-spawning a proxy.'),
       stealth: stealthInput(),
+      browserMode: browserModeInput(),
       isolated: z.boolean().optional().default(false).describe('When auto-connecting via pageUrl/url, request an isolated proxy. Required for safe parallel form submission.'),
       formId: z.string().optional().describe('Optional form id from geometra_form_schema or geometra_page_model'),
       valuesById: formValuesRecordSchema.optional().describe('Form values keyed by stable field id from geometra_form_schema'),
@@ -1599,12 +1759,14 @@ Pass \`pageUrl\`/\`url\` to auto-connect in the same call — use \`isolated: tr
       detail: detailInput(),
       sessionId: sessionIdInput,
     },
-    async ({ url, pageUrl, port, headless, width, height, slowMo, stealth, isolated, formId, valuesById, valuesByLabel, submit, submitIndex, submitTimeoutMs, waitFor, skipFill, softTimeoutMs, failOnInvalid, detail, sessionId }) => {
+    async ({ url, pageUrl, port, headless, width, height, slowMo, stealth, browserMode, isolated, formId, valuesById, valuesByLabel, submit, submitIndex, submitTimeoutMs, waitFor, skipFill, softTimeoutMs, failOnInvalid, detail, sessionId }) => {
+      const browser = resolveBrowserStealth({ stealth, browserMode })
+      if (!browser.ok) return err(browser.error)
       const toolStartedAt = performance.now()
       const effectiveSoftTimeoutMs = softTimeoutMs ?? HOST_SAFE_TOOL_TIMEOUT_MS
       const deadlineAt = toolStartedAt + effectiveSoftTimeoutMs
       const resolved = await ensureToolSession(
-        { sessionId, url, pageUrl, port, headless, width, height, slowMo, stealth, isolated },
+        { sessionId, url, pageUrl, port, headless, width, height, slowMo, stealth: browser.stealth, isolated },
         'Not connected. Call geometra_connect first, or pass pageUrl/url to geometra_submit_form.',
       )
       if (!resolved.ok) return err(resolved.error)
@@ -1912,11 +2074,12 @@ Supported step types: \`click\`, \`type\`, \`key\`, \`upload_files\`, \`pick_lis
       url: z.string().optional().describe('Optional target URL. Use a ws:// Geometra server URL or an http(s) page URL to auto-connect before running actions.'),
       pageUrl: z.string().optional().describe('Optional http(s) page URL to auto-connect before running actions. Prefer this over url for browser pages.'),
       port: z.number().int().min(0).max(65535).optional().describe('Preferred local port for an auto-spawned proxy (default: ephemeral OS-assigned port).'),
-      headless: z.boolean().optional().describe('Run Chromium headless when auto-spawning a proxy (default false = visible window).'),
+      headless: z.boolean().optional().describe('Run Chromium headless when auto-spawning a proxy (default true). Set false for a visible window.'),
       width: z.number().int().positive().optional().describe('Viewport width for auto-connected sessions.'),
       height: z.number().int().positive().optional().describe('Viewport height for auto-connected sessions.'),
       slowMo: z.number().int().nonnegative().optional().describe('Playwright slowMo (ms) when auto-spawning a proxy.'),
       stealth: stealthInput(),
+      browserMode: browserModeInput(),
       isolated: z
         .boolean()
         .optional()
@@ -1941,7 +2104,9 @@ Supported step types: \`click\`, \`type\`, \`key\`, \`upload_files\`, \`pick_lis
       detail: detailInput(),
       sessionId: sessionIdInput,
     },
-    async ({ url, pageUrl, port, headless, width, height, slowMo, stealth, isolated, actions, resumeFromIndex, softTimeoutMs, stopOnError, includeSteps, output, detail, sessionId }) => {
+    async ({ url, pageUrl, port, headless, width, height, slowMo, stealth, browserMode, isolated, actions, resumeFromIndex, softTimeoutMs, stopOnError, includeSteps, output, detail, sessionId }) => {
+      const browser = resolveBrowserStealth({ stealth, browserMode })
+      if (!browser.ok) return err(browser.error)
       const toolStartedAt = performance.now()
       const effectiveSoftTimeoutMs = softTimeoutMs ?? HOST_SAFE_TOOL_TIMEOUT_MS
       const deadlineAt = toolStartedAt + effectiveSoftTimeoutMs
@@ -1955,7 +2120,7 @@ Supported step types: \`click\`, \`type\`, \`key\`, \`upload_files\`, \`pick_lis
           width,
           height,
           slowMo,
-          stealth,
+          stealth: browser.stealth,
           isolated,
           awaitInitialFrame: canDeferInitialFrameForRunActions(actions) ? false : undefined,
         },
@@ -2139,18 +2304,30 @@ Use this first on normal HTML pages when you want to understand the page shape w
         .optional()
         .default(false)
         .describe('Attach a base64 PNG viewport screenshot. Requires @geometra/proxy. Use when geometry alone is ambiguous (icon-only buttons, visual styling cues).'),
+      blockDetection: blockDetectionInput(),
+      blockedSitePolicy: blockedSitePolicyInput(),
+      manualHandoff: manualHandoffInput(),
       sessionId: sessionIdInput,
     },
-    async ({ maxPrimaryActions, maxSectionsPerKind, includeScreenshot, sessionId }) => {
+    async ({ maxPrimaryActions, maxSectionsPerKind, includeScreenshot, blockDetection, blockedSitePolicy, manualHandoff, sessionId }) => {
       const sessionResult = resolveToolSession(sessionId)
       if ('error' in sessionResult) return sessionResult.error
       const session = sessionResult.session
 
       const a11y = await sessionA11yWhenReady(session)
       if (!a11y) return err('No UI tree available')
-      const model = buildPageModel(a11y, { maxPrimaryActions, maxSectionsPerKind })
+      const model = buildPageModel(a11y, { maxPrimaryActions, maxSectionsPerKind, blockDetection })
+      const policy = effectiveBlockedSitePolicy(blockedSitePolicy, manualHandoff)
+      if (policy === 'error' && model.blockedSite?.detected) {
+        return err(JSON.stringify(blockedSitePolicyErrorPayload(model.blockedSite, policy)))
+      }
+      const payload = applyBlockedSitePolicyPayload(
+        model as unknown as Record<string, unknown>,
+        model.blockedSite,
+        { policy: blockedSitePolicy, manualHandoff, pageUrl: a11y.meta?.pageUrl },
+      )
       const screenshot = includeScreenshot ? await captureScreenshotBase64(session) : undefined
-      return ok(JSON.stringify(model), screenshot)
+      return ok(JSON.stringify(payload), screenshot)
     }
   )
 
@@ -2163,11 +2340,12 @@ Unlike geometra_expand_section, this collapses repeated radio/button groups into
       url: z.string().optional().describe('Optional target URL. Use a ws:// Geometra server URL or an http(s) page URL to auto-connect before discovery.'),
       pageUrl: z.string().optional().describe('Optional http(s) page URL to auto-connect before discovery. Prefer this over url for browser pages.'),
       port: z.number().int().min(0).max(65535).optional().describe('Preferred local port for an auto-spawned proxy (default: ephemeral OS-assigned port).'),
-      headless: z.boolean().optional().describe('Run Chromium headless when auto-spawning a proxy (default false = visible window).'),
+      headless: z.boolean().optional().describe('Run Chromium headless when auto-spawning a proxy (default true). Set false for a visible window.'),
       width: z.number().int().positive().optional().describe('Viewport width for auto-connected sessions.'),
       height: z.number().int().positive().optional().describe('Viewport height for auto-connected sessions.'),
       slowMo: z.number().int().nonnegative().optional().describe('Playwright slowMo (ms) when auto-spawning a proxy.'),
       stealth: stealthInput(),
+      browserMode: browserModeInput(),
       isolated: z
         .boolean()
         .optional()
@@ -2183,9 +2361,11 @@ Unlike geometra_expand_section, this collapses repeated radio/button groups into
       format: formSchemaFormatInput(),
       sessionId: sessionIdInput,
     },
-    async ({ url, pageUrl, port, headless, width, height, slowMo, stealth, isolated, formId, maxFields, onlyRequiredFields, onlyInvalidFields, includeOptions, includeContext, sinceSchemaId, format, sessionId }) => {
+    async ({ url, pageUrl, port, headless, width, height, slowMo, stealth, browserMode, isolated, formId, maxFields, onlyRequiredFields, onlyInvalidFields, includeOptions, includeContext, sinceSchemaId, format, sessionId }) => {
+      const browser = resolveBrowserStealth({ stealth, browserMode })
+      if (!browser.ok) return err(browser.error)
       const resolved = await ensureToolSession(
-        { sessionId, url, pageUrl, port, headless, width, height, slowMo, stealth, isolated },
+        { sessionId, url, pageUrl, port, headless, width, height, slowMo, stealth: browser.stealth, isolated },
         'Not connected. Call geometra_connect first, or pass pageUrl/url to geometra_form_schema.',
       )
       if (!resolved.ok) return err(resolved.error)
@@ -3328,27 +3508,46 @@ function connectResponsePayload(
     returnForms?: boolean
     returnPageModel?: boolean
     pageModelMode?: 'inline' | 'deferred'
+    blockDetection?: boolean
+    blockedSitePolicy?: BlockedSitePolicy
+    manualHandoff?: boolean
+    headless?: boolean
     formSchema?: FormSchemaBuildOptions & { sinceSchemaId?: string; format?: FormSchemaFormat }
-    pageModelOptions?: { maxPrimaryActions?: number; maxSectionsPerKind?: number }
+    pageModelOptions?: { maxPrimaryActions?: number; maxSectionsPerKind?: number; blockDetection?: boolean }
   },
 ): Record<string, unknown> {
   const payload = connectPayload(session, opts)
-  if (!opts.returnForms && !opts.returnPageModel) return payload
-  const nextPayload: Record<string, unknown> = { ...payload }
+  const policy = opts.blockedSitePolicy ?? 'continue'
+  const pageModelOptions = {
+    ...opts.pageModelOptions,
+    blockDetection: opts.blockDetection,
+  }
+  const model = opts.blockDetection === false ? undefined : pageModelFromSession(session, pageModelOptions)
+  const nextPayload = applyBlockedSitePolicyPayload(
+    { ...payload },
+    model?.blockedSite,
+    {
+      policy,
+      manualHandoff: opts.manualHandoff,
+      pageUrl: opts.requestedPageUrl,
+      headless: opts.headless,
+    },
+  )
+  if (!opts.returnForms && !opts.returnPageModel) return nextPayload
   if (opts.returnForms) {
     nextPayload.formSchema = formSchemaResponsePayload(session, opts.formSchema ?? {})
   }
   if (opts.returnPageModel) {
     nextPayload.pageModel = opts.pageModelMode === 'deferred'
-      ? deferredPageModelConnectPayload(session, opts.pageModelOptions)
-      : pageModelResponsePayload(session, opts.pageModelOptions)
+      ? deferredPageModelConnectPayload(session, pageModelOptions)
+      : (model ?? pageModelResponsePayload(session, pageModelOptions))
   }
   return nextPayload
 }
 
 function deferredPageModelConnectPayload(
   session: Session,
-  options?: { maxPrimaryActions?: number; maxSectionsPerKind?: number },
+  options?: { maxPrimaryActions?: number; maxSectionsPerKind?: number; blockDetection?: boolean },
 ): Record<string, unknown> {
   return {
     deferred: true,
@@ -3357,18 +3556,24 @@ function deferredPageModelConnectPayload(
     options: {
       maxPrimaryActions: options?.maxPrimaryActions ?? 6,
       maxSectionsPerKind: options?.maxSectionsPerKind ?? 8,
+      blockDetection: options?.blockDetection !== false,
     },
   }
 }
 
 function pageModelResponsePayload(
   session: Session,
-  options?: { maxPrimaryActions?: number; maxSectionsPerKind?: number },
+  options?: { maxPrimaryActions?: number; maxSectionsPerKind?: number; blockDetection?: boolean },
 ): unknown {
+  return pageModelFromSession(session, options) ?? { available: false }
+}
+
+function pageModelFromSession(
+  session: Session,
+  options?: { maxPrimaryActions?: number; maxSectionsPerKind?: number; blockDetection?: boolean },
+): PageModel | undefined {
   const a11y = sessionA11y(session)
-  if (!a11y) {
-    return { available: false }
-  }
+  if (!a11y) return undefined
   return buildPageModel(a11y, options)
 }
 

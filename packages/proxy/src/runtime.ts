@@ -47,10 +47,9 @@ export interface ProxyRuntimeHandle {
  * if the proxy requires it. `bypass` is a comma-separated host pattern list
  * Playwright passes through to Chromium (e.g. `"*.internal,localhost"`).
  *
- * Use case: residential / mobile proxies that present non-datacenter IPs to
- * the target site so anti-bot fingerprinting (Ashby, Lever Mapbox geocoder,
- * Cloudflare Bot Management, etc.) is less likely to flag the session as
- * automation. Geometra is the wire — the user supplies the proxy.
+ * Geometra only passes this caller-provided network route through to
+ * Playwright; callers are responsible for using proxies with authorization and
+ * in line with the target site's rules.
  */
 export interface ProxyConfig {
   server: string
@@ -68,9 +67,9 @@ export interface LaunchProxyRuntimeOptions {
   slowMo?: number
   debounceMs?: number
   eagerInitialExtract?: boolean
-  /** Use CloakBrowser's patched Chromium binary instead of stock Playwright Chromium. */
+  /** Use CloakBrowser's Chromium binary instead of stock Playwright Chromium. */
   stealth?: boolean
-  /** Outbound HTTP/SOCKS proxy for Chromium (BYO residential/mobile IP). */
+  /** Outbound HTTP/SOCKS proxy for Chromium. */
   proxy?: ProxyConfig
   onListening?: (wsUrl: string) => void
   onError?: (err: unknown) => void
@@ -97,13 +96,25 @@ export function formatProxyFatalError(err: unknown): string {
     return `${base}\n${PLAYWRIGHT_INSTALL_HINT}`
   }
   if (/cloakbrowser|CLOAKBROWSER|ERR_MODULE_NOT_FOUND|Cannot find package/i.test(base)) {
-    return `${base}\nStealth mode uses CloakBrowser. Install dependencies with: npm install, or disable stealth with --no-stealth / GEOMETRA_STEALTH=0. To prefetch the patched Chromium binary, run: npx cloakbrowser install`
+    return `${base}\nStealth mode uses CloakBrowser. Install dependencies with: npm install, or disable stealth with --no-stealth / GEOMETRA_STEALTH=0. To prefetch the browser binary for authorized testing, run: npx cloakbrowser install`
   }
   return base
 }
 
 export function resolveStealthMode(stealth?: boolean): boolean {
-  return stealth ?? true
+  if (stealth !== undefined) return stealth
+
+  const explicit = process.env.GEOMETRA_STEALTH
+  if (truthyEnv(explicit)) return true
+  if (falseyEnv(explicit)) return false
+
+  const browser = process.env.GEOMETRA_BROWSER?.trim().toLowerCase()
+  if (browser === 'stealth' || browser === 'cloakbrowser' || browser === 'cloak') return true
+  if (browser === 'chromium' || browser === 'chrome' || browser === 'stock' || browser === 'playwright') {
+    return false
+  }
+
+  return false
 }
 
 function createDeferred<T>(): {
@@ -290,12 +301,9 @@ export async function launchProxyRuntime(options: LaunchProxyRuntimeOptions): Pr
     const browserLaunchStartedAt = performance.now()
     const headless = options.headed !== true
     const args = [
-      '--disable-blink-features=AutomationControlled',
       '--disable-dev-shm-usage',
       '--no-sandbox',
       '--disable-setuid-sandbox',
-      '--disable-web-security',
-      '--disable-features=IsolateOrigins,site-per-process',
     ]
     const proxy = options.proxy?.server
       ? {

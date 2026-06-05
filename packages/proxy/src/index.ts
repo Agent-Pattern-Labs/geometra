@@ -8,24 +8,23 @@ function printUsage(): void {
 
 Open <url> in Chromium and stream GEOM v1 frames on WebSocket (JSON text).
 
-Default is headless with stealth enabled — no visible browser window.
-Use --headed for a visible browser window (debugging).
-Use --no-stealth to use stock Playwright Chromium instead of CloakBrowser.
+Default is headless stock Playwright Chromium.
+Use --headed for a visible browser window.
+Use --stealth to opt into CloakBrowser's Chromium for authorized testing.
 
-Use --proxy-server to route all Chromium traffic through a residential / mobile / SOCKS proxy.
-Pair with --proxy-username/--proxy-password if the proxy requires auth. Helps bypass
-datacenter-IP fingerprinting on apply portals (Ashby, Lever, Cloudflare-fronted ATSes).
+Use --proxy-server to route all Chromium traffic through an HTTP/SOCKS proxy.
+Pair with --proxy-username/--proxy-password if the proxy requires auth.
 
 Examples:
   geometra-proxy http://localhost:8080 --port 3200
   geometra-proxy https://example.com --port 3200 --width 1440 --height 900
   geometra-proxy https://jobs.example.com/apply --slow-mo 40
-  geometra-proxy http://localhost:3000 --headless
+  geometra-proxy http://localhost:3000 --headed
   geometra-proxy https://jobs.example.com/apply --stealth
-  geometra-proxy https://jobs.ashbyhq.com/foo --proxy-server http://res-proxy.example.com:8080 --proxy-username me --proxy-password secret
+  geometra-proxy https://internal.example.com/form --proxy-server http://proxy.example.com:8080 --proxy-username me --proxy-password secret
 
 Requires Chromium for Playwright:  npx playwright install chromium
-Stealth mode uses CloakBrowser and downloads its patched Chromium on first launch:  npx cloakbrowser install
+Stealth mode uses CloakBrowser and downloads its browser binary on first launch:  npx cloakbrowser install
 `)
 }
 

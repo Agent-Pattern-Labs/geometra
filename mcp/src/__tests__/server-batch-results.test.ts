@@ -770,6 +770,131 @@ describe('batch MCP result shaping', () => {
     }))
   })
 
+  it('maps browserMode onto explicit proxy browser settings', async () => {
+    const connectHandler = getToolHandler('geometra_connect')
+
+    await connectHandler({
+      pageUrl: 'https://jobs.example.com/application',
+      browserMode: 'stock',
+    })
+
+    expect(mockState.connectThroughProxy).toHaveBeenCalledWith(expect.objectContaining({
+      pageUrl: 'https://jobs.example.com/application',
+      stealth: false,
+    }))
+
+    vi.clearAllMocks()
+    const prepareHandler = getToolHandler('geometra_prepare_browser')
+
+    await prepareHandler({
+      pageUrl: 'https://jobs.example.com/application',
+      browserMode: 'cloakbrowser',
+    })
+
+    expect(mockState.prewarmProxy).toHaveBeenCalledWith(expect.objectContaining({
+      pageUrl: 'https://jobs.example.com/application',
+      stealth: true,
+    }))
+  })
+
+  it('rejects contradictory browserMode and stealth settings', async () => {
+    const handler = getToolHandler('geometra_connect')
+
+    const result = await handler({
+      pageUrl: 'https://jobs.example.com/application',
+      browserMode: 'stock',
+      stealth: true,
+    })
+
+    expect(result.isError).toBe(true)
+    expect(result.content[0]!.text).toContain('Conflicting browser settings')
+    expect(mockState.connectThroughProxy).not.toHaveBeenCalled()
+  })
+
+  it('surfaces blocked-site manual handoff metadata on connect', async () => {
+    const { buildPageModel } = await import('../session.js')
+    const mockBuildPageModel = buildPageModel as ReturnType<typeof vi.fn>
+    mockBuildPageModel.mockReturnValueOnce({
+      viewport: { width: 1280, height: 800 },
+      archetypes: ['content'],
+      summary: { landmarkCount: 0, formCount: 0, dialogCount: 0, listCount: 0, focusableCount: 0 },
+      blockedSite: {
+        detected: true,
+        type: 'automation-detected',
+        hint: 'Automation block detected',
+        recommendedAction: 'manual-handoff',
+      },
+      primaryActions: [],
+      landmarks: [],
+      forms: [],
+      dialogs: [],
+      lists: [],
+    })
+    const handler = getToolHandler('geometra_connect')
+
+    const result = await handler({
+      pageUrl: 'https://jobs.example.com/application',
+      returnForms: false,
+      blockedSitePolicy: 'manual-handoff',
+    })
+
+    const payload = JSON.parse(result.content[0]!.text) as Record<string, unknown>
+    expect(payload).toMatchObject({
+      connected: true,
+      blockedSitePolicy: 'manual-handoff',
+      blockedSite: {
+        detected: true,
+        type: 'automation-detected',
+      },
+      manualHandoff: {
+        required: true,
+        retry: {
+          pageUrl: 'https://jobs.example.com/application',
+          headless: false,
+        },
+      },
+    })
+  })
+
+  it('returns an MCP error when blockedSitePolicy is error', async () => {
+    const { buildPageModel } = await import('../session.js')
+    const mockBuildPageModel = buildPageModel as ReturnType<typeof vi.fn>
+    mockBuildPageModel.mockReturnValueOnce({
+      viewport: { width: 1280, height: 800 },
+      archetypes: ['content'],
+      summary: { landmarkCount: 0, formCount: 0, dialogCount: 0, listCount: 0, focusableCount: 0 },
+      blockedSite: {
+        detected: true,
+        type: 'access-denied',
+        hint: 'Access denied or request blocked page detected',
+        recommendedAction: 'review-site-rules',
+      },
+      primaryActions: [],
+      landmarks: [],
+      forms: [],
+      dialogs: [],
+      lists: [],
+    })
+    const handler = getToolHandler('geometra_connect')
+
+    const result = await handler({
+      pageUrl: 'https://jobs.example.com/application',
+      returnForms: false,
+      blockedSitePolicy: 'error',
+    })
+
+    expect(result.isError).toBe(true)
+    const payload = JSON.parse(result.content[0]!.text) as Record<string, unknown>
+    expect(payload).toMatchObject({
+      blocked: true,
+      blockedSitePolicy: 'error',
+      blockedSite: {
+        detected: true,
+        type: 'access-denied',
+      },
+    })
+  })
+
   it('can inline a packed form schema into connect for the low-turn form path', async () => {
     const handler = getToolHandler('geometra_connect')
     mockState.formSchemas = [

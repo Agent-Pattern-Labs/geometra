@@ -1,13 +1,13 @@
 # @geometra/proxy
 
-Chromium proxy ( **`headed` / visible window by default** ) that extracts **live DOM layout** (`getBoundingClientRect`) plus a **synthetic Geometra UI tree** and streams **GEOM v1** `frame` / `patch` messages over WebSocket (JSON text). Use it with [`@geometra/mcp`](../../mcp/README.md) to drive arbitrary web apps without screenshots.
+Chromium proxy ( **headless by default** ) that extracts **live DOM layout** (`getBoundingClientRect`) plus a **synthetic Geometra UI tree** and streams **GEOM v1** `frame` / `patch` messages over WebSocket (JSON text). Use it with [`@geometra/mcp`](../../mcp/README.md) to drive arbitrary web apps without screenshots.
 
 ## Install
 
 ```bash
 npm install @geometra/proxy playwright
 npx playwright install chromium
-# Optional: prefetch CloakBrowser's patched Chromium for --stealth mode
+# Optional: prefetch CloakBrowser's Chromium for authorized --stealth testing
 npx cloakbrowser install
 ```
 
@@ -16,14 +16,14 @@ npx cloakbrowser install
 ```bash
 npx geometra-proxy https://example.com --port 3200
 npx geometra-proxy http://localhost:8080 --width 1440 --height 900
-npx geometra-proxy https://example.com --port 3200 --headless
+npx geometra-proxy https://example.com --port 3200 --headed
 npx geometra-proxy https://example.com --port 3200 --slow-mo 50
 npx geometra-proxy https://example.com --port 3200 --stealth
 ```
 
-**Default is a visible browser** so you can watch MCP-driven clicks and typing. Use **`--headless`** (or env **`GEOMETRA_HEADLESS=1`**) for automation on servers / CI. **`--slow-mo <ms>`** (or **`GEOMETRA_SLOW_MO`**) adds Playwright `slowMo` to make actions easier to follow.
+**Default is headless** so MCP-driven browsing does not open windows. Use **`--headed`** when you need to watch clicks and typing. **`--slow-mo <ms>`** (or **`GEOMETRA_SLOW_MO`**) adds Playwright `slowMo` to make actions easier to follow.
 
-Use **`--stealth`** (or env **`GEOMETRA_STEALTH=1`** / **`GEOMETRA_BROWSER=stealth`**) to launch CloakBrowser's patched Chromium through the same Geometra proxy protocol. Stock Playwright Chromium remains the default; pass **`--no-stealth`** to override a stealth env default for one run. CloakBrowser downloads its patched Chromium on first launch and caches it under `~/.cloakbrowser/`.
+Use **`--stealth`** (or env **`GEOMETRA_STEALTH=1`** / **`GEOMETRA_BROWSER=stealth`**) to launch CloakBrowser's Chromium through the same Geometra proxy protocol for authorized testing. Stock Playwright Chromium remains the default; pass **`--no-stealth`** to override a stealth env default for one run. CloakBrowser downloads its browser binary on first launch and caches it under `~/.cloakbrowser/`.
 
 The proxy only opens **`http://`** or **`https://`** pages. For debugging you can still choose a fixed `--port`, but `--port 0` asks the OS for an ephemeral free port (useful for tools that auto-spawn the proxy).
 

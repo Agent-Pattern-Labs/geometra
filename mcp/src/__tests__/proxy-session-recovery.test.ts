@@ -7,7 +7,7 @@ const mockState = vi.hoisted(() => ({
 }))
 
 vi.mock('../proxy-spawn.js', () => ({
-  resolveStealthMode: (stealth?: boolean) => stealth ?? true,
+  resolveStealthMode: (stealth?: boolean) => stealth ?? false,
   startEmbeddedGeometraProxy: mockState.startEmbeddedGeometraProxy,
   spawnGeometraProxy: mockState.spawnGeometraProxy,
 }))
@@ -321,6 +321,49 @@ describe('connectThroughProxy recovery', () => {
       expect(session.proxyRuntime).toBe(preparedRuntime)
       expect(mockState.startEmbeddedGeometraProxy).toHaveBeenCalledTimes(1)
       expect(mockState.spawnGeometraProxy).not.toHaveBeenCalled()
+    } finally {
+      disconnect({ closeProxy: true })
+      expect(preparedRuntime.close).toHaveBeenCalledTimes(1)
+      await closePeer(preparedPeer.wss)
+    }
+  })
+
+  it('prewarms with headless stock Chromium defaults when browser flags are omitted', async () => {
+    const preparedPeer = await createProxyPeer({
+      pageUrl: 'https://jobs.example.com/defaults',
+    })
+
+    const preparedRuntime = {
+      wsUrl: preparedPeer.wsUrl,
+      ready: Promise.resolve(),
+      closed: false,
+      close: vi.fn(async () => {
+        preparedRuntime.closed = true
+      }),
+    }
+
+    mockState.startEmbeddedGeometraProxy.mockResolvedValue({
+      runtime: preparedRuntime,
+      wsUrl: preparedPeer.wsUrl,
+    })
+    mockState.spawnGeometraProxy.mockRejectedValue(new Error('spawn fallback should not be used'))
+
+    try {
+      const prepared = await prewarmProxy({
+        pageUrl: 'https://jobs.example.com/defaults',
+      })
+
+      expect(mockState.startEmbeddedGeometraProxy).toHaveBeenCalledWith(expect.objectContaining({
+        pageUrl: 'https://jobs.example.com/defaults',
+        headless: undefined,
+        stealth: undefined,
+      }))
+      expect(prepared).toMatchObject({
+        prepared: true,
+        pageUrl: 'https://jobs.example.com/defaults',
+        headless: true,
+        stealth: false,
+      })
     } finally {
       disconnect({ closeProxy: true })
       expect(preparedRuntime.close).toHaveBeenCalledTimes(1)
