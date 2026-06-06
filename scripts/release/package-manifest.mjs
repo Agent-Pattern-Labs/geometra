@@ -13,6 +13,7 @@ export const publishablePackages = [
   { name: '@geometra/tw', path: 'packages/tw' },
   { name: '@geometra/agent', path: 'packages/agent' },
   { name: '@geometra/gateway', path: 'packages/gateway' },
+  { name: '@geometra/evidence', path: 'packages/evidence' },
   { name: '@geometra/cli', path: 'packages/cli' },
   { name: '@geometra/proxy', path: 'packages/proxy' },
   { name: '@geometra/mcp', path: 'mcp' },
@@ -51,6 +52,7 @@ export function publishTimeDependencyUpdates(version) {
     '@geometra/tw',
     '@geometra/agent',
     '@geometra/gateway',
+    '@geometra/evidence',
     '@geometra/cli',
   ]) {
     addDependency(packageName, '@geometra/core', `^${version}`)

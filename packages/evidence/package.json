@@ -1,22 +1,22 @@
 {
-  "name": "@geometra/renderer-canvas",
+  "name": "@geometra/evidence",
   "version": "1.63.0",
-  "description": "Canvas2D renderer for Geometra — the geometry protocol for UI",
+  "description": "Portable evidence packets for Geometra agent-native UI replay",
   "license": "MIT",
   "type": "module",
   "repository": {
     "type": "git",
     "url": "https://github.com/Agent-Pattern-Labs/geometra",
-    "directory": "packages/renderer-canvas"
+    "directory": "packages/evidence"
   },
   "homepage": "https://razroo.github.io/geometra",
   "keywords": [
     "geometra",
-    "geometry-protocol",
-    "renderer",
-    "canvas",
-    "dom-free",
-    "ai-native"
+    "agent",
+    "evidence",
+    "audit",
+    "replay",
+    "semantic-geometry"
   ],
   "main": "./dist/index.js",
   "types": "./dist/index.d.ts",
@@ -27,14 +27,17 @@
     }
   },
   "files": [
-    "dist"
+    "dist",
+    "README.md"
   ],
   "scripts": {
     "build": "rm -rf dist && tsc -p tsconfig.build.json",
     "check": "tsc --noEmit"
   },
   "dependencies": {
-    "@geometra/client": "^1.6.0",
-    "@geometra/core": "^1.6.0"
+    "@geometra/core": "^1.62.3"
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0"
   }
 }

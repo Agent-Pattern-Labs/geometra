@@ -417,6 +417,7 @@ The framework replaces the entire browser rendering pipeline. Layout is computed
 | `@geometra/ui` | 31-component UI library: button, input, textarea, checkbox, radio, switch, slider, select, combobox, dialog, sheet, accordion, tabs, card, badge, alert, toast, progress, skeleton, avatar, separator, breadcrumb, pagination, menu, command palette, data table, tree view, list |
 | `@geometra/router` | Renderer-agnostic data router: nested routes, loaders/actions, redirects, blockers, lazy/prefetch, protocol-aware navigation |
 | `@geometra/tw` | Tailwind-style utility classes — converts class strings like `"flex-row p-4 bg-blue-500"` into Geometra props |
+| `@geometra/evidence` | Tamper-evident UI evidence packets for agent replays: redaction, hashes, signatures, OTLP spans, and ISO-style receipts |
 
 Package docs:
 
@@ -431,6 +432,7 @@ Package docs:
 - `@geometra/ui`: `packages/ui/README.md`
 - `@geometra/router`: `packages/router/README.md`
 - `@geometra/tw`: `packages/tw` — Tailwind-style utility classes
+- `@geometra/evidence`: `packages/evidence/README.md`
 
 ## Start Here
 

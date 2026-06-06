@@ -21,6 +21,7 @@ const workspaceAliases = [
   { find: /^@geometra\/router$/, replacement: fromRoot('packages/router/src/index.ts') },
   { find: /^@geometra\/ui$/, replacement: fromRoot('packages/ui/src/index.ts') },
   { find: /^@geometra\/gateway$/, replacement: fromRoot('packages/gateway/src/index.ts') },
+  { find: /^@geometra\/evidence$/, replacement: fromRoot('packages/evidence/src/index.ts') },
 ]
 
 export default defineConfig({
