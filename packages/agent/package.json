@@ -1,6 +1,6 @@
 {
   "name": "@geometra/agent",
-  "version": "1.63.0",
+  "version": "1.63.1",
   "description": "AI agent UI runtime — wire up LLM agents with server-streamed Geometra UIs",
   "license": "MIT",
   "type": "module",

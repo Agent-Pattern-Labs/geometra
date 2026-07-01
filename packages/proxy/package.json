@@ -1,6 +1,6 @@
 {
   "name": "@geometra/proxy",
-  "version": "1.63.0",
+  "version": "1.63.1",
   "description": "Chromium proxy (headed by default) — stream live DOM geometry as Geometra WebSocket frames for MCP and clients",
   "license": "MIT",
   "type": "module",

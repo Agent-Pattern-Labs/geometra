@@ -1,6 +1,6 @@
 {
   "name": "@geometra/core",
-  "version": "1.63.0",
+  "version": "1.63.1",
   "description": "DOM-free UI framework core: components, signals, reconciler",
   "license": "MIT",
   "type": "module",

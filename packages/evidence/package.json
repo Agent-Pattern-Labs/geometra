@@ -1,6 +1,6 @@
 {
   "name": "@geometra/evidence",
-  "version": "1.63.0",
+  "version": "1.63.1",
   "description": "Portable evidence packets for Geometra agent-native UI replay",
   "license": "MIT",
   "type": "module",
