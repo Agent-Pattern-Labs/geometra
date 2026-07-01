@@ -33,6 +33,12 @@ const SESSION_LEASE_MS = 60_000
 const SESSION_SWEEP_MS = 15_000
 const SESSION_WORKER_PREFIX = `geometra-mcp:${process.pid}`
 
+interface SessionLifecycleRegistry {
+  available: boolean
+  orchestrator: ParallelMcpOrchestrator | null
+  close: () => void
+}
+
 function resolveSessionStateFile(): string {
   const raw = process.env.GEOMETRA_MCP_STATE_FILE?.trim()
   if (raw) {
@@ -44,19 +50,72 @@ function resolveSessionStateFile(): string {
   return path.join(dir, `parallel-mcp-${process.pid}-${threadId}.sqlite`)
 }
 
-const orchestrator = new ParallelMcpOrchestrator(
-  new SqliteParallelMcpStore({ filename: resolveSessionStateFile() }),
-  { defaultLeaseMs: SESSION_LEASE_MS },
-)
+function isSessionLifecycleDisabled(): boolean {
+  const raw = process.env.GEOMETRA_MCP_DISABLE_SESSION_LIFECYCLE?.trim().toLowerCase()
+  return raw === '1' || raw === 'true' || raw === 'yes' || raw === 'on'
+}
 
-const leaseSweep = setInterval(() => {
-  try {
-    orchestrator.expireLeases()
-  } catch {
-    /* ignore background lease sweep failures */
+function formatSessionLifecycleInitError(error: unknown): string {
+  if (error instanceof Error) {
+    if (
+      (error as { code?: unknown }).code === 'ERR_DLOPEN_FAILED' &&
+      error.message.includes('better_sqlite3.node')
+    ) {
+      return `${error.message}. Rebuild the native module with \`npm rebuild better-sqlite3\` in the MCP package directory, or reinstall dependencies for the current Node.js version.`
+    }
+    return error.message
   }
-}, SESSION_SWEEP_MS)
-leaseSweep.unref()
+  return String(error)
+}
+
+function createSessionLifecycleRegistry(): SessionLifecycleRegistry {
+  if (isSessionLifecycleDisabled()) {
+    process.stderr.write(
+      '[geometra-mcp] durable session lifecycle disabled via GEOMETRA_MCP_DISABLE_SESSION_LIFECYCLE\n',
+    )
+    return {
+      available: false,
+      orchestrator: null,
+      close: () => {},
+    }
+  }
+
+  try {
+    const orchestrator = new ParallelMcpOrchestrator(
+      new SqliteParallelMcpStore({ filename: resolveSessionStateFile() }),
+      { defaultLeaseMs: SESSION_LEASE_MS },
+    )
+
+    const leaseSweep = setInterval(() => {
+      try {
+        orchestrator.expireLeases()
+      } catch {
+        /* ignore background lease sweep failures */
+      }
+    }, SESSION_SWEEP_MS)
+    leaseSweep.unref()
+
+    return {
+      available: true,
+      orchestrator,
+      close: () => {
+        clearInterval(leaseSweep)
+        orchestrator.close()
+      },
+    }
+  } catch (error) {
+    process.stderr.write(
+      `[geometra-mcp] durable session lifecycle disabled: ${formatSessionLifecycleInitError(error)}\n`,
+    )
+    return {
+      available: false,
+      orchestrator: null,
+      close: () => {},
+    }
+  }
+}
+
+const lifecycleRegistry = createSessionLifecycleRegistry()
 
 function extractPageUrl(target: SessionLifecycleTarget): string | null {
   const cached = target.cachedA11y?.meta?.pageUrl
@@ -125,6 +184,16 @@ export function initializeSessionLifecycle(
   target: SessionLifecycleTarget,
   options?: { pageUrl?: string; transportMode?: string },
 ): void {
+  if (!lifecycleRegistry.available || !lifecycleRegistry.orchestrator) {
+    target.lifecycleFinalized = true
+    target.lifecycleTaskId = undefined
+    target.lifecycleTaskKind = undefined
+    target.lifecycleLeaseId = undefined
+    target.lifecycleWorkerId = undefined
+    return
+  }
+
+  const orchestrator = lifecycleRegistry.orchestrator
   const sessionId = target.id
   const taskId = liveTaskIdFor(sessionId)
   const taskKind = liveTaskKindFor(sessionId)
@@ -177,6 +246,8 @@ export function initializeSessionLifecycle(
 }
 
 export function heartbeatSessionLifecycle(target: SessionLifecycleTarget): void {
+  if (!lifecycleRegistry.orchestrator) return
+  const orchestrator = lifecycleRegistry.orchestrator
   if (target.lifecycleFinalized || !target.lifecycleTaskId || !target.lifecycleLeaseId || !target.lifecycleWorkerId) return
   orchestrator.heartbeatLease({
     taskId: target.lifecycleTaskId,
@@ -191,6 +262,8 @@ export function recordSessionSnapshot(
   label: string,
   extra?: Record<string, unknown>,
 ): void {
+  if (!lifecycleRegistry.orchestrator) return
+  const orchestrator = lifecycleRegistry.orchestrator
   if (!target.lifecycleTaskId) return
   orchestrator.appendContextSnapshot({
     runId: target.id,
@@ -206,6 +279,8 @@ export function completeSessionLifecycle(
   reason: string,
   extra?: Record<string, unknown>,
 ): void {
+  if (!lifecycleRegistry.orchestrator) return
+  const orchestrator = lifecycleRegistry.orchestrator
   if (target.lifecycleFinalized || !target.lifecycleTaskId || !target.lifecycleLeaseId || !target.lifecycleWorkerId) return
   orchestrator.completeTask({
     taskId: target.lifecycleTaskId,
@@ -229,6 +304,8 @@ export function failSessionLifecycle(
   error: string,
   extra?: Record<string, unknown>,
 ): void {
+  if (!lifecycleRegistry.orchestrator) return
+  const orchestrator = lifecycleRegistry.orchestrator
   if (target.lifecycleFinalized || !target.lifecycleTaskId || !target.lifecycleLeaseId || !target.lifecycleWorkerId) return
   recordSessionSnapshot(target, 'session.failed', {
     error,
@@ -245,6 +322,5 @@ export function failSessionLifecycle(
 }
 
 export function shutdownSessionLifecycleRegistry(): void {
-  clearInterval(leaseSweep)
-  orchestrator.close()
+  lifecycleRegistry.close()
 }
