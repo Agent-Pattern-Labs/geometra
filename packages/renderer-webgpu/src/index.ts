@@ -4,6 +4,8 @@ import {
   finiteNumberOrZero,
   focusedElement,
   layoutBoundsAreFinite,
+  normalizeBorderRadius,
+  parseColorRGBA as parseColor,
   type Renderer,
   type SelectionRange,
   type TextNodeInfo,
@@ -1580,52 +1582,4 @@ function pushRectVertices(
   out.push(x1, y0, r, g, b, a)
   out.push(x1, y1, r, g, b, a)
   out.push(x0, y1, r, g, b, a)
-}
-
-/**
- * Normalize `borderRadius` (number | object) into a 4-tuple [tl, tr, br, bl] in pixels, clamped
- * to half of the smaller dimension.
- */
-function normalizeBorderRadius(
-  r: number | { topLeft?: number; topRight?: number; bottomLeft?: number; bottomRight?: number } | undefined,
-  w: number,
-  h: number,
-): [number, number, number, number] {
-  const maxR = Math.min(w / 2, h / 2)
-  if (typeof r === 'number') {
-    const v = Math.min(Math.max(0, r), maxR)
-    return [v, v, v, v]
-  }
-  if (r && typeof r === 'object') {
-    return [
-      Math.min(Math.max(0, r.topLeft ?? 0), maxR),
-      Math.min(Math.max(0, r.topRight ?? 0), maxR),
-      Math.min(Math.max(0, r.bottomRight ?? 0), maxR),
-      Math.min(Math.max(0, r.bottomLeft ?? 0), maxR),
-    ]
-  }
-  return [0, 0, 0, 0]
-}
-
-function parseColor(color: string): [number, number, number, number] {
-  if (color.startsWith('#')) {
-    const hex = color.slice(1)
-    const full = hex.length === 3
-      ? hex[0]! + hex[0]! + hex[1]! + hex[1]! + hex[2]! + hex[2]!
-      : hex
-    const r = parseInt(full.slice(0, 2), 16) / 255
-    const g = parseInt(full.slice(2, 4), 16) / 255
-    const b = parseInt(full.slice(4, 6), 16) / 255
-    return [r, g, b, 1]
-  }
-  const m = color.match(/rgba?\(\s*(\d+)\s*,\s*(\d+)\s*,\s*(\d+)(?:\s*,\s*([0-9.]+))?\s*\)/)
-  if (m) {
-    return [
-      Number(m[1]) / 255,
-      Number(m[2]) / 255,
-      Number(m[3]) / 255,
-      m[4] === undefined ? 1 : Number(m[4]),
-    ]
-  }
-  return [0, 0, 0, 1]
 }

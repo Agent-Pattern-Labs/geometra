@@ -26,6 +26,8 @@ import {
   clampNonNegativeLayoutWallMs,
   finiteNumberOrZero,
   findInTextNodes,
+  parseColorRGBA,
+  normalizeBorderRadius,
 } from '@geometra/core'
 
 export interface CanvasRendererOptions {
@@ -109,27 +111,9 @@ interface FailedImageEntry {
   nextRetryAt: number
 }
 
-/** Parse a CSS color string into [r, g, b] (0-255). Supports #hex and rgba(). */
-function parseColorRGB(color: string): [number, number, number] {
-  if (color.startsWith('#')) {
-    const hex = color.slice(1)
-    const full = hex.length === 3
-      ? hex[0]! + hex[0]! + hex[1]! + hex[1]! + hex[2]! + hex[2]!
-      : hex
-    return [
-      parseInt(full.slice(0, 2), 16),
-      parseInt(full.slice(2, 4), 16),
-      parseInt(full.slice(4, 6), 16),
-    ]
-  }
-  const match = color.match(/rgba?\(\s*(\d+)\s*,\s*(\d+)\s*,\s*(\d+)/)
-  if (match) return [parseInt(match[1]!), parseInt(match[2]!), parseInt(match[3]!)]
-  return [59, 130, 246]
-}
-
-/** Compute relative luminance (0-1) from sRGB. */
+/** Compute relative luminance (0-1) from sRGB channels already in the [0, 1] range. */
 function luminance(r: number, g: number, b: number): number {
-  const [rs, gs, bs] = [r / 255, g / 255, b / 255].map(
+  const [rs, gs, bs] = [r, g, b].map(
     c => c <= 0.03928 ? c / 12.92 : Math.pow((c + 0.055) / 1.055, 2.4),
   )
   return 0.2126 * rs! + 0.7152 * gs! + 0.0722 * bs!
@@ -225,7 +209,7 @@ export class CanvasRenderer implements Renderer {
     if (options.selectedTextColor) {
       this.selectedTextColor = options.selectedTextColor
     } else {
-      const [r, g, b] = parseColorRGB(this.selectionColor)
+      const [r, g, b] = parseColorRGBA(this.selectionColor)
       this.selectedTextColor = luminance(r, g, b) > 0.4 ? '#000000' : '#ffffff'
     }
 
@@ -884,19 +868,7 @@ export class CanvasRenderer implements Renderer {
     r: number | { topLeft?: number; topRight?: number; bottomLeft?: number; bottomRight?: number },
   ): void {
     const { ctx } = this
-    const maxR = Math.min(w / 2, h / 2)
-    let tl: number
-    let tr: number
-    let br: number
-    let bl: number
-    if (typeof r === 'number') {
-      tl = tr = br = bl = Math.min(Math.max(0, r), maxR)
-    } else {
-      tl = Math.min(Math.max(0, r.topLeft ?? 0), maxR)
-      tr = Math.min(Math.max(0, r.topRight ?? 0), maxR)
-      br = Math.min(Math.max(0, r.bottomRight ?? 0), maxR)
-      bl = Math.min(Math.max(0, r.bottomLeft ?? 0), maxR)
-    }
+    const [tl, tr, br, bl] = normalizeBorderRadius(r, w, h)
     ctx.beginPath()
     ctx.moveTo(x + tl, y)
     ctx.lineTo(x + w - tr, y)

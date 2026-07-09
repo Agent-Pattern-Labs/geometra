@@ -55,6 +55,11 @@ export {
 } from './layout-bounds.js'
 export { safePerformanceNowMs, readPerformanceNow, clampNonNegativeLayoutWallMs } from './performance-now.js'
 
+// Paint-backend helpers shared by @geometra/renderer-* packages so color parsing and border-radius
+// clamping stay in lockstep across canvas, webgpu, and any future paint target.
+export { parseColorRGBA, normalizeBorderRadius } from './render-utils.js'
+export type { BorderRadiusInput } from './render-utils.js'
+
 // Web fonts (browser)
 export {
   extractFontFamiliesFromCSSFont,
