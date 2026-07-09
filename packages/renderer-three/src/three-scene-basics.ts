@@ -168,7 +168,9 @@ function isPlainCameraPosition(value: unknown): value is THREE.Vector3Tuple {
   )
 }
 
-function isPlainGeometraThreeSceneBasicsOptionsRecord(o: Record<string, unknown>): boolean {
+function isPlainGeometraThreeSceneBasicsOptionsRecord(value: unknown): boolean {
+  if (value === null || typeof value !== 'object') return false
+  const o = value as Record<string, unknown>
   if (typeof o.threeBackgroundHex !== 'number' || !Number.isFinite(o.threeBackgroundHex)) {
     return false
   }
@@ -192,8 +194,7 @@ function isPlainGeometraThreeSceneBasicsOptionsRecord(o: Record<string, unknown>
 export function isPlainGeometraThreeSceneBasicsOptions(
   value: unknown,
 ): value is PlainGeometraThreeSceneBasicsOptions {
-  if (value === null || typeof value !== 'object') return false
-  return isPlainGeometraThreeSceneBasicsOptionsRecord(value as Record<string, unknown>)
+  return isPlainGeometraThreeSceneBasicsOptionsRecord(value)
 }
 
 /**
@@ -204,7 +205,7 @@ export function isPlainGeometraThreeSceneBasicsOptions(
  */
 export function isPlainGeometraThreeHostSnapshot(value: unknown): value is PlainGeometraThreeHostSnapshot {
   if (!isPlainGeometraThreeViewSizingState(value)) return false
-  return isPlainGeometraThreeSceneBasicsOptionsRecord(value as unknown as Record<string, unknown>)
+  return isPlainGeometraThreeSceneBasicsOptionsRecord(value)
 }
 
 /**

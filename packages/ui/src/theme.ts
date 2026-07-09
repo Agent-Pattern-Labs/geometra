@@ -223,25 +223,24 @@ export type DeepPartial<T> = {
   [K in keyof T]?: T[K] extends object ? DeepPartial<T[K]> : T[K]
 }
 
-function deepMerge(base: Record<string, unknown>, partial: Record<string, unknown>): Record<string, unknown> {
-  const result = { ...base }
-  for (const key of Object.keys(partial)) {
-    const val = partial[key]
+function deepMerge<T extends object>(base: T, partial: DeepPartial<T>): T {
+  const result = { ...base } as Record<string, unknown>
+  const src = partial as Record<string, unknown>
+  for (const key of Object.keys(src)) {
+    const val = src[key]
     if (val !== undefined && typeof val === 'object' && val !== null && !Array.isArray(val)) {
-      result[key] = deepMerge(
-        (base[key] ?? {}) as Record<string, unknown>,
-        val as Record<string, unknown>,
-      )
+      const existing = (result[key] ?? {}) as object
+      result[key] = deepMerge(existing, val as DeepPartial<object>)
     } else if (val !== undefined) {
       result[key] = val
     }
   }
-  return result
+  return result as T
 }
 
 /** Deep-merge a partial override onto the current theme. Returns a new `Theme`. */
 export function mergeTheme(partial: DeepPartial<Theme>): Theme {
-  return deepMerge(peekTheme() as unknown as Record<string, unknown>, partial as unknown as Record<string, unknown>) as unknown as Theme
+  return deepMerge(peekTheme(), partial)
 }
 
 // ---------------------------------------------------------------------------
