@@ -24,6 +24,7 @@ const MODERN_PROXY_METADATA = {
     idempotentRequestIds: true,
     proxyActions: true,
     exactFieldIdentity: true,
+    verifiedFileUploads: true,
   },
 } as const
 const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i
@@ -47,6 +48,7 @@ describe('proxy-backed MCP actions', () => {
             type: 'frame',
             layout: { x: 0, y: 0, width: 1024, height: 768, children: [] },
             tree: { kind: 'box', props: {}, semantic: { tag: 'body', role: 'group' }, children: [] },
+            ...MODERN_PROXY_METADATA,
           }))
           return
         }
@@ -102,6 +104,7 @@ describe('proxy-backed MCP actions', () => {
             type: 'frame',
             layout: { x: 0, y: 0, width: 1024, height: 768, children: [] },
             tree: { kind: 'box', props: {}, semantic: { tag: 'body', role: 'group' }, children: [] },
+            ...MODERN_PROXY_METADATA,
           }))
           return
         }
@@ -116,8 +119,9 @@ describe('proxy-backed MCP actions', () => {
               semantic: { tag: 'body', role: 'group', ariaLabel: 'Resume attached' },
               children: [],
             },
+            ...MODERN_PROXY_METADATA,
           }))
-          ws.send(JSON.stringify({ type: 'ack', requestId: msg.requestId }))
+          ws.send(JSON.stringify({ type: 'ack', requestId: msg.requestId, ...MODERN_PROXY_METADATA }))
         }
       })
     })
@@ -148,6 +152,55 @@ describe('proxy-backed MCP actions', () => {
         contextText: 'Upload your resume',
         sectionText: 'Application documents',
       })
+    } finally {
+      disconnect()
+      await new Promise<void>((resolve, reject) => wss.close(err => (err ? reject(err) : resolve())))
+    }
+  })
+
+  it('refuses direct and batched file mutations before sending to an unverified proxy', async () => {
+    const wss = new WebSocketServer({ port: 0 })
+    let fileMutationCount = 0
+    const unsafeProxyMetadata = {
+      ...MODERN_PROXY_METADATA,
+      protocolCapabilities: {
+        ...MODERN_PROXY_METADATA.protocolCapabilities,
+        verifiedFileUploads: undefined,
+      },
+    }
+    wss.on('connection', ws => {
+      ws.on('message', raw => {
+        const msg = JSON.parse(String(raw)) as { type?: string }
+        if (msg.type === 'file' || msg.type === 'fillFields') fileMutationCount += 1
+        if (msg.type !== 'resize') return
+        ws.send(JSON.stringify({
+          type: 'frame',
+          layout: { x: 0, y: 0, width: 1024, height: 768, children: [] },
+          tree: { kind: 'box', props: {}, semantic: { tag: 'body', role: 'group' }, children: [] },
+          ...unsafeProxyMetadata,
+        }))
+      })
+    })
+    const port = await new Promise<number>((resolve, reject) => {
+      wss.once('listening', () => {
+        const address = wss.address()
+        if (typeof address === 'object' && address) resolve(address.port)
+        else reject(new Error('Failed to resolve ephemeral WebSocket port'))
+      })
+      wss.once('error', reject)
+    })
+
+    try {
+      const session = await connect(`ws://127.0.0.1:${port}`)
+      await expect(sendFileUpload(session, ['/tmp/resume.pdf'], {
+        fieldLabel: 'Resume',
+      })).rejects.toThrow('file_upload_capability_required')
+      await expect(sendFillFields(session, [{
+        kind: 'file',
+        fieldLabel: 'Resume',
+        paths: ['/tmp/resume.pdf'],
+      }])).rejects.toThrow('file_upload_capability_required')
+      expect(fileMutationCount).toBe(0)
     } finally {
       disconnect()
       await new Promise<void>((resolve, reject) => wss.close(err => (err ? reject(err) : resolve())))
@@ -1906,6 +1959,68 @@ describe('proxy-backed MCP actions', () => {
       )
       expect(connectionCount).toBe(2)
       expect(actionReachedReplacement).toBe(false)
+    } finally {
+      disconnect()
+      await new Promise<void>((resolve, reject) => wss.close(err => (err ? reject(err) : resolve())))
+    }
+  })
+
+  it('re-checks verified file-upload capability after reconnect before sending a file', async () => {
+    const wss = new WebSocketServer({ port: 0 })
+    const token = 'mcp-reconnect-file-capability-00000000000000000'
+    let connectionCount = 0
+    let fileReachedReplacement = false
+    const replacementMetadata = {
+      ...MODERN_PROXY_METADATA,
+      protocolCapabilities: {
+        ...MODERN_PROXY_METADATA.protocolCapabilities,
+        verifiedFileUploads: undefined,
+      },
+    }
+    wss.on('connection', ws => {
+      const connectionIndex = ++connectionCount
+      if (connectionIndex === 1) {
+        ws.send(JSON.stringify({ type: 'hello', ...MODERN_PROXY_METADATA }))
+      }
+      ws.on('message', raw => {
+        const msg = JSON.parse(String(raw)) as { type?: string }
+        if (connectionIndex !== 2) return
+        if (msg.type === 'file') fileReachedReplacement = true
+        if (msg.type === 'resize') {
+          ws.send(JSON.stringify({
+            type: 'frame',
+            layout: { x: 0, y: 0, width: 1024, height: 768, children: [] },
+            tree: { kind: 'box', props: {}, children: [] },
+            ...replacementMetadata,
+          }))
+        }
+      })
+    })
+    const port = await new Promise<number>((resolve, reject) => {
+      wss.once('listening', () => {
+        const address = wss.address()
+        if (typeof address === 'object' && address) resolve(address.port)
+        else reject(new Error('Failed to resolve ephemeral WebSocket port'))
+      })
+      wss.once('error', reject)
+    })
+
+    try {
+      const session = await connect(`ws://127.0.0.1:${port}`, {
+        authToken: token,
+        awaitInitialFrame: false,
+      })
+      expect(session.peerProtocolCapabilities?.verifiedFileUploads).toBe(true)
+      await new Promise<void>(resolve => {
+        session.ws.once('close', () => resolve())
+        session.ws.close()
+      })
+
+      await expect(sendFileUpload(session, ['/tmp/resume.pdf'], {
+        fieldLabel: 'Resume',
+      }, 150)).rejects.toThrow('file_upload_capability_required')
+      expect(connectionCount).toBe(2)
+      expect(fileReachedReplacement).toBe(false)
     } finally {
       disconnect()
       await new Promise<void>((resolve, reject) => wss.close(err => (err ? reject(err) : resolve())))

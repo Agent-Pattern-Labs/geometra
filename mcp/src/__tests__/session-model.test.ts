@@ -659,6 +659,182 @@ describe('buildFormSchemas', () => {
     })
   })
 
+  it('preserves required file inputs and their upload constraints in form schemas', () => {
+    const tree = node('group', undefined, { x: 0, y: 0, width: 900, height: 700 }, {
+      children: [
+        node('form', 'Application', { x: 20, y: 20, width: 760, height: 480 }, {
+          path: [0],
+          children: [
+            node('button', 'Resume', { x: 40, y: 80, width: 320, height: 36 }, {
+              path: [0, 0],
+              focusable: true,
+              state: { required: true },
+              meta: {
+                controlTag: 'input',
+                controlKey: 'id:resume-upload',
+                controlId: 'resume-upload',
+                fileInput: true,
+                inputType: 'file',
+                accept: '.pdf,.doc,.docx',
+                multiple: true,
+              },
+            }),
+          ],
+        }),
+      ],
+    })
+
+    const schema = buildFormSchemas(tree)[0]
+    expect(schema).toMatchObject({
+      fieldCount: 1,
+      requiredCount: 1,
+      fields: [{
+        id: 'id:resume-upload',
+        fieldKey: 'id:resume-upload',
+        kind: 'file',
+        label: 'Resume',
+        required: true,
+        format: {
+          inputType: 'file',
+          accept: '.pdf,.doc,.docx',
+          multiple: true,
+        },
+      }],
+    })
+
+    expect(buildFormGraphs(tree)[0]?.fields[0]).toMatchObject({
+      id: 'id:resume-upload',
+      kind: 'text',
+      metadata: {
+        inputType: 'file',
+        geometra: {
+          kind: 'file',
+          format: {
+            inputType: 'file',
+            accept: '.pdf,.doc,.docx',
+            multiple: true,
+          },
+        },
+      },
+    })
+    expect(buildPageModel(tree).forms[0]).toMatchObject({
+      fieldCount: 1,
+    })
+  })
+
+  it('counts file inputs when inferring forms without a native form landmark', () => {
+    const tree = node('group', undefined, { x: 0, y: 0, width: 900, height: 700 }, {
+      children: [
+        node('region', 'Application', { x: 20, y: 20, width: 760, height: 480 }, {
+          path: [0],
+          children: [
+            node('textbox', 'Full name', { x: 40, y: 80, width: 320, height: 36 }, {
+              path: [0, 0],
+            }),
+            node('button', undefined, { x: 40, y: 140, width: 320, height: 36 }, {
+              path: [0, 1],
+              state: { required: true },
+              meta: {
+                fileInput: true,
+                inputType: 'file',
+                controlKey: 'name:input:file:resume',
+                controlName: 'resume',
+              },
+            }),
+          ],
+        }),
+      ],
+    })
+
+    expect(buildFormSchemas(tree)[0]).toMatchObject({
+      name: 'Application',
+      fieldCount: 2,
+      requiredCount: 1,
+      fields: [
+        { kind: 'text', label: 'Full name' },
+        {
+          id: 'name:input:file:resume',
+          fieldKey: 'name:input:file:resume',
+          kind: 'file',
+          label: 'resume',
+          required: true,
+        },
+      ],
+    })
+  })
+
+  it('infers a standalone required upload surface without a native form landmark', () => {
+    const tree = node('group', undefined, { x: 0, y: 0, width: 900, height: 700 }, {
+      children: [
+        node('region', 'Documents', { x: 20, y: 20, width: 760, height: 240 }, {
+          path: [0],
+          children: [
+            node('button', 'Resume', { x: 40, y: 80, width: 320, height: 36 }, {
+              path: [0, 0],
+              state: { required: true },
+              meta: {
+                fileInput: true,
+                inputType: 'file',
+                accept: '.pdf',
+                controlKey: 'id:resume-upload',
+              },
+            }),
+          ],
+        }),
+      ],
+    })
+
+    expect(buildFormSchemas(tree)).toEqual([
+      expect.objectContaining({
+        name: 'Documents',
+        fieldCount: 1,
+        requiredCount: 1,
+        fields: [expect.objectContaining({
+          id: 'id:resume-upload',
+          kind: 'file',
+          label: 'Resume',
+          required: true,
+          format: expect.objectContaining({ accept: '.pdf' }),
+        })],
+      }),
+    ])
+  })
+
+  it('deduplicates nested inferred containers that expose the same standalone upload', () => {
+    const tree = node('group', undefined, { x: 0, y: 0, width: 900, height: 700 }, {
+      children: [
+        node('region', 'Documents', { x: 20, y: 20, width: 760, height: 240 }, {
+          path: [0],
+          children: [
+            node('group', undefined, { x: 32, y: 48, width: 700, height: 160 }, {
+              path: [0, 0],
+              children: [
+                node('button', 'Resume', { x: 40, y: 80, width: 320, height: 36 }, {
+                  path: [0, 0, 0],
+                  state: { required: true },
+                  meta: {
+                    fileInput: true,
+                    inputType: 'file',
+                    controlKey: 'id:resume-upload',
+                  },
+                }),
+              ],
+            }),
+          ],
+        }),
+      ],
+    })
+
+    const schemas = buildFormSchemas(tree)
+    expect(schemas).toHaveLength(1)
+    expect(schemas[0]).toMatchObject({
+      formId: 'fm:0',
+      name: 'Documents',
+      fieldCount: 1,
+      fields: [{ id: 'id:resume-upload', kind: 'file', label: 'Resume' }],
+    })
+  })
+
   it('uses authored identities only when unique and keeps keyed fields in form sections', () => {
     const uniqueTree = node('group', undefined, { x: 0, y: 0, width: 900, height: 700 }, {
       children: [
@@ -1129,6 +1305,88 @@ describe('buildA11yTree', () => {
     })
   })
 
+  it('keeps coordinate-only closed-root controls visible without advertising them as fillable fields', () => {
+    const tree = {
+      kind: 'box',
+      props: {},
+      semantic: { tag: 'form', role: 'form', ariaLabel: 'Application' },
+      children: [
+        {
+          kind: 'box',
+          props: {},
+          semantic: {
+            tag: 'input',
+            a11yRoleHint: 'textbox',
+            ariaLabel: 'Secret field',
+            coordinateOnly: true,
+            shadowMode: 'closed',
+          },
+          handlers: { onClick: true, onKeyDown: true },
+        },
+        {
+          kind: 'box',
+          props: {},
+          semantic: { tag: 'div', role: 'group' },
+          children: [
+            {
+              kind: 'box',
+              props: {},
+              semantic: { a11yRoleHint: 'radio', ariaLabel: 'Yes', coordinateOnly: true },
+              handlers: { onClick: true },
+            },
+            {
+              kind: 'box',
+              props: {},
+              semantic: { a11yRoleHint: 'radio', ariaLabel: 'No', coordinateOnly: true },
+              handlers: { onClick: true },
+            },
+          ],
+        },
+        {
+          kind: 'box',
+          props: {},
+          semantic: { tag: 'input', role: 'textbox', ariaLabel: 'Email' },
+          handlers: { onClick: true, onKeyDown: true },
+        },
+      ],
+    } as Record<string, unknown>
+    const layout = {
+      x: 0,
+      y: 0,
+      width: 800,
+      height: 600,
+      children: [
+        { x: 24, y: 40, width: 320, height: 36, children: [] },
+        {
+          x: 24,
+          y: 96,
+          width: 320,
+          height: 48,
+          children: [
+            { x: 24, y: 96, width: 80, height: 36, children: [] },
+            { x: 120, y: 96, width: 80, height: 36, children: [] },
+          ],
+        },
+        { x: 24, y: 160, width: 320, height: 36, children: [] },
+      ],
+    } as Record<string, unknown>
+
+    const a11y = buildA11yTree(tree, layout)
+    expect(a11y.children[0]).toMatchObject({
+      role: 'textbox',
+      name: 'Secret field',
+      meta: { coordinateOnly: true },
+    })
+    expect(a11y.children[1]?.children).toEqual([
+      expect.objectContaining({ role: 'radio', name: 'Yes', meta: { coordinateOnly: true } }),
+      expect.objectContaining({ role: 'radio', name: 'No', meta: { coordinateOnly: true } }),
+    ])
+    expect(buildFormSchemas(a11y)[0]).toMatchObject({
+      fieldCount: 1,
+      fields: [{ kind: 'text', label: 'Email' }],
+    })
+  })
+
   it('preserves authored field identity and structured native option metadata', () => {
     const tree = {
       kind: 'box',
@@ -1173,6 +1431,52 @@ describe('buildA11yTree', () => {
         { value: 'nyc', label: 'New York', disabled: false, selected: false, index: 1 },
         { value: 'nyc-alt', label: 'New York', disabled: false, selected: false, index: 2 },
       ],
+    })
+  })
+
+  it('maps file input identity and constraints from raw semantic nodes', () => {
+    const tree = {
+      kind: 'box',
+      props: {},
+      semantic: {},
+      children: [{
+        kind: 'box',
+        props: {},
+        semantic: {
+          tag: 'input',
+          role: 'button',
+          ariaLabel: 'Resume',
+          ariaRequired: true,
+          controlKey: 'id:resume-upload',
+          fileInput: true,
+          inputType: 'file',
+          accept: '.pdf',
+          multiple: true,
+        },
+        handlers: { onClick: true },
+      }],
+    } as Record<string, unknown>
+    const layout = {
+      x: 0,
+      y: 0,
+      width: 800,
+      height: 600,
+      children: [{ x: 24, y: 40, width: 320, height: 36, children: [] }],
+    } as Record<string, unknown>
+
+    const file = buildA11yTree(tree, layout).children[0]
+    expect(file).toMatchObject({
+      role: 'button',
+      name: 'Resume',
+      state: { required: true },
+      meta: {
+        controlTag: 'input',
+        controlKey: 'id:resume-upload',
+        fileInput: true,
+        inputType: 'file',
+        accept: '.pdf',
+        multiple: true,
+      },
     })
   })
 })

@@ -1,6 +1,8 @@
+import { randomUUID } from 'node:crypto'
 import { performance } from 'node:perf_hooks'
-import type { Frame, Page } from 'playwright'
+import type { Frame, JSHandle, Page } from 'playwright'
 import {
+  createCdpAxSessionManager,
   enrichSnapshotWithCdpAx,
   shouldEnrichSnapshotWithCdpAx,
   type CdpAxSessionManager,
@@ -15,6 +17,9 @@ import type { GeometrySnapshot, LayoutSnapshot, TreeSnapshot } from './types.js'
 function browserExtractGeometry(): { layout: LayoutSnapshot; tree: TreeSnapshot } {
   const SKIP_TAGS = new Set(['script', 'style', 'noscript', 'template'])
   const LEAF_FORM_TAGS = new Set(['input', 'textarea', 'select'])
+  const CLOSED_SHADOW_ROOTS_SYMBOL = Symbol.for('geometra.closedShadowRoots')
+  const IFRAME_IDENTITIES_SYMBOL = Symbol.for('geometra.iframeIdentities')
+  const fileDescendantCache = new WeakMap<Element, boolean>()
   const FORM_CONTROL_ROLES = new Set([
     'button',
     'checkbox',
@@ -27,6 +32,83 @@ function browserExtractGeometry(): { layout: LayoutSnapshot; tree: TreeSnapshot 
     'switch',
     'textbox',
   ])
+
+  function registeredShadowRootForHost(host: Element): ShadowRoot | null {
+    const openRoot = (host as HTMLElement).shadowRoot
+    if (openRoot) return openRoot
+    try {
+      const registry = (globalThis as unknown as Record<symbol, unknown>)[CLOSED_SHADOW_ROOTS_SYMBOL]
+      if (!(registry instanceof WeakMap)) return null
+      const root = registry.get(host)
+      return root instanceof ShadowRoot ? root : null
+    } catch {
+      return null
+    }
+  }
+
+  function rootScopedElementById(owner: Element, id: string): Element | null {
+    const root = owner.getRootNode()
+    if (root instanceof ShadowRoot) return root.getElementById(id)
+    if (root instanceof Document) return root.getElementById(id)
+    return null
+  }
+
+  function closedShadowRootForElement(el: Element): ShadowRoot | null {
+    const root = el.getRootNode()
+    return root instanceof ShadowRoot && root.mode === 'closed' ? root : null
+  }
+
+  function iframeIdentityForElement(el: HTMLIFrameElement): string | undefined {
+    try {
+      const registry = (globalThis as unknown as Record<symbol, unknown>)[IFRAME_IDENTITIES_SYMBOL]
+      if (!(registry instanceof WeakMap)) return undefined
+      const identity = registry.get(el)
+      return typeof identity === 'string' && identity ? identity : undefined
+    } catch {
+      return undefined
+    }
+  }
+
+  function isClosedShadowFormControl(el: Element): boolean {
+    if (!closedShadowRootForElement(el)) return false
+    if (
+      el instanceof HTMLInputElement ||
+      el instanceof HTMLTextAreaElement ||
+      el instanceof HTMLSelectElement
+    ) return true
+    if (el instanceof HTMLElement && el.isContentEditable) return true
+    const role = el.getAttribute('role')?.trim().toLowerCase()
+    return !!role && role !== 'button' && FORM_CONTROL_ROLES.has(role)
+  }
+
+  function subtreeContainsExtractableFileInput(container: Element): boolean {
+    const cached = fileDescendantCache.get(container)
+    if (cached !== undefined) return cached
+    if (container instanceof HTMLInputElement && container.type === 'file') {
+      fileDescendantCache.set(container, true)
+      return true
+    }
+    if (container.querySelector('input[type="file"]')) {
+      fileDescendantCache.set(container, true)
+      return true
+    }
+    for (const host of [container, ...container.querySelectorAll('*')]) {
+      const root = registeredShadowRootForHost(host)
+      if (root?.mode !== 'open') continue
+      if (root.querySelector('input[type="file"]')) {
+        fileDescendantCache.set(container, true)
+        return true
+      }
+      for (const shadowChild of root.children) {
+        if (subtreeContainsExtractableFileInput(shadowChild)) {
+          fileDescendantCache.set(container, true)
+          return true
+        }
+      }
+    }
+    fileDescendantCache.set(container, false)
+    return false
+  }
 
   function textWithoutNestedControls(node: Node): string {
     if (node.nodeType === Node.TEXT_NODE) return node.textContent ?? ''
@@ -44,22 +126,25 @@ function browserExtractGeometry(): { layout: LayoutSnapshot; tree: TreeSnapshot 
     if (aria) return aria.trim() || undefined
     const labelledBy = el.getAttribute('aria-labelledby')
     if (labelledBy) {
-      const resolveChain = (ids: string, visited: Set<string>): string =>
+      const resolveChainFrom = (owner: Element, ids: string, visited: Set<string>): string =>
         ids
           .split(/\s+/)
           .map(id => {
             if (visited.has(id)) return ''
             visited.add(id)
-            const target = document.getElementById(id)
+            const target = rootScopedElementById(owner, id)
             if (!target) return ''
             const chained = target.getAttribute('aria-labelledby')
-            if (chained) return resolveChain(chained, visited)
+            if (chained) {
+              const chainedText = resolveChainFrom(target, chained, visited)
+              if (chainedText) return chainedText
+            }
             return textWithoutNestedControls(target).replace(/\s+/g, ' ').trim()
           })
           .filter(Boolean)
           .join(' ')
           .trim()
-      const text = resolveChain(labelledBy, new Set<string>())
+      const text = resolveChainFrom(el, labelledBy, new Set<string>())
       if (text) return text.length > 100 ? text.slice(0, 100) : text
     }
     if (
@@ -71,7 +156,10 @@ function browserExtractGeometry(): { layout: LayoutSnapshot; tree: TreeSnapshot 
       if (t) return t
     }
     if (el instanceof HTMLElement && el.id) {
-      const label = document.querySelector(`label[for="${CSS.escape(el.id)}"]`)
+      const root = el.getRootNode()
+      const label = (root instanceof Document || root instanceof ShadowRoot)
+        ? root.querySelector(`label[for="${CSS.escape(el.id)}"]`)
+        : document.querySelector(`label[for="${CSS.escape(el.id)}"]`)
       const t = label ? textWithoutNestedControls(label).replace(/\s+/g, ' ').trim() : ''
       if (t) return t
     }
@@ -189,7 +277,7 @@ function browserExtractGeometry(): { layout: LayoutSnapshot; tree: TreeSnapshot 
     return trimmed.length > maxLength ? trimmed.slice(0, maxLength) : trimmed
   }
 
-  function referencedText(ids: string | null, visited?: Set<string>): string | undefined {
+  function referencedText(owner: Element, ids: string | null, visited?: Set<string>): string | undefined {
     if (!ids) return undefined
     const seen = visited ?? new Set<string>()
     const text = ids
@@ -197,10 +285,10 @@ function browserExtractGeometry(): { layout: LayoutSnapshot; tree: TreeSnapshot 
       .map(id => {
         if (seen.has(id)) return ''
         seen.add(id)
-        const target = document.getElementById(id)
+        const target = rootScopedElementById(owner, id)
         if (!target) return ''
         const chained = target.getAttribute('aria-labelledby')
-        if (chained) return referencedText(chained, seen) ?? ''
+        if (chained) return referencedText(target, chained, seen) ?? ''
         return target.textContent?.trim() ?? ''
       })
       .filter(Boolean)
@@ -241,16 +329,16 @@ function browserExtractGeometry(): { layout: LayoutSnapshot; tree: TreeSnapshot 
   }
 
   function controlErrorText(el: Element): string | undefined {
-    const err = referencedText(el.getAttribute('aria-errormessage'))
+    const err = referencedText(el, el.getAttribute('aria-errormessage'))
     if (err) return err
     if (!controlInvalid(el)) return undefined
-    const described = referencedText(el.getAttribute('aria-describedby'))
+    const described = referencedText(el, el.getAttribute('aria-describedby'))
     if (described && looksLikeValidationText(described)) return described
     return undefined
   }
 
   function controlDescriptionText(el: Element): string | undefined {
-    const described = referencedText(el.getAttribute('aria-describedby'))
+    const described = referencedText(el, el.getAttribute('aria-describedby'))
     if (!described) return undefined
     const error = controlErrorText(el)
     return described === error ? undefined : described
@@ -469,10 +557,21 @@ function browserExtractGeometry(): { layout: LayoutSnapshot; tree: TreeSnapshot 
     if (SKIP_TAGS.has(tag)) return true
     const h = el as HTMLElement
     const style = getComputedStyle(h)
-    if (style.display === 'none' || style.visibility === 'hidden') return true
+    const isFileInput = el instanceof HTMLInputElement && el.type === 'file'
+    const preservesFileAncestry = isFileInput || subtreeContainsExtractableFileInput(el)
+    // Hidden chooser inputs still define required/accept/multiple schema and
+    // are commonly activated by a visible dropzone or button. Preserve their
+    // semantics even though they have no coordinate target.
+    if (!preservesFileAncestry && (style.display === 'none' || style.visibility === 'hidden')) return true
     if (tag === 'input' && (el as HTMLInputElement).type === 'hidden') return true
     const rect = h.getBoundingClientRect()
     if (rect.width <= 0 || rect.height <= 0) {
+      if (preservesFileAncestry) return false
+      // A zero-sized shadow host can still contain positioned, visible
+      // controls. The early page instrumentation keeps a weak reference to
+      // closed roots so read-only extraction can traverse them without
+      // adding observable attributes to the application DOM.
+      if (registeredShadowRootForHost(el)) return false
       // Don't skip elements that carry an explicit interactive role or are
       // form-control elements. react-select v5 (and similar custom-combobox
       // libraries) renders the trigger as an `<input role="combobox">` with
@@ -505,7 +604,7 @@ function browserExtractGeometry(): { layout: LayoutSnapshot; tree: TreeSnapshot 
     for (const c of container.children) {
       if (!shouldSkip(c)) out.push(c)
     }
-    const sr = (container as HTMLElement).shadowRoot
+    const sr = registeredShadowRootForHost(container)
     if (sr) {
       for (const c of sr.children) {
         if (!shouldSkip(c)) out.push(c)
@@ -679,7 +778,17 @@ function browserExtractGeometry(): { layout: LayoutSnapshot; tree: TreeSnapshot 
     const semantic: Record<string, unknown> = { tag }
     const role = defaultRoleForTag(el, tag)
     if (role) semantic.role = role
-    addAuthoredControlIdentity(semantic, el, tag, role)
+    const closedShadowRoot = closedShadowRootForElement(el)
+    if (closedShadowRoot) {
+      // Closed-root descendants cannot be resolved by Playwright locators.
+      // Keep non-form interactive geometry available for coordinate actions,
+      // but never advertise an authored semantic target that actions cannot
+      // subsequently pierce.
+      semantic.shadowMode = 'closed'
+      semantic.coordinateOnly = true
+    } else {
+      addAuthoredControlIdentity(semantic, el, tag, role)
+    }
     if (el instanceof HTMLSelectElement) semantic.options = nativeSelectOptions(el)
     const al = el.getAttribute('aria-label')
     if (al) semantic.ariaLabel = al
@@ -718,6 +827,15 @@ function browserExtractGeometry(): { layout: LayoutSnapshot; tree: TreeSnapshot 
     if (h instanceof HTMLButtonElement && h.disabled) semantic.ariaDisabled = true
     if (h instanceof HTMLSelectElement && h.disabled) semantic.ariaDisabled = true
     if (h instanceof HTMLTextAreaElement && h.disabled) semantic.ariaDisabled = true
+    const authoredDisabled = el.getAttribute('aria-disabled')
+    if (authoredDisabled !== null) semantic.ariaDisabled = authoredDisabled === 'true'
+    if (
+      (h instanceof HTMLInputElement || h instanceof HTMLTextAreaElement) &&
+      h.readOnly
+    ) semantic.ariaReadonly = true
+    const authoredReadonly = el.getAttribute('aria-readonly')
+    if (authoredReadonly !== null) semantic.ariaReadonly = authoredReadonly === 'true'
+    if (h.inert || el.hasAttribute('inert')) semantic.inert = true
     const exp = el.getAttribute('aria-expanded')
     if (exp !== null) semantic.ariaExpanded = exp === 'true'
     const sel = el.getAttribute('aria-selected')
@@ -753,6 +871,14 @@ function browserExtractGeometry(): { layout: LayoutSnapshot; tree: TreeSnapshot 
     if (h instanceof HTMLInputElement && h.type === 'file') {
       sem.role = 'button'
       sem.fileInput = true
+      sem.inputType = 'file'
+      const accept = h.accept.trim()
+      if (accept) sem.accept = accept
+      sem.multiple = h.multiple
+      if (!name) {
+        const authoredFallback = h.getAttribute('name')?.trim() || h.getAttribute('id')?.trim()
+        if (authoredFallback) sem.ariaLabel = authoredFallback
+      }
     }
     if (name && !sem.ariaLabel) sem.ariaLabel = name
     const focusable = isFocusable(el)
@@ -784,6 +910,10 @@ function browserExtractGeometry(): { layout: LayoutSnapshot; tree: TreeSnapshot 
 
   function extractElement(el: Element): { layout: LayoutSnapshot; tree: TreeSnapshot } | null {
     if (shouldSkip(el)) return null
+    // Actions cannot pierce a closed shadow root. Omitting its form controls
+    // keeps form schemas truthful; ordinary interactive content (for example,
+    // a button) remains available as explicitly coordinate-only geometry.
+    if (isClosedShadowFormControl(el)) return null
     const tag = el.tagName.toLowerCase()
     if (tag === 'img' && el instanceof HTMLImageElement) return extractImage(el)
     if (LEAF_FORM_TAGS.has(tag)) return extractFormControl(el, tag)
@@ -799,8 +929,12 @@ function browserExtractGeometry(): { layout: LayoutSnapshot; tree: TreeSnapshot 
         children: [],
       }
       const sem = semanticFor(iframe, 'iframe')
+      const name = getAccessibleName(iframe)
+      if (name && !sem.ariaLabel) sem.ariaLabel = name
       sem.iframe = true
       sem.iframePlaceholder = true
+      const iframeIdentity = iframeIdentityForElement(iframe)
+      if (iframeIdentity) sem.iframeIdentity = iframeIdentity
       return {
         layout,
         tree: {
@@ -877,7 +1011,12 @@ function browserExtractGeometry(): { layout: LayoutSnapshot; tree: TreeSnapshot 
   const body = document.body
   if (!body) {
     const emptyLayout: LayoutSnapshot = { x: 0, y: 0, width: 0, height: 0, children: [] }
-    const emptyTree: TreeSnapshot = { kind: 'box', props: {}, semantic: { tag: 'body' }, children: [] }
+    const emptyTree: TreeSnapshot = {
+      kind: 'box',
+      props: {},
+      semantic: { tag: 'body' },
+      children: [],
+    }
     return { layout: emptyLayout, tree: emptyTree }
   }
 
@@ -920,6 +1059,574 @@ function cloneTree(tree: TreeSnapshot): TreeSnapshot {
   return structuredClone(tree)
 }
 
+interface CachedAxAppendNode {
+  tree: TreeSnapshot
+  layout: LayoutSnapshot
+}
+
+interface CachedAxSemanticPatch {
+  path: number[]
+  semantic: Record<string, unknown>
+}
+
+interface AxDocumentState {
+  documentIdentity: string
+  probeStatus: 'pending' | 'succeeded' | 'failed'
+  lastHeuristicFingerprint?: string
+  lastAxProbeAtMs: number
+  currentGeometryFingerprint: string
+  currentSemanticFingerprint: string
+  cachedGeometryFingerprint?: string
+  cachedSemanticFingerprint?: string
+  cachedAxRevision?: string
+  cachedAppendNodes: CachedAxAppendNode[]
+  cachedSemanticPatches: CachedAxSemanticPatch[]
+  cacheInvalidated: boolean
+  refreshingWithSafeCache: boolean
+  automaticRetryUsed: boolean
+}
+
+const axDocumentStateByPage = new WeakMap<Page, AxDocumentState>()
+const defaultAxSessionManagerByPage = new WeakMap<Page, CdpAxSessionManager>()
+const AX_HEURISTIC_MIN_INTERVAL_MS = 10_000
+
+function axSessionManagerForPage(
+  page: Page,
+  explicit: CdpAxSessionManager | undefined,
+): CdpAxSessionManager {
+  if (explicit) return explicit
+  const existing = defaultAxSessionManagerByPage.get(page)
+  if (existing) return existing
+  const manager = createCdpAxSessionManager()
+  defaultAxSessionManagerByPage.set(page, manager)
+  page.once('close', () => {
+    if (defaultAxSessionManagerByPage.get(page) === manager) {
+      defaultAxSessionManagerByPage.delete(page)
+    }
+    void manager.close()
+  })
+  return manager
+}
+
+function snapshotGeometryFingerprint(snapshot: GeometrySnapshot): string {
+  const parts: string[] = []
+  const rootSemantic = snapshot.tree.semantic ?? {}
+  parts.push(`scroll:${String(rootSemantic.scrollX ?? '')},${String(rootSemantic.scrollY ?? '')}`)
+
+  function visit(tree: TreeSnapshot, layout: LayoutSnapshot): void {
+    const semantic = tree.semantic ?? {}
+    parts.push([
+      typeof semantic.tag === 'string' ? semantic.tag : '',
+      typeof semantic.role === 'string' ? semantic.role : '',
+      layout.x,
+      layout.y,
+      layout.width,
+      layout.height,
+      tree.children?.length ?? 0,
+    ].join(':'))
+    const children = tree.children ?? []
+    for (let index = 0; index < children.length; index++) {
+      const childLayout = layout.children[index]
+      if (childLayout) visit(children[index]!, childLayout)
+    }
+  }
+
+  visit(snapshot.tree, snapshot.layout)
+  return parts.join('|')
+}
+
+function snapshotSemanticFingerprint(snapshot: GeometrySnapshot): string {
+  // The un-enriched DOM tree is already deterministic and contains the
+  // action-relevant text, accessible labels, values, checked/selected state,
+  // disabled/readonly state, options, handlers, and authored identities. Keep
+  // the exact serialization instead of a lossy hash: a cache miss is cheap,
+  // while a collision could resurrect a stale destructive action label.
+  return JSON.stringify(snapshot.tree)
+}
+
+function axHeuristicFingerprint(snapshot: GeometrySnapshot): string {
+  // This is only computed when the cheap DOM heuristic already says AX is
+  // needed. Remembering the last unhealthy shape prevents a permanently
+  // unnamed control from launching getFullAXTree on every RAF extraction.
+  const parts: string[] = []
+  let meaningfulCount = 0
+
+  function visit(tree: TreeSnapshot, layout: LayoutSnapshot, path: string): void {
+    const semantic = tree.semantic ?? {}
+    const role = typeof semantic.role === 'string' ? semantic.role : ''
+    const label = axNodeLabel(tree)
+    const interactive = !!tree.handlers?.onClick || !!tree.handlers?.onKeyDown || !!tree.handlers?.onKeyUp ||
+      ['button', 'link', 'textbox', 'combobox', 'checkbox', 'radio', 'tab'].includes(role)
+    if (tree.handlers || tree.props.text || (role && role !== 'group')) meaningfulCount += 1
+    if (interactive && !label) {
+      parts.push(`${path}:${role}:${layout.x},${layout.y},${layout.width},${layout.height}`)
+    }
+    const children = tree.children ?? []
+    for (let index = 0; index < children.length; index++) {
+      const childLayout = layout.children[index]
+      if (childLayout) visit(children[index]!, childLayout, `${path}.${index}`)
+    }
+  }
+
+  visit(snapshot.tree, snapshot.layout, '0')
+  return `${Math.min(meaningfulCount, 2)}|${parts.join('|')}`
+}
+
+function axCacheHasPayload(state: AxDocumentState): boolean {
+  return state.cachedAppendNodes.length > 0 || state.cachedSemanticPatches.length > 0
+}
+
+function clearAxCache(state: AxDocumentState): void {
+  state.cachedAppendNodes = []
+  state.cachedSemanticPatches = []
+  state.cachedGeometryFingerprint = undefined
+  state.cachedSemanticFingerprint = undefined
+  state.cachedAxRevision = undefined
+}
+
+function planAxProbe(
+  page: Page,
+  documentIdentity: string | undefined,
+  snapshot: GeometrySnapshot,
+  axRevision: string | undefined,
+): {
+  firstDocumentProbe: boolean
+  shouldRun: boolean
+  mayReplayCache: boolean
+  geometryFingerprint: string
+  semanticFingerprint: string
+  cacheReplaySuppressed?: boolean
+  retryAfterMs?: number
+  state?: AxDocumentState
+} {
+  const heuristicRequestsAx = shouldEnrichSnapshotWithCdpAx(snapshot)
+  const geometryFingerprint = snapshotGeometryFingerprint(snapshot)
+  const semanticFingerprint = snapshotSemanticFingerprint(snapshot)
+  if (!documentIdentity) {
+    return {
+      firstDocumentProbe: false,
+      shouldRun: heuristicRequestsAx,
+      mayReplayCache: false,
+      geometryFingerprint,
+      semanticFingerprint,
+    }
+  }
+
+  const heuristicFingerprint = heuristicRequestsAx ? axHeuristicFingerprint(snapshot) : undefined
+  const now = performance.now()
+  let state = axDocumentStateByPage.get(page)
+  if (!state || state.documentIdentity !== documentIdentity) {
+    state = {
+      documentIdentity,
+      probeStatus: 'pending',
+      lastHeuristicFingerprint: heuristicFingerprint,
+      lastAxProbeAtMs: now,
+      currentGeometryFingerprint: geometryFingerprint,
+      currentSemanticFingerprint: semanticFingerprint,
+      cachedAppendNodes: [],
+      cachedSemanticPatches: [],
+      cacheInvalidated: false,
+      refreshingWithSafeCache: false,
+      automaticRetryUsed: false,
+    }
+    // Claim synchronously before any CDP await so concurrent RAF extracts
+    // cannot launch duplicate full-tree traversals for this document.
+    axDocumentStateByPage.set(page, state)
+    return {
+      firstDocumentProbe: true,
+      shouldRun: true,
+      mayReplayCache: false,
+      geometryFingerprint,
+      semanticFingerprint,
+      state,
+    }
+  }
+
+  // Record the newest DOM snapshot synchronously. A background probe may
+  // finish after a newer extraction; it is allowed to populate cache only if
+  // both the semantic and geometry revisions still match its starting point.
+  state.currentGeometryFingerprint = geometryFingerprint
+  state.currentSemanticFingerprint = semanticFingerprint
+  const elapsedSinceProbe = Math.max(0, now - state.lastAxProbeAtMs)
+  const retryAfterMs = Math.max(0, AX_HEURISTIC_MIN_INTERVAL_MS - elapsedSinceProbe)
+  const unclaimedRetryAfterMs = state.automaticRetryUsed ? undefined : retryAfterMs
+
+  if (state.probeStatus === 'pending') {
+    const wasRefreshingWithSafeCache = state.refreshingWithSafeCache
+    const refreshingCacheStillSafe =
+      wasRefreshingWithSafeCache &&
+      state.cachedGeometryFingerprint === geometryFingerprint &&
+      state.cachedSemanticFingerprint === semanticFingerprint &&
+      !!axRevision &&
+      state.cachedAxRevision === axRevision
+    if (state.refreshingWithSafeCache && !refreshingCacheStillSafe) {
+      clearAxCache(state)
+      state.cacheInvalidated = true
+      state.refreshingWithSafeCache = false
+    }
+    return {
+      firstDocumentProbe: false,
+      shouldRun: false,
+      mayReplayCache: refreshingCacheStillSafe && axCacheHasPayload(state),
+      geometryFingerprint,
+      semanticFingerprint,
+      ...(wasRefreshingWithSafeCache && !refreshingCacheStillSafe
+        ? { cacheReplaySuppressed: true }
+        : {}),
+      state,
+    }
+  }
+  if (state.probeStatus === 'failed') {
+    if (elapsedSinceProbe < AX_HEURISTIC_MIN_INTERVAL_MS) {
+      return {
+        firstDocumentProbe: false,
+        shouldRun: false,
+        mayReplayCache: false,
+        geometryFingerprint,
+        semanticFingerprint,
+        retryAfterMs: unclaimedRetryAfterMs,
+        state,
+      }
+    }
+    state.probeStatus = 'pending'
+    state.lastAxProbeAtMs = now
+    state.refreshingWithSafeCache = false
+    return {
+      firstDocumentProbe: false,
+      shouldRun: true,
+      mayReplayCache: false,
+      geometryFingerprint,
+      semanticFingerprint,
+      state,
+    }
+  }
+
+  const cachedSnapshotInvalid =
+    state.cacheInvalidated ||
+    state.cachedGeometryFingerprint !== geometryFingerprint ||
+    state.cachedSemanticFingerprint !== semanticFingerprint ||
+    !axRevision ||
+    state.cachedAxRevision !== axRevision
+  if (cachedSnapshotInvalid) {
+    // Drop the stale payload immediately. Retaining it until the cadence opens
+    // risks replay if a same-bounds SPA replacement later happens to restore a
+    // previous geometry shape.
+    clearAxCache(state)
+    state.cacheInvalidated = true
+    state.refreshingWithSafeCache = false
+    if (elapsedSinceProbe >= AX_HEURISTIC_MIN_INTERVAL_MS) {
+      state.probeStatus = 'pending'
+      state.lastAxProbeAtMs = now
+      state.lastHeuristicFingerprint = heuristicFingerprint
+      return {
+        firstDocumentProbe: false,
+        shouldRun: true,
+        mayReplayCache: false,
+        geometryFingerprint,
+        semanticFingerprint,
+        cacheReplaySuppressed: true,
+        state,
+      }
+    }
+    return {
+      firstDocumentProbe: false,
+      shouldRun: false,
+      mayReplayCache: false,
+      geometryFingerprint,
+      semanticFingerprint,
+      cacheReplaySuppressed: true,
+      retryAfterMs: unclaimedRetryAfterMs,
+      state,
+    }
+  }
+
+  if (elapsedSinceProbe >= AX_HEURISTIC_MIN_INTERVAL_MS) {
+    const mayReplayCache = axCacheHasPayload(state)
+    state.probeStatus = 'pending'
+    state.lastAxProbeAtMs = now
+    state.lastHeuristicFingerprint = heuristicFingerprint
+    state.refreshingWithSafeCache = mayReplayCache
+    return {
+      firstDocumentProbe: false,
+      shouldRun: true,
+      mayReplayCache,
+      geometryFingerprint,
+      semanticFingerprint,
+      state,
+    }
+  }
+
+  if (!heuristicRequestsAx) {
+    state.lastHeuristicFingerprint = undefined
+    return {
+      firstDocumentProbe: false,
+      shouldRun: false,
+      mayReplayCache: true,
+      geometryFingerprint,
+      semanticFingerprint,
+      state,
+    }
+  }
+  if (state.lastHeuristicFingerprint === heuristicFingerprint) {
+    return {
+      firstDocumentProbe: false,
+      shouldRun: false,
+      mayReplayCache: true,
+      geometryFingerprint,
+      semanticFingerprint,
+      state,
+    }
+  }
+  if (elapsedSinceProbe < AX_HEURISTIC_MIN_INTERVAL_MS) {
+    // Keep the prior fingerprint so the changed unhealthy shape remains
+    // pending and is probed once the bounded cadence opens.
+    return {
+      firstDocumentProbe: false,
+      shouldRun: false,
+      mayReplayCache: true,
+      geometryFingerprint,
+      semanticFingerprint,
+      retryAfterMs: unclaimedRetryAfterMs,
+      state,
+    }
+  }
+  state.lastHeuristicFingerprint = heuristicFingerprint
+  state.probeStatus = 'pending'
+  state.lastAxProbeAtMs = now
+  state.refreshingWithSafeCache = axCacheHasPayload(state)
+  return {
+    firstDocumentProbe: false,
+    shouldRun: true,
+    mayReplayCache: state.refreshingWithSafeCache,
+    geometryFingerprint,
+    semanticFingerprint,
+    state,
+  }
+}
+
+function axNodeLabel(tree: TreeSnapshot): string {
+  const semantic = tree.semantic ?? {}
+  const label = typeof semantic.ariaLabel === 'string' ? semantic.ariaLabel : tree.props.text
+  return typeof label === 'string' ? label.replace(/\s+/g, ' ').trim().toLowerCase() : ''
+}
+
+function axNodeRole(tree: TreeSnapshot): string {
+  const semantic = tree.semantic ?? {}
+  if (typeof semantic.role === 'string') return semantic.role
+  return typeof semantic.a11yRoleHint === 'string' ? semantic.a11yRoleHint : ''
+}
+
+function layoutsRepresentSameAxNode(a: LayoutSnapshot, b: LayoutSnapshot): boolean {
+  return Math.max(
+    Math.abs(a.x - b.x),
+    Math.abs(a.y - b.y),
+    Math.abs(a.width - b.width),
+    Math.abs(a.height - b.height),
+  ) <= 3
+}
+
+function snapshotContainsCachedAxNode(
+  tree: TreeSnapshot,
+  layout: LayoutSnapshot,
+  cached: CachedAxAppendNode,
+): boolean {
+  if (
+    axNodeRole(tree) === axNodeRole(cached.tree) &&
+    axNodeLabel(tree) === axNodeLabel(cached.tree) &&
+    layoutsRepresentSameAxNode(layout, cached.layout)
+  ) return true
+  const children = tree.children ?? []
+  for (let index = 0; index < children.length; index++) {
+    const childLayout = layout.children[index]
+    if (childLayout && snapshotContainsCachedAxNode(children[index]!, childLayout, cached)) return true
+  }
+  return false
+}
+
+function cacheAxAppendNodes(
+  snapshot: GeometrySnapshot,
+  baselineTree: TreeSnapshot,
+  state: AxDocumentState,
+  geometryFingerprint: string,
+  semanticFingerprint: string,
+  axRevision: string | undefined,
+): void {
+  const cached: CachedAxAppendNode[] = []
+  const children = snapshot.tree.children ?? []
+  for (let index = 0; index < children.length; index++) {
+    const tree = children[index]!
+    const layout = snapshot.layout.children[index]
+    const cacheableAxFallback =
+      tree.semantic?.coordinateOnly === true &&
+      (tree.semantic?.a11yAppended === true || tree.semantic?.a11yFallback === true)
+    if (!layout || !cacheableAxFallback) continue
+    cached.push({ tree: cloneTree(tree), layout: cloneLayout(layout) })
+  }
+  const semanticPatches: CachedAxSemanticPatch[] = []
+  const patchKeys = ['ariaLabel', 'a11yRoleHint', 'a11yEnriched'] as const
+  const collectSemanticPatches = (
+    before: TreeSnapshot,
+    after: TreeSnapshot,
+    path: number[],
+  ): void => {
+    const beforeSemantic = before.semantic ?? {}
+    const afterSemantic = after.semantic ?? {}
+    const semantic: Record<string, unknown> = {}
+    for (const key of patchKeys) {
+      if (afterSemantic[key] !== beforeSemantic[key] && afterSemantic[key] !== undefined) {
+        semantic[key] = structuredClone(afterSemantic[key])
+      }
+    }
+    if (Object.keys(semantic).length > 0) semanticPatches.push({ path: [...path], semantic })
+
+    const beforeChildren = before.children ?? []
+    const afterChildren = after.children ?? []
+    for (let index = 0; index < beforeChildren.length; index++) {
+      const afterChild = afterChildren[index]
+      if (afterChild) collectSemanticPatches(beforeChildren[index]!, afterChild, [...path, index])
+    }
+  }
+  collectSemanticPatches(baselineTree, snapshot.tree, [])
+
+  state.cachedAppendNodes = cached
+  state.cachedSemanticPatches = semanticPatches
+  state.cachedGeometryFingerprint = geometryFingerprint
+  state.cachedSemanticFingerprint = semanticFingerprint
+  state.cachedAxRevision = axRevision
+  state.cacheInvalidated = false
+}
+
+function replayCachedAxSemanticPatches(snapshot: GeometrySnapshot, state: AxDocumentState): number {
+  let replayed = 0
+  for (const patch of state.cachedSemanticPatches) {
+    let target: TreeSnapshot | undefined = snapshot.tree
+    for (const index of patch.path) {
+      target = target.children?.[index]
+      if (!target) break
+    }
+    if (!target) continue
+    target.semantic = {
+      ...(target.semantic ?? {}),
+      ...structuredClone(patch.semantic),
+      a11yReplayed: true,
+    }
+    replayed += 1
+  }
+  if (replayed > 0) {
+    snapshot.tree.semantic = {
+      ...(snapshot.tree.semantic ?? {}),
+      a11yPatchReplayed: true,
+      a11yPatchedCount: replayed,
+    }
+  }
+  return replayed
+}
+
+function replayCachedAxAppendNodes(snapshot: GeometrySnapshot, state: AxDocumentState): number {
+  let replayed = 0
+  let replayedFallback = false
+  if (!snapshot.tree.children) snapshot.tree.children = []
+  for (const cached of state.cachedAppendNodes) {
+    if (snapshotContainsCachedAxNode(snapshot.tree, snapshot.layout, cached)) continue
+    const tree = cloneTree(cached.tree)
+    tree.semantic = { ...(tree.semantic ?? {}), a11yReplayed: true }
+    if (tree.semantic.a11yFallback === true) replayedFallback = true
+    snapshot.tree.children.push(tree)
+    snapshot.layout.children.push(cloneLayout(cached.layout))
+    replayed += 1
+  }
+  if (replayed > 0) {
+    snapshot.tree.semantic = {
+      ...(snapshot.tree.semantic ?? {}),
+      a11yAppendUsed: true,
+      a11yAppendReplayed: true,
+      a11yAppendedCount: replayed,
+      ...(replayedFallback ? { a11yFallbackUsed: true } : {}),
+    }
+  }
+  return replayed
+}
+
+function axCachePayloadSignature(state: AxDocumentState): string {
+  return JSON.stringify({
+    appendNodes: state.cachedAppendNodes,
+    semanticPatches: state.cachedSemanticPatches,
+  })
+}
+
+async function runAxProbeAndUpdateState(
+  page: Page,
+  snapshot: GeometrySnapshot,
+  state: AxDocumentState | undefined,
+  geometryFingerprint: string,
+  semanticFingerprint: string,
+  axSessionManager: CdpAxSessionManager | undefined,
+): Promise<{ succeeded: boolean; cacheReady: boolean; retryAfterMs?: number }> {
+  const baselineTree = cloneTree(snapshot.tree)
+  const priorCacheSignature = state ? axCachePayloadSignature(state) : undefined
+  let axRevisionAtStart: string | undefined
+  try {
+    await axSessionManager?.get(page)
+    axRevisionAtStart = axSessionManager?.revisionToken()
+  } catch {
+    // The fail-soft enrichment call below owns reset/retry behavior. An
+    // unclaimed starting revision can never produce a replayable cache.
+  }
+  const succeeded = await enrichSnapshotWithCdpAx(page, snapshot, axSessionManager)
+  if (!state || axDocumentStateByPage.get(page) !== state) {
+    return { succeeded, cacheReady: false }
+  }
+  state.lastAxProbeAtMs = performance.now()
+  state.refreshingWithSafeCache = false
+  const axRevisionAtEnd = axSessionManager?.revisionToken()
+  const unclaimedRetryAfterMs = state.automaticRetryUsed
+    ? undefined
+    : AX_HEURISTIC_MIN_INTERVAL_MS
+  if (!succeeded) {
+    state.probeStatus = 'failed'
+    state.cacheInvalidated = true
+    clearAxCache(state)
+    return {
+      succeeded: false,
+      cacheReady: false,
+      retryAfterMs: unclaimedRetryAfterMs,
+    }
+  }
+  if (
+    state.currentGeometryFingerprint !== geometryFingerprint ||
+    state.currentSemanticFingerprint !== semanticFingerprint ||
+    !axRevisionAtStart ||
+    axRevisionAtStart !== axRevisionAtEnd
+  ) {
+    // A newer extraction observed a different DOM while this CDP request was
+    // in flight. The AX response is valid for its source snapshot but unsafe
+    // to replay into the current document. Retry only after the normal bound.
+    state.probeStatus = 'failed'
+    state.cacheInvalidated = true
+    clearAxCache(state)
+    return {
+      succeeded: true,
+      cacheReady: false,
+      retryAfterMs: unclaimedRetryAfterMs,
+    }
+  }
+  state.probeStatus = 'succeeded'
+  state.automaticRetryUsed = false
+  cacheAxAppendNodes(
+    snapshot,
+    baselineTree,
+    state,
+    geometryFingerprint,
+    semanticFingerprint,
+    axRevisionAtEnd,
+  )
+  const nextCacheSignature = axCachePayloadSignature(state)
+  return {
+    succeeded: true,
+    cacheReady: priorCacheSignature !== nextCacheSignature,
+  }
+}
+
 export interface ExtractGeometryTrace {
   mainFrameMs?: number
   iframeCount?: number
@@ -927,16 +1634,202 @@ export interface ExtractGeometryTrace {
   axDecisionMs?: number
   axEnrichMs?: number
   axRan?: boolean
+  axBackgroundStarted?: boolean
+  axFirstDocumentProbe?: boolean
+  axCacheReplayedCount?: number
+  axCacheReplaySuppressed?: boolean
+  axProbeSucceeded?: boolean
   treeJsonMs?: number
   totalMs?: number
 }
 
-async function captureFrameGeometry(frame: Frame): Promise<{ layout: LayoutSnapshot; tree: TreeSnapshot }> {
+interface CapturedFrameGeometry {
+  layout: LayoutSnapshot
+  tree: TreeSnapshot
+  childFramesByIdentity: Map<string, Frame>
+  documentIdentity?: string
+}
+
+interface HostDocumentIdentityState {
+  handle: JSHandle<Document>
+  identity: string
+}
+
+const hostDocumentIdentityByFrame = new WeakMap<Frame, HostDocumentIdentityState>()
+
+/**
+ * Track the actual remote Document object in Playwright's host process.
+ *
+ * A token stored on `document` is not an identity boundary: application code
+ * can preseed or copy any page-readable property across navigations. Remote
+ * object equality is instead checked with a host-held handle whose opaque
+ * identity never enters the page snapshot.
+ */
+async function currentHostDocumentIdentity(frame: Frame): Promise<string> {
+  const candidate = await frame.evaluateHandle(() => document) as JSHandle<Document>
+  const previous = hostDocumentIdentityByFrame.get(frame)
+  if (previous) {
+    try {
+      const unchanged = await candidate.evaluate(
+        (current, prior) => current === prior,
+        previous.handle,
+      )
+      if (unchanged) {
+        await candidate.dispose()
+        return previous.identity
+      }
+    } catch {
+      // Handles from a destroyed execution context cannot be compared with
+      // the replacement document. That is a document transition, not a reason
+      // to reuse the prior cache identity.
+    }
+    await previous.handle.dispose().catch(() => {})
+  }
+
+  const next = { handle: candidate, identity: randomUUID() }
+  hostDocumentIdentityByFrame.set(frame, next)
+  return next.identity
+}
+
+/**
+ * Associate each Playwright child frame with its exact owner element without
+ * mutating authored DOM attributes. The WeakMap identity lives in the page's
+ * main world so the browser-side snapshot can put the same opaque identity on
+ * the matching iframe placeholder. Entries disappear with their elements.
+ */
+async function identifyChildFrames(ownerFrame: Frame): Promise<Map<string, Frame>> {
+  const framesByIdentity = new Map<string, Frame>()
+  const ambiguousIdentities = new Set<string>()
+  for (const childFrame of ownerFrame.childFrames()) {
+    if (childFrame.isDetached()) continue
+    let handle: Awaited<ReturnType<Frame['frameElement']>> | undefined
+    try {
+      handle = await childFrame.frameElement()
+      const identity = await handle.evaluate((iframe, candidate) => {
+        if (!(iframe instanceof HTMLIFrameElement) || !iframe.isConnected) return null
+        const key = Symbol.for('geometra.iframeIdentities')
+        const globals = globalThis as unknown as Record<symbol, unknown>
+        let registry = globals[key]
+        if (!(registry instanceof WeakMap)) {
+          registry = new WeakMap<Element, string>()
+          try {
+            Object.defineProperty(globalThis, key, {
+              configurable: true,
+              value: registry,
+            })
+          } catch {
+            return null
+          }
+        }
+        const identities = registry as WeakMap<Element, unknown>
+        const existing = identities.get(iframe)
+        if (typeof existing === 'string' && existing) return existing
+        identities.set(iframe, candidate)
+        return candidate
+      }, `iframe-${crypto.randomUUID()}`)
+      if (
+        identity &&
+        !childFrame.isDetached() &&
+        childFrame.parentFrame() === ownerFrame
+      ) {
+        if (framesByIdentity.has(identity)) {
+          // A corrupted/page-supplied registry must not be able to alias two
+          // owners. Remove both candidates and leave their placeholders empty.
+          framesByIdentity.delete(identity)
+          ambiguousIdentities.add(identity)
+        } else if (!ambiguousIdentities.has(identity)) {
+          framesByIdentity.set(identity, childFrame)
+        }
+      }
+    } catch {
+      // Detached or cross-navigation frame owners fail closed. In particular,
+      // never shift the next child frame into this placeholder's slot.
+    } finally {
+      await handle?.dispose().catch(() => {})
+    }
+  }
+  return framesByIdentity
+}
+
+async function captureFrameGeometry(
+  frame: Frame,
+  trackDocumentIdentity = false,
+): Promise<CapturedFrameGeometry> {
+  const documentIdentityBefore = trackDocumentIdentity
+    ? await currentHostDocumentIdentity(frame)
+    : undefined
+  const childFramesByIdentity = await identifyChildFrames(frame)
   const raw = await frame.evaluate(browserExtractGeometry)
+  const tree = raw.tree as TreeSnapshot
+  const documentIdentityAfter = trackDocumentIdentity
+    ? await currentHostDocumentIdentity(frame)
+    : undefined
+  if (documentIdentityBefore !== documentIdentityAfter) {
+    throw new Error('Document changed during navigation geometry extraction')
+  }
   return {
     layout: raw.layout as LayoutSnapshot,
-    tree: raw.tree as TreeSnapshot,
+    tree,
+    childFramesByIdentity,
+    documentIdentity: documentIdentityAfter,
   }
+}
+
+async function mergeIframesForOwner(
+  tree: TreeSnapshot,
+  layout: LayoutSnapshot,
+  ownerFrame: Frame,
+  framesByIdentity: Map<string, Frame>,
+): Promise<void> {
+  const ownerOrigin = await frameOriginInRootPage(ownerFrame)
+
+  async function visit(t: TreeSnapshot, l: LayoutSnapshot): Promise<void> {
+    if (t.semantic?.tag === 'iframe') {
+      const identity = typeof t.semantic.iframeIdentity === 'string'
+        ? t.semantic.iframeIdentity
+        : undefined
+      // Internal correlation tokens must never leak into the public snapshot,
+      // including for detached or otherwise unmatched owners.
+      if ('iframeIdentity' in t.semantic) delete t.semantic.iframeIdentity
+      t.children = []
+      l.children = []
+      if (!identity) return
+
+      const childFrame = framesByIdentity.get(identity)
+      if (!childFrame || childFrame.isDetached()) return
+      try {
+        const child = await captureFrameGeometry(childFrame)
+        await mergeIframesForOwner(
+          child.tree,
+          child.layout,
+          childFrame,
+          child.childFramesByIdentity,
+        )
+        const childOrigin = await frameOriginInRootPage(childFrame)
+        const deltaX = childOrigin.x - ownerOrigin.x
+        const deltaY = childOrigin.y - ownerOrigin.y
+        l.children = child.layout.children.map(childLayout => {
+          const copy = cloneLayout(childLayout)
+          offsetLayoutSubtree(copy, deltaX, deltaY)
+          return copy
+        })
+        t.children = (child.tree.children ?? []).map(cloneTree)
+        t.semantic = { ...t.semantic, frameUrl: childFrame.url() }
+      } catch {
+        // A navigation/detach between identity capture and frame extraction is
+        // an unmatched placeholder, not permission to borrow another frame.
+      }
+      return
+    }
+
+    const children = t.children ?? []
+    for (let index = 0; index < children.length; index++) {
+      const childLayout = l.children[index]
+      if (childLayout) await visit(children[index]!, childLayout)
+    }
+  }
+
+  await visit(tree, layout)
 }
 
 export async function extractFrameGeometry(frame: Frame): Promise<GeometrySnapshot> {
@@ -953,43 +1846,16 @@ export async function mergeAllIframes(
   layout: LayoutSnapshot,
   ownerFrame: Frame,
 ): Promise<void> {
-  if (ownerFrame.childFrames().length === 0) return
-
-  async function dfs(t: TreeSnapshot, l: LayoutSnapshot, f: Frame): Promise<void> {
-    const subFrames = f.childFrames()
-    if (subFrames.length === 0) return
-    let slot = 0
-    const tch = t.children ?? []
-    const lch = l.children
-    for (let i = 0; i < tch.length; i++) {
-      const st = tch[i]!
-      const sl = lch[i]!
-      if (st.semantic?.tag === 'iframe') {
-        const cf = subFrames[slot++]
-        if (cf && !cf.isDetached()) {
-          const snap = await captureFrameGeometry(cf)
-          await mergeAllIframes(snap.tree, snap.layout, cf)
-          const { x: ox, y: oy } = await frameOriginInRootPage(cf)
-          sl.children = snap.layout.children.map(c => {
-            const copy = cloneLayout(c)
-            offsetLayoutSubtree(copy, ox, oy)
-            return copy
-          })
-          st.children = (snap.tree.children ?? []).map(cloneTree)
-          st.semantic = { ...st.semantic, frameUrl: cf.url() }
-          await dfs(st, sl, cf)
-        }
-      } else {
-        await dfs(st, sl, f)
-      }
-    }
-  }
-  await dfs(tree, layout, ownerFrame)
+  await mergeIframesForOwner(tree, layout, ownerFrame, await identifyChildFrames(ownerFrame))
 }
 
 export interface ExtractGeometryOptions {
   axSessionManager?: CdpAxSessionManager
   trace?: ExtractGeometryTrace
+  /** Called once when a background AX probe materially added, changed, or removed cached AX data. */
+  onAxReady?: () => void
+  /** Requests one bounded host refresh after a failed, invalidated, or expiring AX probe. */
+  onAxRetryDue?: (delayMs: number) => void
 }
 
 /**
@@ -1000,7 +1866,7 @@ export async function extractGeometry(page: Page, options?: ExtractGeometryOptio
   const totalStartedAt = performance.now()
 
   const mainFrameStartedAt = performance.now()
-  const mainFrame = await captureFrameGeometry(page.mainFrame())
+  const mainFrame = await captureFrameGeometry(page.mainFrame(), true)
   if (trace) {
     trace.mainFrameMs = performance.now() - mainFrameStartedAt
     trace.iframeCount = Math.max(0, page.frames().length - 1)
@@ -1012,24 +1878,110 @@ export async function extractGeometry(page: Page, options?: ExtractGeometryOptio
   }
 
   const iframeMergeStartedAt = performance.now()
-  await mergeAllIframes(main.tree, main.layout, page.mainFrame())
+  await mergeIframesForOwner(
+    main.tree,
+    main.layout,
+    page.mainFrame(),
+    mainFrame.childFramesByIdentity,
+  )
   if (trace) {
     trace.iframeMergeMs = performance.now() - iframeMergeStartedAt
   }
 
   const axDecisionStartedAt = performance.now()
-  const shouldRunAxEnrichment = shouldEnrichSnapshotWithCdpAx(main)
+  const axSessionManager = axSessionManagerForPage(page, options?.axSessionManager)
+  const axPlan = planAxProbe(
+    page,
+    mainFrame.documentIdentity,
+    main,
+    axSessionManager.revisionToken(),
+  )
+  const shouldRunAxEnrichment = axPlan.shouldRun
+  const runAxInBackground = shouldRunAxEnrichment
+  const requestAxRetry = (delayMs: number | undefined): boolean => {
+    if (!delayMs || !Number.isFinite(delayMs) || delayMs <= 0 || !options?.onAxRetryDue) {
+      return false
+    }
+    try {
+      options.onAxRetryDue(delayMs)
+      return true
+    } catch {
+      // Retry scheduling is advisory and must never poison extraction.
+      return false
+    }
+  }
   if (trace) {
     trace.axDecisionMs = performance.now() - axDecisionStartedAt
-    trace.axRan = shouldRunAxEnrichment
+    trace.axRan = shouldRunAxEnrichment && !runAxInBackground
+    trace.axBackgroundStarted = runAxInBackground
+    trace.axFirstDocumentProbe = axPlan.firstDocumentProbe
+    if (axPlan.cacheReplaySuppressed) trace.axCacheReplaySuppressed = true
+  }
+  if (requestAxRetry(axPlan.retryAfterMs) && axPlan.state) {
+    axPlan.state.automaticRetryUsed = true
   }
 
-  if (shouldRunAxEnrichment) {
-    const axEnrichStartedAt = performance.now()
-    await enrichSnapshotWithCdpAx(page, main, options?.axSessionManager)
-    if (trace) {
-      trace.axEnrichMs = performance.now() - axEnrichStartedAt
+  if (runAxInBackground) {
+    const backgroundSnapshot: GeometrySnapshot = {
+      tree: cloneTree(main.tree),
+      layout: cloneLayout(main.layout),
+      treeJson: '',
     }
+    const axEnrichStartedAt = performance.now()
+    void runAxProbeAndUpdateState(
+      page,
+      backgroundSnapshot,
+      axPlan.state,
+      axPlan.geometryFingerprint,
+      axPlan.semanticFingerprint,
+      axSessionManager,
+    ).then(result => {
+      if (trace) {
+        trace.axProbeSucceeded = result.succeeded
+        trace.axEnrichMs = performance.now() - axEnrichStartedAt
+      }
+      if (result.cacheReady) {
+        try {
+          options?.onAxReady?.()
+        } catch {
+          // Readiness is advisory; scheduler errors must not poison AX state.
+        }
+      }
+      if (
+        requestAxRetry(result.retryAfterMs) &&
+        axPlan.state &&
+        axDocumentStateByPage.get(page) === axPlan.state
+      ) {
+        axPlan.state.automaticRetryUsed = true
+      }
+    }).catch(() => {
+      // enrichSnapshotWithCdpAx is fail-soft, but keep the detached background
+      // task from ever becoming an unhandled rejection if that contract changes.
+      if (axPlan.state && axDocumentStateByPage.get(page) === axPlan.state) {
+        axPlan.state.probeStatus = 'failed'
+        axPlan.state.lastAxProbeAtMs = performance.now()
+        axPlan.state.refreshingWithSafeCache = false
+        axPlan.state.cacheInvalidated = true
+        clearAxCache(axPlan.state)
+      }
+      if (trace) trace.axProbeSucceeded = false
+      if (requestAxRetry(AX_HEURISTIC_MIN_INTERVAL_MS) && axPlan.state) {
+        axPlan.state.automaticRetryUsed = true
+      }
+    })
+  }
+
+  if (axPlan.state && axPlan.mayReplayCache) {
+    const replayed =
+      replayCachedAxSemanticPatches(main, axPlan.state) +
+      replayCachedAxAppendNodes(main, axPlan.state)
+    if (trace) trace.axCacheReplayedCount = replayed
+  } else if (trace && (
+    axPlan.cacheReplaySuppressed ||
+    axPlan.state?.cachedAppendNodes.length ||
+    axPlan.state?.cachedSemanticPatches.length
+  )) {
+    trace.axCacheReplaySuppressed = true
   }
 
   const treeJsonStartedAt = performance.now()

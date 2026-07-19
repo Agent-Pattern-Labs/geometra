@@ -51,6 +51,10 @@ const DEFAULT_MAX_PAYLOAD_BYTES = 4 * 1024 * 1024
 const DEFAULT_ACTION_REQUEST_LEDGER_ENTRIES = 65_536
 /** A completed action must not be starved by a page that mutates forever. */
 const MAX_INPUT_ACK_LATENCY_MS = 250
+// The page-side bridge lives in the untrusted main world. Even if application
+// code calls the exposed "settled" hook directly, it must not be able to turn
+// that hint into an unbounded extraction loop on the proxy host.
+const MIN_IMMEDIATE_EXTRACT_INTERVAL_MS = 250
 const PROXY_PROTOCOL_CAPABILITIES = {
   transport: 'proxy',
   authenticatedController: true,
@@ -60,6 +64,7 @@ const PROXY_PROTOCOL_CAPABILITIES = {
   atomicTypeText: true,
   proxyActions: true,
   exactFieldIdentity: true,
+  verifiedFileUploads: true,
 } as const
 const PROXY_GEOMETRY_METADATA = {
   protocolVersion: GEOMETRY_PROTOCOL_VERSION,
@@ -76,43 +81,445 @@ const PROXY_ACTION_METADATA = {
   protocolCapabilities: PROXY_PROTOCOL_CAPABILITIES,
 } as const
 
-async function bindDomObserverBridge(page: Page, scheduleExtract: () => void): Promise<void> {
-  if (DOM_OBSERVER_BINDINGS.has(page)) return
-  await page.exposeFunction('__geometraProxyNotify', () => {
-    scheduleExtract()
-  })
-  await page.addInitScript(() => {
-    const w = window as unknown as {
-      __geometraProxyNotify?: () => Promise<void>
-      __geometraProxyObserverBootstrapped?: boolean
-      __geometraProxyObserverInstalled?: boolean
-    }
-    if (w.__geometraProxyObserverBootstrapped) return
+/**
+ * Runs in every page/frame realm before application code.
+ *
+ * Keep this function closure-free: Playwright serializes it for addInitScript.
+ * Closed shadow roots are deliberately held in a WeakMap rather than exposed
+ * through DOM attributes. The extractor consumes the same Symbol.for key in
+ * its in-page evaluation.
+ */
+function installPageFreshnessInstrumentation(config: {
+  installToken: string
+  notifyBindingName: string
+}): void {
+  const { installToken, notifyBindingName } = config
+  const CLOSED_ROOTS_KEY = Symbol.for('geometra.closedShadowRoots')
+  // This key is minted in the trusted host process and injected immediately
+  // before installation. A page can preseed a public Symbol.for name, but it
+  // cannot predict this per-binding capability before an init script runs.
+  const INSTALL_STATE_KEY = `__geometraProxyFreshnessInstalled_${installToken}`
+  const global = globalThis as typeof globalThis & {
+    [CLOSED_ROOTS_KEY]?: WeakMap<Element, ShadowRoot>
+  }
+  const globalRecord = global as unknown as Record<PropertyKey, unknown>
+  if (globalRecord[INSTALL_STATE_KEY] === installToken) return
 
-    const install = () => {
-      if (w.__geometraProxyObserverInstalled) return
-      const root = document.documentElement
-      if (!root) return
-      const observer = new MutationObserver(() => {
-        void w.__geometraProxyNotify?.()
-      })
-      observer.observe(root, {
-        subtree: true,
-        childList: true,
-        attributes: true,
-        characterData: true,
-      })
-      w.__geometraProxyObserverInstalled = true
+  let existingRegistry: unknown
+  try {
+    existingRegistry = global[CLOSED_ROOTS_KEY]
+  } catch {
+    // A hostile getter must not disable the independent freshness signals.
+  }
+  let closedRoots = existingRegistry instanceof WeakMap
+    ? existingRegistry
+    : undefined
+  if (!closedRoots) {
+    const candidate = new WeakMap<Element, ShadowRoot>()
+    try {
+      const existingDescriptor = Object.getOwnPropertyDescriptor(global, CLOSED_ROOTS_KEY)
+      if (existingDescriptor) {
+        // Supplying only value preserves the flags of a non-configurable but
+        // writable data property. Configurable collisions are replaced too.
+        Object.defineProperty(global, CLOSED_ROOTS_KEY, { value: candidate })
+      } else {
+        Object.defineProperty(global, CLOSED_ROOTS_KEY, {
+          value: candidate,
+          configurable: false,
+          enumerable: false,
+          writable: false,
+        })
+      }
+      if (global[CLOSED_ROOTS_KEY] === candidate) closedRoots = candidate
+    } catch {
+      // Fail closed for semantic access to closed roots. attachShadow remains
+      // usable and the mutation/resize/CSS freshness machinery still boots.
+    }
+  }
+
+  // Capture the Playwright bridge before application code can replace or
+  // delete its writable main-world property. All instrumentation signals use
+  // this private closure reference from here onward.
+  const bindingCandidate = globalRecord[notifyBindingName]
+  const notifyBridge = typeof bindingCandidate === 'function'
+    ? (bindingCandidate as (urgency?: 'settled') => Promise<void>).bind(global)
+    : undefined
+  const NOTIFY_MIN_INTERVAL_MS = 25
+  let notifyInFlight = false
+  let notifyPending = false
+  let settledNotifyPending = false
+  let notifyTimer: ReturnType<typeof setTimeout> | undefined
+  let lastNotifyStartedAt = Number.NEGATIVE_INFINITY
+
+  const drainNotify = () => {
+    if (!notifyBridge || notifyInFlight || notifyTimer !== undefined || !notifyPending) return
+    const elapsed = global.performance.now() - lastNotifyStartedAt
+    const remaining = Math.max(0, NOTIFY_MIN_INTERVAL_MS - elapsed)
+    if (remaining > 0) {
+      // Anchor the cadence to the prior dispatch instead of resetting this
+      // timer for every mutation. A page that changes forever therefore keeps
+      // making bounded progress and still emits its final trailing signal.
+      notifyTimer = global.setTimeout(() => {
+        notifyTimer = undefined
+        drainNotify()
+      }, Math.ceil(remaining))
+      return
     }
 
-    if (document.readyState === 'loading') {
-      document.addEventListener('DOMContentLoaded', install, { once: true })
+    const urgency = settledNotifyPending ? 'settled' as const : undefined
+    notifyPending = false
+    settledNotifyPending = false
+    notifyInFlight = true
+    lastNotifyStartedAt = global.performance.now()
+    let bridgeCall: Promise<void>
+    try {
+      bridgeCall = Promise.resolve(notifyBridge(urgency))
+    } catch {
+      notifyInFlight = false
+      drainNotify()
+      return
+    }
+    void bridgeCall.catch(() => {}).finally(() => {
+      notifyInFlight = false
+      drainNotify()
+    })
+  }
+  const notify = (urgency?: 'settled') => {
+    if (!notifyBridge) return
+    notifyPending = true
+    // A final settle hint must survive coalescing with any number of ordinary
+    // mutation signals so the host can bypass its trailing debounce once.
+    if (urgency === 'settled') settledNotifyPending = true
+    drainNotify()
+  }
+
+  // A sampler is started only by a signal that can imply layout is actively
+  // changing. It has a hard per-signal horizon and never polls an idle page.
+  const MAX_SETTLE_MS = 500
+  let settleUntil = 0
+  let settleAnimationFrame: number | undefined
+  const sampleUntilSettled = () => {
+    if (global.performance.now() < settleUntil) {
+      notify()
+      settleAnimationFrame = global.requestAnimationFrame(sampleUntilSettled)
     } else {
-      install()
+      settleAnimationFrame = undefined
+      // Bypass the trailing debounce for the final sample. This makes 500ms
+      // a hard scheduling bound for a finite layout activity window instead
+      // of silently turning it into 500ms + debounceMs.
+      notify('settled')
     }
+  }
+  const markLayoutActivity = () => {
+    settleUntil = Math.max(settleUntil, global.performance.now() + MAX_SETTLE_MS)
+    notify()
+    if (settleAnimationFrame === undefined) {
+      settleAnimationFrame = global.requestAnimationFrame(sampleUntilSettled)
+    }
+  }
 
-    w.__geometraProxyObserverBootstrapped = true
+  let resizeObserver: ResizeObserver | undefined
+  const resizeTargets = new WeakSet<Element>()
+  // Bounding the target count avoids turning observation into an unbounded
+  // mirror of very large application DOMs. CSSOM/event sampling remains the
+  // fallback for nodes beyond this cap.
+  const MAX_RESIZE_TARGETS = 4_096
+  let resizeTargetCount = 0
+  const observeResizeTarget = (element: Element) => {
+    if (!resizeObserver || resizeTargets.has(element) || resizeTargetCount >= MAX_RESIZE_TARGETS) return
+    resizeTargets.add(element)
+    resizeTargetCount += 1
+    resizeObserver.observe(element)
+  }
+  const observeResizeCandidates = (root: ParentNode) => {
+    if (root instanceof Element) observeResizeTarget(root)
+    for (const element of root.querySelectorAll(
+      'a,button,input,select,textarea,iframe,img,canvas,svg,video,[role],[contenteditable],[tabindex]',
+    )) {
+      observeResizeTarget(element)
+      if (resizeTargetCount >= MAX_RESIZE_TARGETS) break
+    }
+  }
+
+  if (typeof ResizeObserver === 'function') {
+    resizeObserver = new ResizeObserver(() => notify())
+  }
+
+  const mutationObserver = new MutationObserver(records => {
+    for (const record of records) {
+      for (const node of record.addedNodes) {
+        if (node instanceof Element || node instanceof ShadowRoot) {
+          observeResizeCandidates(node)
+        }
+      }
+    }
+    notify()
   })
+  const observeRoot = (root: Document | ShadowRoot) => {
+    mutationObserver.observe(root, {
+      subtree: true,
+      childList: true,
+      attributes: true,
+      characterData: true,
+    })
+    observeResizeCandidates(root)
+  }
+
+  const attachShadowDescriptor = Object.getOwnPropertyDescriptor(Element.prototype, 'attachShadow')
+  const nativeAttachShadow = attachShadowDescriptor?.value as typeof Element.prototype.attachShadow | undefined
+  if (nativeAttachShadow) {
+    const instrumentedAttachShadow = function attachShadow(
+      this: Element,
+      init: ShadowRootInit,
+    ): ShadowRoot {
+      const root = Reflect.apply(nativeAttachShadow, this, [init]) as ShadowRoot
+      if (init?.mode === 'closed') closedRoots?.set(this, root)
+      observeRoot(root)
+      markLayoutActivity()
+      return root
+    }
+    // Preserve the original method's own surface where the platform permits
+    // it. The wrapper already has the native one-argument call signature.
+    try {
+      Object.defineProperty(instrumentedAttachShadow, 'name', {
+        value: nativeAttachShadow.name,
+        configurable: true,
+      })
+      Object.defineProperty(instrumentedAttachShadow, 'toString', {
+        value: nativeAttachShadow.toString.bind(nativeAttachShadow),
+        configurable: true,
+      })
+    } catch {
+      // Function metadata is cosmetic; never make attachShadow unavailable.
+    }
+    try {
+      Object.defineProperty(Element.prototype, 'attachShadow', {
+        ...attachShadowDescriptor,
+        value: instrumentedAttachShadow,
+      })
+    } catch {
+      // Hardened realms may lock platform prototypes. Keep the rest of the
+      // freshness instrumentation available even when closed-root capture is
+      // impossible in that realm.
+    }
+  }
+
+  type AnyMethod = (this: unknown, ...args: unknown[]) => unknown
+  type AnyGetter = (this: unknown) => unknown
+  type AnySetter = (this: unknown, value: unknown) => void
+  const wrapLayoutMutator = (prototype: object, property: string) => {
+    const descriptor = Object.getOwnPropertyDescriptor(prototype, property)
+    const native = descriptor?.value as AnyMethod | undefined
+    if (!descriptor || typeof native !== 'function') return
+    const wrapped = function (this: unknown, ...args: unknown[]) {
+      const result = Reflect.apply(native, this, args)
+      markLayoutActivity()
+      if (result && typeof (result as PromiseLike<unknown>).then === 'function') {
+        void Promise.resolve(result).then(markLayoutActivity, markLayoutActivity)
+      }
+      return result
+    }
+    try {
+      Object.defineProperty(wrapped, 'name', { value: native.name, configurable: true })
+      Object.defineProperty(wrapped, 'length', { value: native.length, configurable: true })
+    } catch {
+      // Function metadata is best-effort only.
+    }
+    try {
+      Object.defineProperty(prototype, property, { ...descriptor, value: wrapped })
+    } catch {
+      // A locked CSSOM prototype still has ResizeObserver/event fallbacks.
+    }
+  }
+
+  const wrapLayoutSetter = (prototype: object, property: string) => {
+    const descriptor = Object.getOwnPropertyDescriptor(prototype, property)
+    const nativeSet = descriptor?.set as AnySetter | undefined
+    if (!descriptor || !nativeSet) return
+    const wrappedSet = function (this: unknown, value: unknown) {
+      Reflect.apply(nativeSet, this, [value])
+      markLayoutActivity()
+    }
+    try {
+      Object.defineProperty(prototype, property, { ...descriptor, set: wrappedSet })
+    } catch {
+      // A locked CSSOM prototype still has ResizeObserver/event fallbacks.
+    }
+  }
+
+  const instrumentedDeclarations = new WeakSet<CSSStyleDeclaration>()
+  const nativeGetPropertyValue = CSSStyleDeclaration.prototype.getPropertyValue
+  const nativeSetProperty = CSSStyleDeclaration.prototype.setProperty
+  // CSSStyleDeclaration exposes CSS properties as own WebIDL named
+  // properties. Assignments such as rule.style.transform = 'translateX(...)'
+  // do not call the JavaScript-visible setProperty method and do not produce a
+  // DOM mutation. Instrument geometry-bearing declarations when a CSS rule's
+  // style getter first exposes them so cached declarations remain observable.
+  const GEOMETRY_DECLARATION_PROPERTIES = [
+    'alignContent', 'alignItems', 'alignSelf', 'alignmentBaseline',
+    'animation', 'animationDelay', 'animationDuration', 'animationName', 'animationPlayState',
+    'aspectRatio',
+    'blockSize', 'inlineSize', 'minBlockSize', 'maxBlockSize', 'minInlineSize', 'maxInlineSize',
+    'border', 'borderBlock', 'borderInline', 'borderWidth', 'borderTopWidth', 'borderRightWidth',
+    'borderBottomWidth', 'borderLeftWidth', 'boxSizing',
+    'clear', 'clip', 'clipPath', 'columnCount', 'columnGap', 'columnWidth', 'columns',
+    'contain', 'content', 'contentVisibility',
+    'direction', 'display',
+    'flex', 'flexBasis', 'flexDirection', 'flexFlow', 'flexGrow', 'flexShrink', 'flexWrap',
+    'float', 'cssFloat',
+    'font', 'fontFamily', 'fontSize', 'fontStretch', 'fontStyle', 'fontWeight',
+    'gap', 'grid', 'gridArea', 'gridAutoColumns', 'gridAutoFlow', 'gridAutoRows',
+    'gridColumn', 'gridColumnEnd', 'gridColumnStart', 'gridRow', 'gridRowEnd', 'gridRowStart',
+    'gridTemplate', 'gridTemplateAreas', 'gridTemplateColumns', 'gridTemplateRows',
+    'height', 'minHeight', 'maxHeight',
+    'inset', 'insetBlock', 'insetBlockEnd', 'insetBlockStart', 'insetInline', 'insetInlineEnd',
+    'insetInlineStart', 'top', 'right', 'bottom', 'left',
+    'justifyContent', 'justifyItems', 'justifySelf',
+    'letterSpacing', 'lineHeight',
+    'margin', 'marginBlock', 'marginBlockEnd', 'marginBlockStart', 'marginInline', 'marginInlineEnd',
+    'marginInlineStart', 'marginTop', 'marginRight', 'marginBottom', 'marginLeft',
+    'objectFit', 'objectPosition', 'opacity', 'order', 'overflow', 'overflowX', 'overflowY',
+    'padding', 'paddingBlock', 'paddingBlockEnd', 'paddingBlockStart', 'paddingInline',
+    'paddingInlineEnd', 'paddingInlineStart', 'paddingTop', 'paddingRight', 'paddingBottom', 'paddingLeft',
+    'perspective', 'perspectiveOrigin', 'position',
+    'rotate', 'rowGap', 'scale',
+    'textIndent', 'transform', 'transformBox', 'transformOrigin', 'transition', 'translate',
+    'verticalAlign', 'visibility', 'whiteSpace',
+    'width', 'minWidth', 'maxWidth', 'wordSpacing', 'writingMode', 'zoom',
+  ] as const
+  const cssPropertyName = (property: string): string => {
+    if (property === 'cssFloat') return 'float'
+    const dashed = property.replace(/[A-Z]/g, character => `-${character.toLowerCase()}`)
+    return /^(webkit|moz|ms|o)-/.test(dashed) ? `-${dashed}` : dashed
+  }
+  const instrumentDeclaration = (declaration: CSSStyleDeclaration) => {
+    if (instrumentedDeclarations.has(declaration)) return
+    instrumentedDeclarations.add(declaration)
+    for (const property of GEOMETRY_DECLARATION_PROPERTIES) {
+      const descriptor = Object.getOwnPropertyDescriptor(declaration, property)
+      if (!descriptor?.configurable) continue
+      const cssName = cssPropertyName(property)
+      try {
+        Object.defineProperty(declaration, property, {
+          configurable: true,
+          enumerable: descriptor.enumerable,
+          get() {
+            return Reflect.apply(nativeGetPropertyValue, declaration, [cssName]) as string
+          },
+          set(value: unknown) {
+            Reflect.apply(nativeSetProperty, declaration, [cssName, value == null ? '' : String(value), ''])
+            markLayoutActivity()
+          },
+        })
+      } catch {
+        // The rule-style getter sampler below remains a bounded fallback.
+      }
+    }
+  }
+  const wrapRuleStyleGetter = (prototype: object) => {
+    const descriptor = Object.getOwnPropertyDescriptor(prototype, 'style')
+    const nativeGet = descriptor?.get as AnyGetter | undefined
+    if (!descriptor || !nativeGet) return
+    const wrappedGet = function (this: unknown) {
+      const declaration = Reflect.apply(nativeGet, this, []) as CSSStyleDeclaration
+      instrumentDeclaration(declaration)
+      // Also cover newly introduced CSS properties that are not yet in the
+      // explicit geometry list. Access starts one bounded settle window; it
+      // never creates persistent polling.
+      markLayoutActivity()
+      return declaration
+    }
+    try {
+      Object.defineProperty(prototype, 'style', { ...descriptor, get: wrappedGet })
+    } catch {
+      // Locked rule prototypes retain ResizeObserver/event fallbacks.
+    }
+  }
+
+  if (typeof CSSStyleSheet !== 'undefined') {
+    for (const method of ['insertRule', 'deleteRule', 'replace', 'replaceSync']) {
+      wrapLayoutMutator(CSSStyleSheet.prototype, method)
+    }
+  }
+  if (typeof CSSStyleDeclaration !== 'undefined') {
+    for (const method of ['setProperty', 'removeProperty']) {
+      wrapLayoutMutator(CSSStyleDeclaration.prototype, method)
+    }
+    wrapLayoutSetter(CSSStyleDeclaration.prototype, 'cssText')
+  }
+  for (const constructorName of ['CSSStyleRule', 'CSSKeyframeRule', 'CSSFontFaceRule', 'CSSPageRule']) {
+    const constructor = (global as unknown as Record<string, unknown>)[constructorName] as
+      | { prototype?: object }
+      | undefined
+    if (constructor?.prototype) wrapRuleStyleGetter(constructor.prototype)
+  }
+
+  const notifyEvent = () => notify()
+  const activityEvent = () => markLayoutActivity()
+  global.addEventListener('scroll', notifyEvent, { capture: true, passive: true })
+  global.addEventListener('resize', notifyEvent, { passive: true })
+  document.addEventListener('transitionrun', activityEvent, true)
+  document.addEventListener('transitionstart', activityEvent, true)
+  document.addEventListener('transitionend', activityEvent, true)
+  document.addEventListener('transitioncancel', activityEvent, true)
+  document.addEventListener('animationstart', activityEvent, true)
+  document.addEventListener('animationiteration', activityEvent, true)
+  document.addEventListener('animationend', activityEvent, true)
+  document.addEventListener('animationcancel', activityEvent, true)
+  document.addEventListener('load', event => {
+    const target = event.target
+    if (target instanceof HTMLLinkElement && target.relList.contains('stylesheet')) {
+      markLayoutActivity()
+    }
+  }, true)
+
+  const fonts = document.fonts
+  if (fonts) {
+    fonts.addEventListener('loading', activityEvent)
+    fonts.addEventListener('loadingdone', activityEvent)
+    fonts.addEventListener('loadingerror', activityEvent)
+    void fonts.ready.then(markLayoutActivity, notify)
+  }
+
+  // A Document can be observed before the parser creates documentElement, so
+  // install the mutation signal immediately and add resize targets once they
+  // exist.
+  observeRoot(document)
+  const installDocumentResizeTargets = () => {
+    if (document.documentElement) observeResizeTarget(document.documentElement)
+    if (document.body) observeResizeTarget(document.body)
+  }
+  if (document.documentElement) {
+    installDocumentResizeTargets()
+  } else {
+    document.addEventListener('DOMContentLoaded', installDocumentResizeTargets, { once: true })
+  }
+
+  Object.defineProperty(global, INSTALL_STATE_KEY, {
+    value: installToken,
+    configurable: false,
+    enumerable: false,
+    writable: false,
+  })
+}
+
+async function bindDomObserverBridge(page: Page, scheduleExtract: (immediate?: boolean) => void): Promise<void> {
+  if (DOM_OBSERVER_BINDINGS.has(page)) return
+  const installToken = randomBytes(32).toString('base64url')
+  const notifyBindingName = `__geometraProxyNotify_${installToken}`
+  const installConfig = { installToken, notifyBindingName }
+  await page.exposeFunction(notifyBindingName, (urgency?: 'settled') => {
+    scheduleExtract(urgency === 'settled')
+  })
+  // addInitScript is the critical path: it runs before application scripts in
+  // every subsequent main-frame and child-frame document.
+  await page.addInitScript(installPageFreshnessInstrumentation, installConfig)
+  // Also instrument a document that was already loaded before the bridge was
+  // bound. Closed roots created before this point cannot be recovered, which
+  // is why the runtime primes the bridge before its first navigation.
+  await Promise.all(page.frames().map(async frame => {
+    await frame.evaluate(installPageFreshnessInstrumentation, installConfig).catch(() => {})
+  }))
   DOM_OBSERVER_BINDINGS.add(page)
 }
 
@@ -809,7 +1216,7 @@ export interface GeometryWsHub {
   /** Actual bind host (loopback by default). */
   host: string
   /** Run extraction and broadcast (debounced observer calls this). */
-  scheduleExtract: () => void
+  scheduleExtract: (immediate?: boolean) => void
   /** Wait until any in-flight extract + broadcast finishes. */
   flushExtract: () => Promise<void>
   getTrace: () => GeometryWsTrace
@@ -893,13 +1300,21 @@ export function startGeometryWebSocket(options: {
       done(true)
     },
   })
-  const axSessionManager = createCdpAxSessionManager()
+  let closing = false
+  const axSessionManager = createCdpAxSessionManager(() => {
+    if (!closing) scheduleExtract(true)
+  })
 
   let prevLayout: LayoutSnapshot | null = null
   let prevTreeJson: string | null = null
 
   let debounceTimer: ReturnType<typeof setTimeout> | null = null
   let inputAckFlushTimer: ReturnType<typeof setTimeout> | null = null
+  let immediateExtractTimer: ReturnType<typeof setTimeout> | null = null
+  let axRetryTimer: ReturnType<typeof setTimeout> | null = null
+  let axRetryDueAtMs = Number.POSITIVE_INFINITY
+  let immediateExtractRequestedAfterActive = false
+  let lastExtractCompletedAtMs = Number.NEGATIVE_INFINITY
   let extracting = false
   let pendingExtract = false
   let extractSequence = 0
@@ -1037,7 +1452,14 @@ export function startGeometryWebSocket(options: {
       }
       const page = await waitForPage()
       const extractStartedAt = performance.now()
-      const snap = await extractGeometryWithRecovery(page, axSessionManager, extractorTrace, recoveryTrace)
+      const snap = await extractGeometryWithRecovery(
+        page,
+        axSessionManager,
+        extractorTrace,
+        recoveryTrace,
+        () => scheduleExtract(true),
+        delayMs => scheduleAxRetry(delayMs),
+      )
       const extractMs = performance.now() - extractStartedAt
       const broadcastStartedAt = performance.now()
       const changed = broadcastSnapshot(snap)
@@ -1084,6 +1506,11 @@ export function startGeometryWebSocket(options: {
       }
     } finally {
       extracting = false
+      lastExtractCompletedAtMs = performance.now()
+      if (immediateExtractRequestedAfterActive) {
+        immediateExtractRequestedAfterActive = false
+        armImmediateExtract()
+      }
     }
     return changed
   }
@@ -1100,6 +1527,35 @@ export function startGeometryWebSocket(options: {
       clearTimeout(inputAckFlushTimer)
       inputAckFlushTimer = null
     }
+  }
+
+  function clearImmediateExtractTimer() {
+    if (immediateExtractTimer !== null) {
+      clearTimeout(immediateExtractTimer)
+      immediateExtractTimer = null
+    }
+    immediateExtractRequestedAfterActive = false
+  }
+
+  function clearAxRetryTimer() {
+    if (axRetryTimer !== null) {
+      clearTimeout(axRetryTimer)
+      axRetryTimer = null
+    }
+    axRetryDueAtMs = Number.POSITIVE_INFINITY
+  }
+
+  function scheduleAxRetry(delayMs: number) {
+    const boundedDelayMs = Math.max(1, Math.ceil(delayMs))
+    const dueAtMs = performance.now() + boundedDelayMs
+    if (axRetryTimer !== null && dueAtMs >= axRetryDueAtMs) return
+    clearAxRetryTimer()
+    axRetryDueAtMs = dueAtMs
+    axRetryTimer = setTimeout(() => {
+      axRetryTimer = null
+      axRetryDueAtMs = Number.POSITIVE_INFINITY
+      scheduleExtract(true)
+    }, boundedDelayMs)
   }
 
   function runScheduledExtract() {
@@ -1128,7 +1584,37 @@ export function startGeometryWebSocket(options: {
     }, MAX_INPUT_ACK_LATENCY_MS)
   }
 
-  function scheduleExtract() {
+  function armImmediateExtract() {
+    if (extracting) {
+      // Do not turn a page hint into runExtractQueued's pending loop. One
+      // coalesced refresh becomes eligible only after the active extraction
+      // completes and the host has had a cooldown window.
+      immediateExtractRequestedAfterActive = true
+      return
+    }
+    if (immediateExtractTimer !== null) return
+    const elapsed = performance.now() - lastExtractCompletedAtMs
+    const remaining = Math.max(0, MIN_IMMEDIATE_EXTRACT_INTERVAL_MS - elapsed)
+    if (remaining === 0) {
+      runScheduledExtract()
+      return
+    }
+    immediateExtractTimer = setTimeout(() => {
+      immediateExtractTimer = null
+      if (extracting) {
+        immediateExtractRequestedAfterActive = true
+      } else {
+        runScheduledExtract()
+      }
+    }, remaining)
+  }
+
+  function scheduleExtract(immediate = false) {
+    if (immediate) {
+      clearDebounceTimer()
+      armImmediateExtract()
+      return
+    }
     if (debounceTimer !== null) clearTimeout(debounceTimer)
     debounceTimer = setTimeout(flushDebouncedExtract, debounceMs)
   }
@@ -1224,48 +1710,36 @@ export function startGeometryWebSocket(options: {
       await actionQueue.catch(() => {})
       clearDebounceTimer()
       clearInputAckFlushTimer()
+      clearImmediateExtractTimer()
       await runExtractQueued()
       sendPendingInputAcks()
     },
     getTrace: () => structuredClone(trace),
-    close: () =>
-      new Promise((resolve, reject) => {
+    close: () => {
+      closing = true
+      return new Promise((resolve, reject) => {
         void axSessionManager.close().finally(() => {
           clearDebounceTimer()
           clearInputAckFlushTimer()
+          clearImmediateExtractTimer()
+          clearAxRetryTimer()
           for (const ws of clients) {
             ws.close()
           }
           clients.clear()
           wss.close(err => (err ? reject(err) : resolve()))
         })
-      }),
+      })
+    },
   }
 }
 
-export async function primeDomObserver(page: Page, scheduleExtract: () => void): Promise<void> {
+export async function primeDomObserver(page: Page, scheduleExtract: (immediate?: boolean) => void): Promise<void> {
   await bindDomObserverBridge(page, scheduleExtract)
 }
 
-export async function installDomObserver(page: Page, scheduleExtract: () => void): Promise<void> {
+export async function installDomObserver(page: Page, scheduleExtract: (immediate?: boolean) => void): Promise<void> {
   await bindDomObserverBridge(page, scheduleExtract)
-  await page.evaluate(() => {
-    const w = window as unknown as {
-      __geometraProxyNotify?: () => Promise<void>
-      __geometraProxyObserverInstalled?: boolean
-    }
-    if (w.__geometraProxyObserverInstalled) return
-    const observer = new MutationObserver(() => {
-      void w.__geometraProxyNotify?.()
-    })
-    observer.observe(document.documentElement, {
-      subtree: true,
-      childList: true,
-      attributes: true,
-      characterData: true,
-    })
-    w.__geometraProxyObserverInstalled = true
-  })
 }
 
 function isNavigationTransitionError(err: unknown): boolean {
@@ -1278,6 +1752,8 @@ async function extractGeometryWithRecovery(
   axSessionManager: ReturnType<typeof createCdpAxSessionManager>,
   extractTrace?: ExtractGeometryTrace,
   recoveryTrace?: GeometryExtractRecoveryTrace,
+  onAxReady?: () => void,
+  onAxRetryDue?: (delayMs: number) => void,
 ): Promise<GeometrySnapshot> {
   let lastNavigationError: Error | null = null
   let domContentLoadedWaitMs = 0
@@ -1288,7 +1764,12 @@ async function extractGeometryWithRecovery(
       if (recoveryTrace) {
         recoveryTrace.attemptCount = attempt + 1
       }
-      return await extractGeometry(page, { axSessionManager, trace: extractTrace })
+      return await extractGeometry(page, {
+        axSessionManager,
+        trace: extractTrace,
+        onAxReady,
+        onAxRetryDue,
+      })
     } catch (err) {
       if (page.isClosed() || !isNavigationTransitionError(err)) throw err
       lastNavigationError = err instanceof Error ? err : new Error(String(err))

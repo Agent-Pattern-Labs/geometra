@@ -1,6 +1,6 @@
 import { existsSync, realpathSync, statSync } from 'node:fs'
 import { isAbsolute, relative, resolve } from 'node:path'
-import type { ElementHandle, Frame, Locator, Page } from 'playwright'
+import type { ElementHandle, Frame, JSHandle, Locator, Page } from 'playwright'
 import { canonicalizeHtmlInputValue } from './input-canonical.js'
 import type { ClientChoiceType, ClientFillField } from './types.js'
 
@@ -753,7 +753,14 @@ async function findLabeledControl(
       return style.display !== 'none' && style.visibility !== 'hidden' && style.opacity !== '0'
     }
 
-    function referencedText(ids: string | null, visited?: Set<string>): string | undefined {
+    function rootScopedElementById(owner: Element, id: string): Element | null {
+      const root = owner.getRootNode()
+      if (root instanceof ShadowRoot) return root.getElementById(id)
+      if (root instanceof Document) return root.getElementById(id)
+      return null
+    }
+
+    function referencedText(owner: Element, ids: string | null, visited?: Set<string>): string | undefined {
       if (!ids) return undefined
       const seen = visited ?? new Set<string>()
       const text = ids
@@ -761,10 +768,10 @@ async function findLabeledControl(
         .map(id => {
           if (seen.has(id)) return ''
           seen.add(id)
-          const target = document.getElementById(id)
+          const target = rootScopedElementById(owner, id)
           if (!target) return ''
           const chained = target.getAttribute('aria-labelledby')
-          if (chained) return referencedText(chained, seen) ?? ''
+          if (chained) return referencedText(target, chained, seen) ?? ''
           return target.textContent?.trim() ?? ''
         })
         .filter(Boolean)
@@ -776,7 +783,7 @@ async function findLabeledControl(
     function explicitLabelText(el: Element): string | undefined {
       const aria = el.getAttribute('aria-label')?.trim()
       if (aria) return aria
-      const labelledBy = referencedText(el.getAttribute('aria-labelledby'))
+      const labelledBy = referencedText(el, el.getAttribute('aria-labelledby'))
       if (labelledBy) return labelledBy
       if (
         (el instanceof HTMLInputElement || el instanceof HTMLSelectElement || el instanceof HTMLTextAreaElement) &&
@@ -786,7 +793,10 @@ async function findLabeledControl(
         return el.labels[0]?.textContent?.trim() || undefined
       }
       if (el instanceof HTMLElement && el.id) {
-        const label = document.querySelector(`label[for="${CSS.escape(el.id)}"]`)
+        const root = el.getRootNode()
+        const label = (root instanceof Document || root instanceof ShadowRoot)
+          ? root.querySelector(`label[for="${CSS.escape(el.id)}"]`)
+          : null
         const text = label?.textContent?.trim()
         if (text) return text
       }
@@ -950,6 +960,13 @@ async function findMenuTriggerByContainerLabel(
       return style.display !== 'none' && style.visibility !== 'hidden' && style.opacity !== '0'
     }
 
+    function rootScopedElementById(owner: Element, id: string): Element | null {
+      const root = owner.getRootNode()
+      if (root instanceof ShadowRoot) return root.getElementById(id)
+      if (root instanceof Document) return root.getElementById(id)
+      return null
+    }
+
     function containerLabelText(el: Element): string | undefined {
       // Walk up a few parent levels looking for a container that holds BOTH
       // the trigger and some sibling label text. The label text is the
@@ -992,7 +1009,7 @@ async function findMenuTriggerByContainerLabel(
       if (labelledBy) {
         const text = labelledBy
           .split(/\s+/)
-          .map(id => document.getElementById(id)?.textContent?.trim() ?? '')
+          .map(id => rootScopedElementById(el, id)?.textContent?.trim() ?? '')
           .filter(Boolean)
           .join(' ')
           .trim()
@@ -1020,11 +1037,17 @@ async function findMenuTriggerByContainerLabel(
 
 async function locatorMatchesControlLabel(locator: Locator, fieldLabel: string, exact: boolean): Promise<boolean> {
   const accessibleName = await locator.evaluate((el) => {
-    function referencedText(ids: string | null): string {
-      if (!ids) return ''
-      return ids.split(/\s+/).map(id => document.getElementById(id)?.textContent?.trim() ?? '').filter(Boolean).join(' ')
+    function rootScopedElementById(owner: Element, id: string): Element | null {
+      const root = owner.getRootNode()
+      if (root instanceof ShadowRoot) return root.getElementById(id)
+      if (root instanceof Document) return root.getElementById(id)
+      return null
     }
-    const explicit = el.getAttribute('aria-label')?.trim() || referencedText(el.getAttribute('aria-labelledby'))
+    function referencedText(owner: Element, ids: string | null): string {
+      if (!ids) return ''
+      return ids.split(/\s+/).map(id => rootScopedElementById(owner, id)?.textContent?.trim() ?? '').filter(Boolean).join(' ')
+    }
+    const explicit = el.getAttribute('aria-label')?.trim() || referencedText(el, el.getAttribute('aria-labelledby'))
     if (explicit) return explicit
     if (el instanceof HTMLInputElement || el instanceof HTMLSelectElement || el instanceof HTMLTextAreaElement) {
       const associated = Array.from(el.labels ?? []).map(label => label.textContent?.trim() ?? '').find(Boolean)
@@ -1243,11 +1266,18 @@ async function resolveOwnedPopupHandle(
         return ids
       }
 
+      function rootScopedElementById(owner: Element, id: string): Element | null {
+        const root = owner.getRootNode()
+        if (root instanceof ShadowRoot) return root.getElementById(id)
+        if (root instanceof Document) return root.getElementById(id)
+        return null
+      }
+
       function lookupReferenced(): HTMLElement | null {
         const attributes = ['aria-controls', 'aria-owns', 'aria-activedescendant']
         for (const attribute of attributes) {
           for (const id of readIdRefs(el, attribute)) {
-            const referenced = document.getElementById(id)
+            const referenced = rootScopedElementById(el, id)
             const popup = asPopupRoot(referenced)
             if (popup) return popup
           }
@@ -3002,20 +3032,28 @@ export function resolveExistingFiles(rawPaths: unknown[], allowedRoots: string[]
 
 async function fileInputLabel(locator: Locator): Promise<string> {
   return await locator.evaluate((el) => {
-    function referencedText(ids: string | null): string {
+    function rootScopedElementById(owner: Element, id: string): Element | null {
+      const root = owner.getRootNode()
+      if (root instanceof ShadowRoot) return root.getElementById(id)
+      if (root instanceof Document) return root.getElementById(id)
+      return null
+    }
+    function referencedText(owner: Element, ids: string | null): string {
       if (!ids) return ''
       return ids
         .split(/\s+/)
-        .map(id => document.getElementById(id)?.textContent?.trim() ?? '')
+        .map(id => rootScopedElementById(owner, id)?.textContent?.trim() ?? '')
         .filter(Boolean)
         .join(' ')
         .trim()
     }
     if (!(el instanceof HTMLInputElement) || el.type !== 'file') return ''
     return el.getAttribute('aria-label')?.trim() ||
-      referencedText(el.getAttribute('aria-labelledby')) ||
+      referencedText(el, el.getAttribute('aria-labelledby')) ||
       Array.from(el.labels ?? []).map(label => label.textContent?.trim() ?? '').find(Boolean) ||
       el.getAttribute('title')?.trim() ||
+      el.getAttribute('name')?.trim() ||
+      el.getAttribute('id')?.trim() ||
       ''
   }).catch(() => '')
 }
@@ -3030,11 +3068,17 @@ async function locatorMatchesFileScope(
     function normalize(value: string | null | undefined): string {
       return (value ?? '').replace(/\s+/g, ' ').trim().toLowerCase()
     }
-    function referencedText(ids: string | null): string {
+    function rootScopedElementById(owner: Element, id: string): Element | null {
+      const root = owner.getRootNode()
+      if (root instanceof ShadowRoot) return root.getElementById(id)
+      if (root instanceof Document) return root.getElementById(id)
+      return null
+    }
+    function referencedText(owner: Element, ids: string | null): string {
       if (!ids) return ''
       return ids
         .split(/\s+/)
-        .map(id => document.getElementById(id)?.textContent?.trim() ?? '')
+        .map(id => rootScopedElementById(owner, id)?.textContent?.trim() ?? '')
         .filter(Boolean)
         .join(' ')
         .trim()
@@ -3042,8 +3086,11 @@ async function locatorMatchesFileScope(
     function labelText(input: Element): string {
       if (!(input instanceof HTMLInputElement)) return ''
       return input.getAttribute('aria-label')?.trim() ||
-        referencedText(input.getAttribute('aria-labelledby')) ||
+        referencedText(input, input.getAttribute('aria-labelledby')) ||
         Array.from(input.labels ?? []).map(label => label.textContent?.trim() ?? '').find(Boolean) ||
+        input.getAttribute('title')?.trim() ||
+        input.getAttribute('name')?.trim() ||
+        input.getAttribute('id')?.trim() ||
         ''
     }
 
@@ -3070,7 +3117,7 @@ async function locatorMatchesFileScope(
       const section = el.closest('fieldset, section, form, dialog, [role="group"], [role="region"], [role="dialog"]')
       if (!section) return false
       const explicit = section.getAttribute('aria-label')?.trim() ||
-        referencedText(section.getAttribute('aria-labelledby')) ||
+        referencedText(section, section.getAttribute('aria-labelledby')) ||
         section.querySelector('legend, h1, h2, h3, h4, h5, h6')?.textContent?.trim() ||
         (section instanceof HTMLElement ? section.innerText : section.textContent || '')
       if (!normalize(explicit).includes(sectionNeedle)) return false
@@ -3185,24 +3232,334 @@ function uploadedNamesMatch(actual: string[], expected: string[]): boolean {
   return actual.length === expected.length && actual.every((name, index) => name === expected[index])
 }
 
-async function locatorRetainsUploadedFiles(locator: Locator, paths: string[]): Promise<boolean> {
-  await delay(40)
-  const actual = await locator.evaluate((el) =>
-    el instanceof HTMLInputElement && el.type === 'file'
-      ? Array.from(el.files ?? []).map(file => file.name)
-      : [],
-  ).catch(() => [] as string[])
-  return uploadedNamesMatch(actual, expectedUploadNames(paths))
+type FileAcceptSpecifier =
+  | { kind: 'extension'; value: string }
+  | { kind: 'mime'; value: string }
+  | { kind: 'mime-wildcard'; value: string }
+
+class FileAcceptValidationError extends Error {}
+
+class FileUploadOutcomeAmbiguousError extends Error {
+  constructor(reason: string, cleanupOutcome: string) {
+    super(
+      `file: upload outcome is ambiguous (${reason}); ${cleanupOutcome}. ` +
+      'Do not retry this upload automatically; inspect the current field first.',
+    )
+    this.name = 'FileUploadOutcomeAmbiguousError'
+  }
 }
 
-async function handleRetainsUploadedFiles(handle: ElementHandle<Element>, paths: string[]): Promise<boolean> {
-  await delay(40)
-  const actual = await handle.evaluate((el) =>
+/** Parse only definite HTML file accept contracts; malformed tokens are inert. */
+function parseFileAcceptSpecifiers(rawAccept: string | null | undefined): FileAcceptSpecifier[] {
+  if (!rawAccept) return []
+  const specifiers: FileAcceptSpecifier[] = []
+  for (const rawToken of rawAccept.split(',')) {
+    const token = rawToken.trim().toLowerCase()
+    if (!token) continue
+    if (/^\.[a-z0-9][a-z0-9._+-]*$/i.test(token)) {
+      specifiers.push({ kind: 'extension', value: token })
+      continue
+    }
+    const mimeParts = token.split('/')
+    const mimeToken = /^[a-z0-9!#$%&'*+.^_`|~-]+$/i
+    if (
+      mimeParts.length !== 2 ||
+      !mimeToken.test(mimeParts[0] ?? '') ||
+      (mimeParts[1] !== '*' && (!mimeToken.test(mimeParts[1] ?? '') || mimeParts[1]!.includes('*')))
+    ) continue
+    if (mimeParts[1] === '*') {
+      specifiers.push({ kind: 'mime-wildcard', value: `${mimeParts[0]!}/` })
+    } else {
+      specifiers.push({ kind: 'mime', value: token })
+    }
+  }
+  return specifiers
+}
+
+function pathMatchesFileAccept(path: string, specifiers: FileAcceptSpecifier[]): boolean | 'unknown-mime' {
+  const fileName = path.split(/[/\\]/).pop()?.toLowerCase() ?? path.toLowerCase()
+  if (specifiers.some(specifier =>
+    specifier.kind === 'extension' && fileName.endsWith(specifier.value),
+  )) return true
+  const mimeSpecifiers = specifiers.filter(specifier => specifier.kind !== 'extension')
+  const mime = mimeTypeForPath(path)
+  if (!mime) return mimeSpecifiers.length > 0 ? 'unknown-mime' : false
+  return mimeSpecifiers.some(specifier =>
+    specifier.kind === 'mime-wildcard'
+      ? mime.startsWith(specifier.value)
+      : mime === specifier.value,
+  )
+}
+
+function assertPathsMatchFileAccept(paths: string[], rawAccept: string | null | undefined): void {
+  const specifiers = parseFileAcceptSpecifiers(rawAccept)
+  // Invalid-only accept strings do not establish a definite file contract.
+  if (specifiers.length === 0) return
+  const unknownMime = paths.filter(path => pathMatchesFileAccept(path, specifiers) === 'unknown-mime')
+  if (unknownMime.length > 0) {
+    const names = unknownMime.map(path => path.split(/[/\\]/).pop() ?? path)
+    throw new FileAcceptValidationError(
+      `file: cannot safely infer MIME type for ${names.map(name => `"${name}"`).join(', ')} ` +
+      `to validate input accept="${rawAccept ?? ''}"; no files were attached`,
+    )
+  }
+  const mismatches = paths.filter(path => pathMatchesFileAccept(path, specifiers) === false)
+  if (mismatches.length === 0) return
+  const names = mismatches.map(path => path.split(/[/\\]/).pop() ?? path)
+  throw new FileAcceptValidationError(
+    `file: supplied file${names.length === 1 ? '' : 's'} ${names.map(name => `"${name}"`).join(', ')} ` +
+    `did not match input accept="${rawAccept ?? ''}"; no files were attached`,
+  )
+}
+
+async function handleFileAccept(handle: ElementHandle<Element>): Promise<string | null> {
+  return await handle.evaluate(el =>
     el instanceof HTMLInputElement && el.type === 'file'
-      ? Array.from(el.files ?? []).map(file => file.name)
-      : [],
-  ).catch(() => [] as string[])
-  return uploadedNamesMatch(actual, expectedUploadNames(paths))
+      ? el.getAttribute('accept')
+      : null,
+  )
+}
+
+interface FileInputCommitGuardInitialState {
+  validFileInput: boolean
+  blockReason: string | null
+  accept: string | null
+  names: string[]
+}
+
+interface FileInputCommitGuardFinalState {
+  invalidReason: string | null
+  names: string[]
+}
+
+/**
+ * Playwright owns local-path transfer, so there is no practical atomic
+ * in-page check+commit that works for arbitrarily large files without first
+ * buffering and serializing their full contents. Keep the exact ElementHandle
+ * instead and guard the short protocol-call window. Any relevant mutation in
+ * that window makes the result explicitly ambiguous, even if the page toggles
+ * the attribute back before our post-commit read.
+ */
+async function beginFileInputCommitGuard(
+  handle: ElementHandle<Element>,
+): Promise<{ guard: JSHandle; initial: FileInputCommitGuardInitialState }> {
+  const guard = await handle.evaluateHandle((element) => {
+    function composedParent(node: Element): Element | null {
+      if (node.parentElement) return node.parentElement
+      const root = node.getRootNode()
+      return root instanceof ShadowRoot ? root.host : null
+    }
+
+    function composedContains(ancestor: Element, descendant: Element): boolean {
+      let current: Element | null = descendant
+      while (current) {
+        if (current === ancestor) return true
+        current = composedParent(current)
+      }
+      return false
+    }
+
+    function mutationBlockReason(target: Element): string | null {
+      try {
+        if (target.matches(':disabled')) return 'disabled'
+      } catch { /* non-HTML namespaces may reject pseudo classes */ }
+
+      if (
+        (target instanceof HTMLInputElement || target instanceof HTMLTextAreaElement) &&
+        target.readOnly
+      ) return 'readonly'
+
+      let current: Element | null = target
+      while (current) {
+        if (current.hasAttribute('inert')) return 'inert'
+        if (current.getAttribute('aria-disabled')?.trim().toLowerCase() === 'true') return 'aria-disabled'
+        if (current.getAttribute('aria-readonly')?.trim().toLowerCase() === 'true') return 'aria-readonly'
+        if (current instanceof HTMLFieldSetElement && current.disabled) {
+          const firstLegend = Array.from(current.children).find(child => child instanceof HTMLLegendElement)
+          if (!(firstLegend instanceof HTMLLegendElement) || !composedContains(firstLegend, target)) {
+            return 'disabled fieldset'
+          }
+        }
+        current = composedParent(current)
+      }
+      return null
+    }
+
+    const input = element instanceof HTMLInputElement && element.type === 'file' ? element : null
+    const guardedAncestors = new Set<Element>()
+    let current: Element | null = input
+    while (current) {
+      guardedAncestors.add(current)
+      current = composedParent(current)
+    }
+
+    const initial = {
+      validFileInput: Boolean(input?.isConnected),
+      blockReason: input ? mutationBlockReason(input) : 'detached or no longer a file input',
+      accept: input?.getAttribute('accept') ?? null,
+      names: input ? Array.from(input.files ?? []).map(file => file.name) : [],
+    }
+    const state: {
+      input: HTMLInputElement | null
+      initial: FileInputCommitGuardInitialState
+      invalidReason: string | null
+      observer: MutationObserver
+      record: (records: MutationRecord[]) => void
+      finalize: () => FileInputCommitGuardFinalState
+    } = {
+      input,
+      initial,
+      invalidReason: null,
+      observer: null as unknown as MutationObserver,
+      record: () => {},
+      finalize: () => ({ invalidReason: 'commit guard was not initialized', names: [] }),
+    }
+
+    function markInvalid(reason: string): void {
+      state.invalidReason ??= reason
+    }
+
+    function removedGuardedTarget(node: Node): boolean {
+      if (!(node instanceof Element)) return false
+      for (const ancestor of guardedAncestors) {
+        if (node === ancestor || node.contains(ancestor)) return true
+      }
+      return false
+    }
+
+    state.record = (records) => {
+      for (const record of records) {
+        if (record.type === 'childList' && Array.from(record.removedNodes).some(removedGuardedTarget)) {
+          markInvalid('the exact target identity changed during commit')
+          continue
+        }
+        if (record.type !== 'attributes' || !(record.target instanceof Element)) continue
+        if (!guardedAncestors.has(record.target)) continue
+        const attribute = record.attributeName ?? 'state'
+        if (attribute === 'accept') markInvalid('the target accept contract changed during commit')
+        else if (attribute === 'type') markInvalid('the exact target stopped being a file input during commit')
+        else markInvalid(`the target mutability changed during commit (${attribute})`)
+      }
+    }
+
+    const observer = new MutationObserver(records => state.record(records))
+    state.observer = observer
+    const roots = new Set<Node>()
+    for (const ancestor of guardedAncestors) roots.add(ancestor.getRootNode())
+    for (const root of roots) {
+      observer.observe(root, {
+        subtree: true,
+        childList: true,
+        attributes: true,
+        attributeOldValue: true,
+        attributeFilter: ['accept', 'type', 'disabled', 'readonly', 'inert', 'aria-disabled', 'aria-readonly'],
+      })
+    }
+
+    state.finalize = () => {
+      state.record(observer.takeRecords())
+      observer.disconnect()
+      if (!input?.isConnected) markInvalid('the exact target detached during commit')
+      else if (input.type !== 'file') markInvalid('the exact target is no longer a file input')
+      else if (input.getAttribute('accept') !== initial.accept) markInvalid('the target accept contract changed during commit')
+      else {
+        const blocked = mutationBlockReason(input)
+        if (blocked) markInvalid(`the target is not mutable after commit (${blocked})`)
+      }
+      return {
+        invalidReason: state.invalidReason,
+        names: input ? Array.from(input.files ?? []).map(file => file.name) : [],
+      }
+    }
+
+    return state
+  })
+  const initial = await guard.evaluate(value => value.initial) as FileInputCommitGuardInitialState
+  return { guard, initial }
+}
+
+async function finalizeFileInputCommitGuard(guard: JSHandle): Promise<FileInputCommitGuardFinalState> {
+  return await guard.evaluate(value => value.finalize()) as FileInputCommitGuardFinalState
+}
+
+async function stopFileInputCommitGuard(guard: JSHandle): Promise<void> {
+  await guard.evaluate(value => {
+    value.observer.disconnect()
+  }).catch(() => {})
+}
+
+async function clearAmbiguousRetainedFiles(
+  handle: ElementHandle<Element>,
+  actualNames: string[],
+  initialNames: string[],
+): Promise<string> {
+  const selectionChanged = !uploadedNamesMatch(actualNames, initialNames)
+  if (!selectionChanged) {
+    return actualNames.length === 0
+      ? 'no retained file selection remained to clear'
+      : 'the preexisting selection was preserved because a same-named replacement could not be proven'
+  }
+  if (actualNames.length === 0) return 'no newly retained files remained on the target'
+  try {
+    await handle.setInputFiles([])
+  } catch {
+    await handle.evaluate((el) => {
+      if (el instanceof HTMLInputElement && el.type === 'file') el.value = ''
+    }).catch(() => {})
+  }
+  return 'the changed selection was cleared best-effort without trying another candidate'
+}
+
+async function commitFilesToExactInput(
+  handle: ElementHandle<Element>,
+  paths: string[],
+  targetName: 'matched input' | 'chooser input',
+): Promise<void> {
+  const { guard, initial } = await beginFileInputCommitGuard(handle)
+  try {
+    if (!initial.validFileInput) {
+      await stopFileInputCommitGuard(guard)
+      throw new Error(`file: ${targetName} detached or is no longer a file input`)
+    }
+    if (initial.blockReason) {
+      await stopFileInputCommitGuard(guard)
+      throw new Error(`file: ${targetName} is not mutable (${initial.blockReason})`)
+    }
+    try {
+      assertPathsMatchFileAccept(paths, initial.accept)
+    } catch (error) {
+      await stopFileInputCommitGuard(guard)
+      throw error
+    }
+
+    let operationError: unknown
+    try {
+      await handle.setInputFiles(paths)
+    } catch (error) {
+      operationError = error
+    }
+
+    // Give synchronous handlers, their microtasks, and one timer turn a chance
+    // to reject/clear the selection before calling the outcome confirmed.
+    await delay(40)
+    const final = await finalizeFileInputCommitGuard(guard).catch(() => ({
+      invalidReason: 'the exact target could not be inspected after commit',
+      names: [] as string[],
+    }))
+    const retained = uploadedNamesMatch(final.names, expectedUploadNames(paths))
+    if (!operationError && !final.invalidReason && retained) return
+
+    const cleanupOutcome = await clearAmbiguousRetainedFiles(handle, final.names, initial.names)
+    const operationReason = operationError instanceof Error
+      ? `Playwright could not confirm the exact-target commit: ${operationError.message}`
+      : operationError
+        ? 'Playwright could not confirm the exact-target commit'
+        : null
+    const reason = final.invalidReason ?? operationReason ?? 'the exact target did not retain the supplied filenames'
+    throw new FileUploadOutcomeAmbiguousError(reason, cleanupOutcome)
+  } finally {
+    await guard.dispose().catch(() => {})
+  }
 }
 
 async function attachHiddenInAllFrames(
@@ -3230,33 +3587,35 @@ async function attachHiddenInAllFrames(
       opts.sectionText,
     )
     if (labeled) {
-      await assertLocatorMutable(labeled, 'file', 'file')
-      try {
-        await labeled.setInputFiles(paths)
-      } catch {
-        return false
-      }
-      if (!(await locatorRetainsUploadedFiles(labeled, paths))) {
-        throw new Error('file: matched input rejected or cleared the supplied files')
-      }
+      const handle = await labeled.elementHandle()
+      if (!handle) throw new Error('file: matched input detached before upload')
+      await commitFilesToExactInput(handle, paths, 'matched input')
       return true
     }
     return false
   }
 
+  let acceptError: Error | undefined
   for (const frame of page.frames()) {
     const loc = frame.locator('input[type="file"]')
     const n = await loc.count()
     for (let i = 0; i < n; i++) {
       if (await locatorMutationBlockReason(loc.nth(i), 'file')) continue
+      const handle = await loc.nth(i).elementHandle()
+      if (!handle) continue
       try {
-        await loc.nth(i).setInputFiles(paths)
-        if (await locatorRetainsUploadedFiles(loc.nth(i), paths)) return true
-      } catch {
-        /* try next */
+        await commitFilesToExactInput(handle, paths, 'matched input')
+        return true
+      } catch (error) {
+        if (error instanceof FileAcceptValidationError) {
+          acceptError ??= error
+          continue
+        }
+        throw error
       }
     }
   }
+  if (acceptError) throw acceptError
   return false
 }
 
@@ -3267,26 +3626,35 @@ async function attachViaChooser(page: Page, paths: string[], clickX: number, cli
     page.mouse.click(clickX, clickY),
   ])
   const input = chooser.element() as ElementHandle<Element>
-  const blockReason = await input.evaluate(mutationBlockReasonInPage, 'file')
-  if (blockReason) throw new Error(`file: chooser input is not mutable (${blockReason})`)
-  await chooser.setFiles(paths)
-  if (!(await handleRetainsUploadedFiles(input, paths))) {
-    throw new Error('file: chooser input rejected or cleared the supplied files')
-  }
+  await commitFilesToExactInput(input, paths, 'chooser input')
 }
 
 /**
  * Map common file extensions to MIME types so react-dropzone's `accept` filter
- * does not silently drop our synthetic files. Defaults to application/octet-stream
- * for unknowns, which is rejected by most dropzones configured with accept.
+ * does not silently drop our synthetic files. A null result means MIME cannot
+ * be inferred reliably from the path and must not be used to reject a MIME
+ * accept contract as though application/octet-stream were authoritative.
  */
-function mimeTypeForPath(path: string): string {
+function mimeTypeForPath(path: string): string | null {
   const ext = path.toLowerCase().split('.').pop() ?? ''
   switch (ext) {
     case 'pdf': return 'application/pdf'
     case 'doc': return 'application/msword'
     case 'docx': return 'application/vnd.openxmlformats-officedocument.wordprocessingml.document'
+    case 'xls': return 'application/vnd.ms-excel'
+    case 'xlsx': return 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
+    case 'ppt': return 'application/vnd.ms-powerpoint'
+    case 'pptx': return 'application/vnd.openxmlformats-officedocument.presentationml.presentation'
+    case 'json': return 'application/json'
+    case 'xml': return 'application/xml'
+    case 'zip': return 'application/zip'
+    case 'gz': return 'application/gzip'
+    case 'tar': return 'application/x-tar'
+    case '7z': return 'application/x-7z-compressed'
     case 'txt': return 'text/plain'
+    case 'csv': return 'text/csv'
+    case 'htm':
+    case 'html': return 'text/html'
     case 'rtf': return 'application/rtf'
     case 'png': return 'image/png'
     case 'jpg':
@@ -3294,8 +3662,77 @@ function mimeTypeForPath(path: string): string {
     case 'gif': return 'image/gif'
     case 'webp': return 'image/webp'
     case 'svg': return 'image/svg+xml'
-    default: return 'application/octet-stream'
+    case 'avif': return 'image/avif'
+    case 'bmp': return 'image/bmp'
+    case 'tif':
+    case 'tiff': return 'image/tiff'
+    case 'mp3': return 'audio/mpeg'
+    case 'm4a': return 'audio/mp4'
+    case 'wav': return 'audio/wav'
+    case 'ogg': return 'audio/ogg'
+    case 'mp4': return 'video/mp4'
+    case 'mov': return 'video/quicktime'
+    case 'webm': return 'video/webm'
+    default: return null
   }
+}
+
+async function dropFileInputAtPoint(
+  page: Page,
+  x: number,
+  y: number,
+): Promise<ElementHandle<Element> | null> {
+  const handle = await page.mainFrame().evaluateHandle(({ x: clientX, y: clientY }) => {
+    const deepest = document.elementFromPoint(clientX, clientY)
+    if (!deepest) return null
+    function composedParent(element: Element): Element | null {
+      if (element.parentElement) return element.parentElement
+      const root = element.getRootNode()
+      return root instanceof ShadowRoot ? root.host : null
+    }
+    function isExplicitLocalBoundary(element: Element): boolean {
+      const tag = element.tagName.toLowerCase()
+      const className = typeof element.className === 'string' ? element.className : ''
+      const testId = element.getAttribute('data-testid') ?? ''
+      const buttonText = `${element.getAttribute('aria-label') ?? ''} ${element.textContent ?? ''}`
+      return tag === 'label' ||
+        element.hasAttribute('data-dropzone') ||
+        element.getAttributeNames().some(attribute => attribute.startsWith('data-rfd')) ||
+        /drop[-_]?zone|file[-_]?upload|attach|upload/i.test(className) ||
+        /drop|file|upload|attach/i.test(testId) ||
+        (element.getAttribute('role') === 'button' && /drop|file|upload|attach/i.test(buttonText))
+    }
+    function isBroadContainer(element: Element): boolean {
+      return element.matches('form, [role="form"], fieldset, section')
+    }
+    let current: Element | null = deepest
+    let associationClosed = false
+    for (let depth = 0; current && depth < 16; depth++, current = composedParent(current)) {
+      if (current instanceof HTMLInputElement && current.type === 'file') return current
+      // Do not infer a relationship from an unrelated page-global input.
+      if (current === document.body || current === document.documentElement) break
+      const inputs = current.querySelectorAll('input[type="file"]')
+      if (inputs.length > 1) {
+        throw new Error(
+          `file: coordinate-only drop target is ambiguous; nearest candidate container has ${inputs.length} file inputs`,
+        )
+      }
+      const input = inputs[0]
+      const explicitBoundary = isExplicitLocalBoundary(current)
+      const broadContainer = isBroadContainer(current)
+      if (
+        input instanceof HTMLInputElement &&
+        !associationClosed &&
+        explicitBoundary
+      ) return input
+      if (explicitBoundary || broadContainer) associationClosed = true
+    }
+    return null
+  }, { x, y })
+  const element = handle.asElement()
+  if (element) return element as ElementHandle<Element>
+  await handle.dispose()
+  return null
 }
 
 /**
@@ -3315,13 +3752,39 @@ function mimeTypeForPath(path: string): string {
  * button layer and the wrapper that actually has the listeners.
  */
 async function attachViaDropPlaywright(page: Page, paths: string[], dropX: number, dropY: number): Promise<void> {
-  const fs = await import('node:fs/promises')
-  const buffers = await Promise.all(paths.map(p => fs.readFile(p)))
-  const names = paths.map(p => p.split(/[/\\\\]/).pop() ?? 'file')
-  const mimes = paths.map(mimeTypeForPath)
-  await page.mouse.move(dropX, dropY)
-  const result = await page.mainFrame().evaluate(
-    async ({ bufs, ns, ms, x, y }: { bufs: number[][]; ns: string[]; ms: string[]; x: number; y: number }) => {
+  const dropFileInput = await dropFileInputAtPoint(page, dropX, dropY)
+  try {
+    // A real scoped input establishes the drop contract. Validate before
+    // mouse movement, drag events, input assignment, or application callbacks.
+    // Pure dropzones without an input retain their framework-defined behavior.
+    const observedAccept = dropFileInput ? await handleFileAccept(dropFileInput) : null
+    if (dropFileInput) {
+      const inputBlockReason = await dropFileInput.evaluate(mutationBlockReasonInPage, 'file')
+      if (inputBlockReason) {
+        throw new Error(`file: associated drop input is not mutable (${inputBlockReason})`)
+      }
+    }
+    assertPathsMatchFileAccept(paths, observedAccept)
+    const fs = await import('node:fs/promises')
+    const buffers = await Promise.all(paths.map(p => fs.readFile(p)))
+    const names = paths.map(p => p.split(/[/\\\\]/).pop() ?? 'file')
+    const mimes = paths.map(path => mimeTypeForPath(path) ?? 'application/octet-stream')
+    await page.mouse.move(dropX, dropY)
+    const result = await page.mainFrame().evaluate(
+      async ({ bufs, ns, ms, x, y, expectedAccept, expectedFileInput }: {
+      bufs: number[][]
+      ns: string[]
+      ms: string[]
+      x: number
+      y: number
+      expectedAccept: string | null
+      expectedFileInput: Element | null
+    }): Promise<{
+      accepted: boolean
+      blockReason: string | null
+      acceptContractChanged: boolean
+      ambiguousTarget: boolean
+    }> => {
       function blockReason(target: Element): string | null {
         function parent(node: Element): Element | null {
           if (node.parentElement) return node.parentElement
@@ -3387,9 +3850,64 @@ async function attachViaDropPlaywright(page: Page, paths: string[], dropX: numbe
       }
 
       const deepest = document.elementFromPoint(x, y)
-      if (!deepest) return { accepted: false, blockReason: null }
+      if (!deepest) {
+        return { accepted: false, blockReason: null, acceptContractChanged: false, ambiguousTarget: false }
+      }
       const blocked = blockReason(deepest)
-      if (blocked) return { accepted: false, blockReason: blocked }
+      if (blocked) {
+        return { accepted: false, blockReason: blocked, acceptContractChanged: false, ambiguousTarget: false }
+      }
+
+      function resolveFileInput(start: Element): {
+        input: HTMLInputElement | null
+        host: Element
+        ambiguous: boolean
+      } {
+        function composedParent(element: Element): Element | null {
+          if (element.parentElement) return element.parentElement
+          const root = element.getRootNode()
+          return root instanceof ShadowRoot ? root.host : null
+        }
+        function isExplicitLocalBoundary(element: Element): boolean {
+          const tag = element.tagName.toLowerCase()
+          const className = typeof element.className === 'string' ? element.className : ''
+          const testId = element.getAttribute('data-testid') ?? ''
+          const buttonText = `${element.getAttribute('aria-label') ?? ''} ${element.textContent ?? ''}`
+          return tag === 'label' ||
+            element.hasAttribute('data-dropzone') ||
+            element.getAttributeNames().some(attribute => attribute.startsWith('data-rfd')) ||
+            /drop[-_]?zone|file[-_]?upload|attach|upload/i.test(className) ||
+            /drop|file|upload|attach/i.test(testId) ||
+            (element.getAttribute('role') === 'button' && /drop|file|upload|attach/i.test(buttonText))
+        }
+        function isBroadContainer(element: Element): boolean {
+          return element.matches('form, [role="form"], fieldset, section')
+        }
+        let current: Element | null = start
+        let associationClosed = false
+        for (let depth = 0; current && depth < 16; depth++, current = composedParent(current)) {
+          if (current instanceof HTMLInputElement && current.type === 'file') {
+            return { input: current, host: current, ambiguous: false }
+          }
+          if (current === document.body || current === document.documentElement) break
+          const inputs = current.querySelectorAll('input[type="file"]')
+          if (inputs.length > 1) return { input: null, host: current, ambiguous: true }
+          const input = inputs[0]
+          const explicitBoundary = isExplicitLocalBoundary(current)
+          const broadContainer = isBroadContainer(current)
+          if (
+            input instanceof HTMLInputElement &&
+            !associationClosed &&
+            explicitBoundary
+          ) return { input, host: current, ambiguous: false }
+          if (explicitBoundary || broadContainer) associationClosed = true
+        }
+        return {
+          input: null,
+          host: start.closest('form, [role="form"], fieldset, section, div') ?? document.body,
+          ambiguous: false,
+        }
+      }
 
       const targets: Element[] = [deepest]
       let p: Element | null = deepest.parentElement
@@ -3405,8 +3923,25 @@ async function attachViaDropPlaywright(page: Page, paths: string[], dropX: numbe
         p = p.parentElement
       }
 
-      const host = deepest.closest('form, [role="form"], fieldset, section, div') ?? document.body
-      const fileInput = host.querySelector('input[type="file"]') as HTMLInputElement | null
+      const resolvedTarget = resolveFileInput(deepest)
+      if (resolvedTarget.ambiguous) {
+        return { accepted: false, blockReason: null, acceptContractChanged: false, ambiguousTarget: true }
+      }
+      const host = resolvedTarget.host
+      const fileInput = resolvedTarget.input
+      if (fileInput !== expectedFileInput) {
+        return { accepted: false, blockReason: null, acceptContractChanged: true, ambiguousTarget: false }
+      }
+      const currentAccept = fileInput?.getAttribute('accept') ?? null
+      if (currentAccept !== expectedAccept) {
+        return { accepted: false, blockReason: null, acceptContractChanged: true, ambiguousTarget: false }
+      }
+      if (fileInput) {
+        const inputBlockReason = blockReason(fileInput)
+        if (inputBlockReason) {
+          throw new Error(`file: associated drop input is not mutable (${inputBlockReason})`)
+        }
+      }
       const beforeFileNames = Array.from(fileInput?.files ?? []).map(file => file.name)
       const beforeRenderedText = [host, ...targets]
         .map(node => node.textContent ?? '')
@@ -3455,16 +3990,35 @@ async function attachViaDropPlaywright(page: Page, paths: string[], dropX: numbe
       return {
         accepted: fileInputAccepted || (handled && renderedAcceptance),
         blockReason: null,
+        acceptContractChanged: false,
+        ambiguousTarget: false,
       }
     },
-    { bufs: buffers.map(b => Array.from(b)), ns: names, ms: mimes, x: dropX, y: dropY },
+    {
+      bufs: buffers.map(b => Array.from(b)),
+      ns: names,
+      ms: mimes,
+      x: dropX,
+      y: dropY,
+      expectedAccept: observedAccept,
+      expectedFileInput: dropFileInput,
+    },
   )
 
-  if (result.blockReason) {
-    throw new Error(`file: drop target is not mutable (${result.blockReason})`)
-  }
-  if (!result.accepted) {
-    throw new Error('file: drop target did not accept the supplied files')
+    if (result.ambiguousTarget) {
+      throw new Error('file: coordinate-only drop target became ambiguous between multiple file inputs')
+    }
+    if (result.acceptContractChanged) {
+      throw new Error('file: drop target accept contract changed before upload; retry with a fresh target')
+    }
+    if (result.blockReason) {
+      throw new Error(`file: drop target is not mutable (${result.blockReason})`)
+    }
+    if (!result.accepted) {
+      throw new Error('file: drop target did not accept the supplied files')
+    }
+  } finally {
+    await dropFileInput?.dispose().catch(() => {})
   }
 }
 
@@ -3792,6 +4346,55 @@ async function setLocatorTextValue(
     return await locator.evaluate((el, payload: { value: string; imeFriendly: boolean }) => {
       const nextValue = payload.value
       const imeFriendly = payload.imeFriendly
+
+      // Preflight and commit are separate Playwright round-trips. Reactive
+      // applications can make a control readonly/disabled in between, so the
+      // final guard must live in the same page task as the first mutation.
+      function commitMutationBlockReason(target: Element): string | null {
+        function composedParent(node: Element): Element | null {
+          if (node.parentElement) return node.parentElement
+          const root = node.getRootNode()
+          return root instanceof ShadowRoot ? root.host : null
+        }
+
+        function composedDescendantOf(node: Element, ancestor: Element): boolean {
+          let current: Element | null = node
+          while (current) {
+            if (current === ancestor) return true
+            current = composedParent(current)
+          }
+          return false
+        }
+
+        try {
+          if (target.matches(':disabled')) return 'disabled'
+        } catch { /* non-HTML namespaces may reject pseudo classes */ }
+
+        if (
+          (target instanceof HTMLInputElement || target instanceof HTMLTextAreaElement) &&
+          target.readOnly
+        ) {
+          return 'readonly'
+        }
+
+        let current: Element | null = target
+        while (current) {
+          if (current.hasAttribute('inert')) return 'inert'
+          if (current.getAttribute('aria-disabled')?.trim().toLowerCase() === 'true') return 'aria-disabled'
+          if (current.getAttribute('aria-readonly')?.trim().toLowerCase() === 'true') return 'aria-readonly'
+
+          if (current instanceof HTMLFieldSetElement && current.disabled) {
+            const firstLegend = Array.from(current.children).find(child => child instanceof HTMLLegendElement)
+            if (!(firstLegend instanceof HTMLLegendElement) || !composedDescendantOf(target, firstLegend)) {
+              return 'disabled fieldset'
+            }
+          }
+          current = composedParent(current)
+        }
+        return null
+      }
+
+      if (commitMutationBlockReason(el)) return false
       // React Greenhouse/Workday/Lever fix: React stores the previous value on
       // a hidden `_valueTracker` property that React uses to short-circuit
       // onChange when the value "hasn't changed". If we set el.value through
@@ -4041,7 +4644,14 @@ async function attemptNativeBatchFill(page: Page, fields: FormFieldFill[]): Prom
         return null
       }
 
-      function referencedText(ids: string | null, visited?: Set<string>): string | undefined {
+      function rootScopedElementById(owner: Element, id: string): Element | null {
+        const root = owner.getRootNode()
+        if (root instanceof ShadowRoot) return root.getElementById(id)
+        if (root instanceof Document) return root.getElementById(id)
+        return null
+      }
+
+      function referencedText(owner: Element, ids: string | null, visited?: Set<string>): string | undefined {
         if (!ids) return undefined
         const seen = visited ?? new Set<string>()
         const text = ids
@@ -4049,10 +4659,10 @@ async function attemptNativeBatchFill(page: Page, fields: FormFieldFill[]): Prom
           .map(id => {
             if (seen.has(id)) return ''
             seen.add(id)
-            const target = document.getElementById(id)
+            const target = rootScopedElementById(owner, id)
             if (!target) return ''
             const chained = target.getAttribute('aria-labelledby')
-            if (chained) return referencedText(chained, seen) ?? ''
+            if (chained) return referencedText(target, chained, seen) ?? ''
             return target.textContent?.trim() ?? ''
           })
           .filter(Boolean)
@@ -4064,7 +4674,7 @@ async function attemptNativeBatchFill(page: Page, fields: FormFieldFill[]): Prom
       function explicitLabelText(el: Element): string | undefined {
         const aria = el.getAttribute('aria-label')?.trim()
         if (aria) return aria
-        const labelledBy = referencedText(el.getAttribute('aria-labelledby'))
+        const labelledBy = referencedText(el, el.getAttribute('aria-labelledby'))
         if (labelledBy) return labelledBy
         if (
           (el instanceof HTMLInputElement || el instanceof HTMLSelectElement || el instanceof HTMLTextAreaElement) &&
@@ -4074,7 +4684,10 @@ async function attemptNativeBatchFill(page: Page, fields: FormFieldFill[]): Prom
           return el.labels[0]?.textContent?.trim() || undefined
         }
         if (el instanceof HTMLElement && el.id) {
-          const label = document.querySelector(`label[for="${CSS.escape(el.id)}"]`)
+          const root = el.getRootNode()
+          const label = (root instanceof Document || root instanceof ShadowRoot)
+            ? root.querySelector(`label[for="${CSS.escape(el.id)}"]`)
+            : null
           const text = label?.textContent?.trim()
           if (text) return text
         }
@@ -5018,6 +5631,48 @@ async function setNativeSelectByLabel(
   try {
     return await locator.evaluate(async (el, payload) => {
       if (!(el instanceof HTMLSelectElement)) return false
+
+      // Keep the final state check atomic with selectedIndex/event mutation.
+      // The earlier host-side preflight can race a reactive disable/inert
+      // update while Playwright crosses back into the page.
+      function commitMutationBlockReason(target: Element): string | null {
+        function composedParent(node: Element): Element | null {
+          if (node.parentElement) return node.parentElement
+          const root = node.getRootNode()
+          return root instanceof ShadowRoot ? root.host : null
+        }
+
+        function composedDescendantOf(node: Element, ancestor: Element): boolean {
+          let current: Element | null = node
+          while (current) {
+            if (current === ancestor) return true
+            current = composedParent(current)
+          }
+          return false
+        }
+
+        try {
+          if (target.matches(':disabled')) return 'disabled'
+        } catch { /* non-HTML namespaces may reject pseudo classes */ }
+
+        let current: Element | null = target
+        while (current) {
+          if (current.hasAttribute('inert')) return 'inert'
+          if (current.getAttribute('aria-disabled')?.trim().toLowerCase() === 'true') return 'aria-disabled'
+          if (current.getAttribute('aria-readonly')?.trim().toLowerCase() === 'true') return 'aria-readonly'
+
+          if (current instanceof HTMLFieldSetElement && current.disabled) {
+            const firstLegend = Array.from(current.children).find(child => child instanceof HTMLLegendElement)
+            if (!(firstLegend instanceof HTMLLegendElement) || !composedDescendantOf(target, firstLegend)) {
+              return 'disabled fieldset'
+            }
+          }
+          current = composedParent(current)
+        }
+        return null
+      }
+
+      if (commitMutationBlockReason(el)) return false
       const normalize = (input: string | undefined | null) => input?.replace(/\s+/g, ' ').trim().toLowerCase() ?? ''
       const expected = normalize(payload.value)
       const enabled = (candidate: HTMLOptionElement): boolean =>
@@ -5119,7 +5774,14 @@ async function chooseValueFromLabeledGroup(
         return payload.exact ? normalizedCandidate === normalizedExpected : normalizedCandidate.includes(normalizedExpected)
       }
 
-      function referencedText(ids: string | null, visited?: Set<string>): string | undefined {
+      function rootScopedElementById(owner: Element, id: string): Element | null {
+        const root = owner.getRootNode()
+        if (root instanceof ShadowRoot) return root.getElementById(id)
+        if (root instanceof Document) return root.getElementById(id)
+        return null
+      }
+
+      function referencedText(owner: Element, ids: string | null, visited?: Set<string>): string | undefined {
         if (!ids) return undefined
         const seen = visited ?? new Set<string>()
         const text = ids
@@ -5127,10 +5789,10 @@ async function chooseValueFromLabeledGroup(
           .map(id => {
             if (seen.has(id)) return ''
             seen.add(id)
-            const target = document.getElementById(id)
+            const target = rootScopedElementById(owner, id)
             if (!target) return ''
             const chained = target.getAttribute('aria-labelledby')
-            if (chained) return referencedText(chained, seen) ?? ''
+            if (chained) return referencedText(target, chained, seen) ?? ''
             return target.textContent?.trim() ?? ''
           })
           .filter(Boolean)
@@ -5142,7 +5804,7 @@ async function chooseValueFromLabeledGroup(
       function explicitLabelText(el: Element): string | undefined {
         const aria = el.getAttribute('aria-label')?.trim()
         if (aria) return aria
-        const labelledBy = referencedText(el.getAttribute('aria-labelledby'))
+        const labelledBy = referencedText(el, el.getAttribute('aria-labelledby'))
         if (labelledBy) return labelledBy
         if (el instanceof HTMLInputElement && el.labels && el.labels.length > 0) {
           return el.labels[0]?.textContent?.trim() || undefined
@@ -5173,7 +5835,7 @@ async function chooseValueFromLabeledGroup(
         if (el instanceof HTMLLabelElement) return el.textContent?.trim() || undefined
         const aria = el.getAttribute('aria-label')?.trim()
         if (aria) return aria
-        const labelledBy = referencedText(el.getAttribute('aria-labelledby'))
+        const labelledBy = referencedText(el, el.getAttribute('aria-labelledby'))
         if (labelledBy) return labelledBy
         return el.textContent?.trim() || undefined
       }
@@ -5941,15 +6603,21 @@ async function applyToggleState(
   desiredChecked: boolean,
 ): Promise<{ success: boolean; reason?: 'radio-uncheck'; kind: 'checkbox' | 'radio'; name: string; before: boolean; after: boolean }> {
   return await locator.evaluate((target, checked) => {
-    function referencedText(ids: string | null, visited?: Set<string>): string | undefined {
+    function rootScopedElementById(owner: Element, id: string): Element | null {
+      const root = owner.getRootNode()
+      if (root instanceof ShadowRoot) return root.getElementById(id)
+      if (root instanceof Document) return root.getElementById(id)
+      return null
+    }
+    function referencedText(owner: Element, ids: string | null, visited?: Set<string>): string | undefined {
       if (!ids) return undefined
       const seen = visited ?? new Set<string>()
       const text = ids.split(/\s+/).map(id => {
         if (seen.has(id)) return ''
         seen.add(id)
-        const node = document.getElementById(id)
+        const node = rootScopedElementById(owner, id)
         if (!node) return ''
-        return referencedText(node.getAttribute('aria-labelledby'), seen) ?? node.textContent?.trim() ?? ''
+        return referencedText(node, node.getAttribute('aria-labelledby'), seen) ?? node.textContent?.trim() ?? ''
       }).filter(Boolean).join(' ').trim()
       return text || undefined
     }
@@ -5960,7 +6628,7 @@ async function applyToggleState(
     function nameOf(el: Element): string {
       const aria = el.getAttribute('aria-label')?.trim()
       if (aria) return aria
-      const labelledBy = referencedText(el.getAttribute('aria-labelledby'))
+      const labelledBy = referencedText(el, el.getAttribute('aria-labelledby'))
       if (labelledBy) return labelledBy
       if (el instanceof HTMLInputElement) {
         const labelText = Array.from(el.labels ?? []).map(label => label.textContent?.trim()).find(Boolean)
@@ -6025,15 +6693,21 @@ async function collectToggleMatches(
         const style = getComputedStyle(el)
         return rect.width > 0 && rect.height > 0 && style.display !== 'none' && style.visibility !== 'hidden'
       }
-      function referencedText(ids: string | null, visited?: Set<string>): string | undefined {
+      function rootScopedElementById(owner: Element, id: string): Element | null {
+        const root = owner.getRootNode()
+        if (root instanceof ShadowRoot) return root.getElementById(id)
+        if (root instanceof Document) return root.getElementById(id)
+        return null
+      }
+      function referencedText(owner: Element, ids: string | null, visited?: Set<string>): string | undefined {
         if (!ids) return undefined
         const seen = visited ?? new Set<string>()
         const text = ids.split(/\s+/).map(id => {
           if (seen.has(id)) return ''
           seen.add(id)
-          const node = document.getElementById(id)
+          const node = rootScopedElementById(owner, id)
           if (!node) return ''
-          return referencedText(node.getAttribute('aria-labelledby'), seen) ?? node.textContent?.trim() ?? ''
+          return referencedText(node, node.getAttribute('aria-labelledby'), seen) ?? node.textContent?.trim() ?? ''
         }).filter(Boolean).join(' ').trim()
         return text || undefined
       }
@@ -6051,7 +6725,7 @@ async function collectToggleMatches(
       function nameOf(el: Element): string | undefined {
         const aria = el.getAttribute('aria-label')?.trim()
         if (aria) return aria
-        const labelledBy = referencedText(el.getAttribute('aria-labelledby'))
+        const labelledBy = referencedText(el, el.getAttribute('aria-labelledby'))
         if (labelledBy) return labelledBy
         if (el instanceof HTMLInputElement) {
           const labelText = Array.from(el.labels ?? []).map(label => label.textContent?.trim()).find(Boolean)
@@ -6075,7 +6749,7 @@ async function collectToggleMatches(
         const section = el.closest('fieldset, section, form, dialog, [role="group"], [role="radiogroup"], [role="region"], [role="dialog"]')
         if (!(section instanceof HTMLElement)) return ''
         const explicit = section.getAttribute('aria-label')?.trim() ||
-          referencedText(section.getAttribute('aria-labelledby')) ||
+          referencedText(section, section.getAttribute('aria-labelledby')) ||
           section.querySelector('legend, h1, h2, h3, h4, h5, h6')?.textContent?.trim()
         return (explicit || section.innerText || section.textContent || '').replace(/\s+/g, ' ').trim()
       }

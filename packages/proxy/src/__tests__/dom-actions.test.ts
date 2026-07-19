@@ -1552,6 +1552,31 @@ describe('attachFiles', () => {
     }
   })
 
+  it('uses authored name/id as the stable label for an otherwise unlabeled keyed file input', async () => {
+    const page = await browser.newPage({ viewport: { width: 900, height: 700 } })
+    const tempFile = join(tmpdir(), `geometra-upload-unlabeled-${Date.now()}.txt`)
+    await writeFile(tempFile, 'resume')
+    await page.setContent(`
+      <form>
+        <div style="display:none">
+          <input id="resume-upload" name="resume_attachment" type="file" required />
+        </div>
+      </form>
+    `)
+
+    try {
+      await attachFiles(page, [tempFile], {
+        fieldKey: 'id:resume-upload',
+        fieldLabel: 'resume_attachment',
+        exact: true,
+      })
+      expect(await page.locator('#resume-upload').evaluate((el: HTMLInputElement) => el.files?.length ?? 0)).toBe(1)
+    } finally {
+      await rm(tempFile, { force: true })
+      await page.close()
+    }
+  })
+
   it('jointly validates keyed file labels and never falls back globally when a key is stale', async () => {
     const page = await browser.newPage({ viewport: { width: 900, height: 700 } })
     const tempFile = join(tmpdir(), `geometra-upload-key-truth-${Date.now()}.txt`)
@@ -1590,6 +1615,381 @@ describe('attachFiles', () => {
       expect(await page.locator('#resume-b').evaluate((el: HTMLInputElement) => el.files?.length ?? 0)).toBe(0)
     } finally {
       await rm(tempFile, { force: true })
+      await page.close()
+    }
+  })
+
+  it('enforces case-insensitive and compound extension accept contracts before labeled input mutation', async () => {
+    const page = await browser.newPage({ viewport: { width: 900, height: 700 } })
+    const stamp = `${Date.now()}-${Math.random().toString(36).slice(2)}`
+    const pdfFile = join(tmpdir(), `geometra-accept-${stamp}.PDF`)
+    const textFile = join(tmpdir(), `geometra-accept-${stamp}.txt`)
+    const compoundFile = join(tmpdir(), `geometra-accept-${stamp}.TAR.GZ`)
+    await Promise.all([
+      writeFile(pdfFile, 'pdf'),
+      writeFile(textFile, 'text'),
+      writeFile(compoundFile, 'archive'),
+    ])
+    await page.setContent(`
+      <label for="resume-accept">Resume</label>
+      <input id="resume-accept" type="file"
+        accept=".pdf, .tar.gz, definitely-not-valid, text/plain; charset=utf-8" />
+    `)
+
+    try {
+      await attachFiles(page, [pdfFile], { fieldLabel: 'Resume', strategy: 'hidden' })
+      expect(await page.locator('#resume-accept').evaluate((el: HTMLInputElement) => el.files?.[0]?.name)).toBe(
+        pdfFile.split('/').pop(),
+      )
+
+      await expect(attachFiles(page, [pdfFile, textFile], {
+        fieldLabel: 'Resume',
+        strategy: 'hidden',
+      })).rejects.toThrow('did not match input accept=')
+      // Rejection is a preflight decision: the previously selected file is
+      // not cleared or replaced by the mismatching path.
+      expect(await page.locator('#resume-accept').evaluate((el: HTMLInputElement) =>
+        Array.from(el.files ?? []).map(file => file.name),
+      )).toEqual([pdfFile.split('/').pop()])
+
+      await attachFiles(page, [compoundFile], { fieldLabel: 'Resume', strategy: 'hidden' })
+      expect(await page.locator('#resume-accept').evaluate((el: HTMLInputElement) => el.files?.[0]?.name)).toBe(
+        compoundFile.split('/').pop(),
+      )
+    } finally {
+      await Promise.all([pdfFile, textFile, compoundFile].map(path => rm(path, { force: true })))
+      await page.close()
+    }
+  })
+
+  it('ignores invalid-only accept tokens instead of inventing a restriction', async () => {
+    const page = await browser.newPage({ viewport: { width: 900, height: 700 } })
+    const textFile = join(tmpdir(), `geometra-invalid-accept-${Date.now()}.txt`)
+    await writeFile(textFile, 'text')
+    await page.setContent(`
+      <label for="invalid-accept">Attachment</label>
+      <input id="invalid-accept" type="file"
+        accept="not-a-specifier, text/plain; charset=utf-8, image/**, . bad" />
+    `)
+
+    try {
+      await attachFiles(page, [textFile], { fieldLabel: 'Attachment', strategy: 'hidden' })
+      expect(await page.locator('#invalid-accept').evaluate((el: HTMLInputElement) => el.files?.length ?? 0)).toBe(1)
+    } finally {
+      await rm(textFile, { force: true })
+      await page.close()
+    }
+  })
+
+  it('enforces exact MIME accept contracts on file chooser handles', async () => {
+    const page = await browser.newPage({ viewport: { width: 900, height: 700 } })
+    const stamp = `${Date.now()}-${Math.random().toString(36).slice(2)}`
+    const pdfFile = join(tmpdir(), `geometra-chooser-accept-${stamp}.pdf`)
+    const textFile = join(tmpdir(), `geometra-chooser-accept-${stamp}.txt`)
+    const unknownFile = join(tmpdir(), `geometra-chooser-accept-${stamp}.unknown-file-type`)
+    await Promise.all([
+      writeFile(pdfFile, 'pdf'),
+      writeFile(textFile, 'text'),
+      writeFile(unknownFile, 'unknown'),
+    ])
+    await page.setContent(`
+      <button id="choose-file" type="button">Choose file</button>
+      <input id="chooser-accept" type="file" accept="application/pdf" hidden />
+      <script>
+        document.getElementById('choose-file').addEventListener('click', () => {
+          document.getElementById('chooser-accept').click()
+        })
+      </script>
+    `)
+
+    try {
+      const box = await page.locator('#choose-file').boundingBox()
+      if (!box) throw new Error('expected chooser bounds')
+      const chooserTarget = {
+        strategy: 'chooser' as const,
+        clickX: box.x + box.width / 2,
+        clickY: box.y + box.height / 2,
+      }
+      await attachFiles(page, [pdfFile], chooserTarget)
+      await expect(attachFiles(page, [textFile], chooserTarget)).rejects.toThrow('did not match input accept=')
+      await expect(attachFiles(page, [unknownFile], chooserTarget)).rejects.toThrow('cannot safely infer MIME type')
+      expect(await page.locator('#chooser-accept').evaluate((el: HTMLInputElement) =>
+        Array.from(el.files ?? []).map(file => file.name),
+      )).toEqual([pdfFile.split('/').pop()])
+    } finally {
+      await Promise.all([pdfFile, textFile, unknownFile].map(path => rm(path, { force: true })))
+      await page.close()
+    }
+  })
+
+  it('enforces wildcard MIME accept contracts before synthetic drop events', async () => {
+    const page = await browser.newPage({ viewport: { width: 900, height: 700 } })
+    const stamp = `${Date.now()}-${Math.random().toString(36).slice(2)}`
+    const imageFile = join(tmpdir(), `geometra-drop-accept-${stamp}.png`)
+    const textFile = join(tmpdir(), `geometra-drop-accept-${stamp}.txt`)
+    await Promise.all([writeFile(imageFile, 'png'), writeFile(textFile, 'text')])
+    await page.setContent(`
+      <div id="accept-drop" data-dropzone style="width:320px;height:100px;border:1px solid #aaa;">
+        <span id="accept-drop-status">Drop image here</span>
+        <input id="accept-drop-input" type="file" accept="image/*" hidden />
+      </div>
+      <script>
+        globalThis.__geometraDropEvents = { drag: 0, change: 0 }
+        const zone = document.getElementById('accept-drop')
+        const status = document.getElementById('accept-drop-status')
+        const input = document.getElementById('accept-drop-input')
+        zone.addEventListener('dragover', event => {
+          globalThis.__geometraDropEvents.drag++
+          event.preventDefault()
+        })
+        zone.addEventListener('drop', event => {
+          globalThis.__geometraDropEvents.drag++
+          event.preventDefault()
+          status.textContent = Array.from(event.dataTransfer.files).map(file => file.name).join(', ')
+        })
+        input.addEventListener('change', () => { globalThis.__geometraDropEvents.change++ })
+      </script>
+    `)
+
+    try {
+      const box = await page.locator('#accept-drop').boundingBox()
+      if (!box) throw new Error('expected drop bounds')
+      const dropTarget = {
+        strategy: 'drop' as const,
+        dropX: box.x + box.width / 2,
+        dropY: box.y + box.height / 2,
+      }
+      await attachFiles(page, [imageFile], dropTarget)
+      const beforeRejectedDrop = await page.evaluate(() => ({
+        events: { ...(globalThis as unknown as { __geometraDropEvents: { drag: number; change: number } }).__geometraDropEvents },
+        files: Array.from((document.getElementById('accept-drop-input') as HTMLInputElement).files ?? [])
+          .map(file => file.name),
+      }))
+
+      await expect(attachFiles(page, [textFile], dropTarget)).rejects.toThrow('did not match input accept=')
+      const afterRejectedDrop = await page.evaluate(() => ({
+        events: { ...(globalThis as unknown as { __geometraDropEvents: { drag: number; change: number } }).__geometraDropEvents },
+        files: Array.from((document.getElementById('accept-drop-input') as HTMLInputElement).files ?? [])
+          .map(file => file.name),
+      }))
+      expect(beforeRejectedDrop.files).toEqual([imageFile.split('/').pop()])
+      expect(afterRejectedDrop).toEqual(beforeRejectedDrop)
+    } finally {
+      await Promise.all([imageFile, textFile].map(path => rm(path, { force: true })))
+      await page.close()
+    }
+  })
+
+  it('finds a sibling file input on the nearest outer dropzone before trusting rendered acceptance', async () => {
+    const page = await browser.newPage({ viewport: { width: 900, height: 700 } })
+    const stamp = `${Date.now()}-${Math.random().toString(36).slice(2)}`
+    const pdfFile = join(tmpdir(), `geometra-nested-drop-${stamp}.pdf`)
+    const jsonFile = join(tmpdir(), `geometra-nested-drop-${stamp}.json`)
+    await Promise.all([writeFile(pdfFile, 'pdf'), writeFile(jsonFile, '{"invalid":true}')])
+    await page.setContent(`
+      <div id="outer-drop" data-dropzone style="width:360px;height:120px;border:1px solid #aaa;">
+        <div id="inner-drop" style="width:100%;height:100%;display:grid;place-items:center;">
+          <span id="nested-drop-target">Drop application document</span>
+        </div>
+        <input id="nested-drop-input" type="file" accept=".pdf" hidden />
+      </div>
+      <div id="nested-drop-status">Nothing uploaded</div>
+      <script>
+        globalThis.__geometraNestedDropEvents = 0
+        const outer = document.getElementById('outer-drop')
+        const status = document.getElementById('nested-drop-status')
+        outer.addEventListener('dragover', event => {
+          globalThis.__geometraNestedDropEvents++
+          event.preventDefault()
+        })
+        outer.addEventListener('drop', event => {
+          globalThis.__geometraNestedDropEvents++
+          event.preventDefault()
+          const name = event.dataTransfer.files[0]?.name ?? ''
+          status.textContent = JSON.stringify({ uploaded: name })
+        })
+      </script>
+    `)
+
+    try {
+      const target = await page.locator('#nested-drop-target').boundingBox()
+      if (!target) throw new Error('expected nested drop target bounds')
+      const dropTarget = {
+        strategy: 'drop' as const,
+        dropX: target.x + target.width / 2,
+        dropY: target.y + target.height / 2,
+      }
+
+      await expect(attachFiles(page, [jsonFile], dropTarget)).rejects.toThrow('did not match input accept=')
+      expect(await page.evaluate(() => (globalThis as unknown as { __geometraNestedDropEvents: number }).__geometraNestedDropEvents)).toBe(0)
+      expect(await page.locator('#nested-drop-status').textContent()).toBe('Nothing uploaded')
+      expect(await page.locator('#nested-drop-input').evaluate((el: HTMLInputElement) => el.files?.length ?? 0)).toBe(0)
+
+      await attachFiles(page, [pdfFile], dropTarget)
+      expect(await page.locator('#nested-drop-input').evaluate((el: HTMLInputElement) => el.files?.[0]?.name)).toBe(
+        pdfFile.split('/').pop(),
+      )
+    } finally {
+      await Promise.all([pdfFile, jsonFile].map(path => rm(path, { force: true })))
+      await page.close()
+    }
+  })
+
+  it('rejects a non-mutable associated drop input before firing any application events', async () => {
+    const page = await browser.newPage({ viewport: { width: 900, height: 700 } })
+    const uploadFile = join(tmpdir(), `geometra-disabled-drop-${Date.now()}.pdf`)
+    await writeFile(uploadFile, 'document')
+    await page.setContent(`
+      <div id="disabled-drop" data-dropzone style="width:360px;height:120px;border:1px solid #aaa;">
+        <span id="disabled-drop-target">Drop disabled attachment</span>
+        <input id="disabled-drop-input" type="file" accept=".pdf" disabled hidden />
+      </div>
+      <div id="disabled-drop-status">Nothing uploaded</div>
+      <script>
+        globalThis.__geometraDisabledDropEvents = { drag: 0, input: 0, change: 0 }
+        const zone = document.getElementById('disabled-drop')
+        const input = document.getElementById('disabled-drop-input')
+        const status = document.getElementById('disabled-drop-status')
+        for (const type of ['dragenter', 'dragover', 'drop']) {
+          zone.addEventListener(type, event => {
+            globalThis.__geometraDisabledDropEvents.drag++
+            event.preventDefault()
+            status.textContent = 'handler fired'
+          })
+        }
+        input.addEventListener('input', () => { globalThis.__geometraDisabledDropEvents.input++ })
+        input.addEventListener('change', () => { globalThis.__geometraDisabledDropEvents.change++ })
+      </script>
+    `)
+
+    try {
+      const target = await page.locator('#disabled-drop-target').boundingBox()
+      if (!target) throw new Error('expected disabled drop target bounds')
+      await expect(attachFiles(page, [uploadFile], {
+        strategy: 'drop',
+        dropX: target.x + target.width / 2,
+        dropY: target.y + target.height / 2,
+      })).rejects.toThrow('associated drop input is not mutable (disabled)')
+
+      expect(await page.evaluate(() =>
+        (globalThis as unknown as {
+          __geometraDisabledDropEvents: { drag: number; input: number; change: number }
+        }).__geometraDisabledDropEvents,
+      )).toEqual({ drag: 0, input: 0, change: 0 })
+      expect(await page.locator('#disabled-drop-status').textContent()).toBe('Nothing uploaded')
+      expect(await page.locator('#disabled-drop-input').evaluate((el: HTMLInputElement) => el.files?.length ?? 0)).toBe(0)
+    } finally {
+      await rm(uploadFile, { force: true })
+      await page.close()
+    }
+  })
+
+  it('refuses a coordinate-only drop when the nearest candidate container has multiple file inputs', async () => {
+    const page = await browser.newPage({ viewport: { width: 900, height: 700 } })
+    const coverFile = join(tmpdir(), `geometra-ambiguous-drop-${Date.now()}.pdf`)
+    await writeFile(coverFile, 'cover')
+    await page.setContent(`
+      <form id="application-form">
+        <input id="resume-upload" type="file" hidden />
+        <div id="cover-drop" data-dropzone style="width:360px;height:120px;border:1px solid #aaa;">
+          <span id="cover-drop-target">Drop cover letter</span>
+        </div>
+        <input id="cover-upload" type="file" hidden />
+      </form>
+      <div id="ambiguous-drop-status">Nothing uploaded</div>
+      <script>
+        globalThis.__geometraAmbiguousDropEvents = 0
+        const zone = document.getElementById('cover-drop')
+        const status = document.getElementById('ambiguous-drop-status')
+        zone.addEventListener('dragover', event => {
+          globalThis.__geometraAmbiguousDropEvents++
+          event.preventDefault()
+        })
+        zone.addEventListener('drop', event => {
+          globalThis.__geometraAmbiguousDropEvents++
+          event.preventDefault()
+          status.textContent = JSON.stringify({ uploaded: event.dataTransfer.files[0]?.name ?? '' })
+        })
+      </script>
+    `)
+
+    try {
+      const target = await page.locator('#cover-drop-target').boundingBox()
+      if (!target) throw new Error('expected ambiguous drop target bounds')
+      await expect(attachFiles(page, [coverFile], {
+        strategy: 'drop',
+        dropX: target.x + target.width / 2,
+        dropY: target.y + target.height / 2,
+      })).rejects.toThrow(/ambiguous.*2 file inputs/)
+
+      expect(await page.evaluate(() =>
+        (globalThis as unknown as { __geometraAmbiguousDropEvents: number }).__geometraAmbiguousDropEvents,
+      )).toBe(0)
+      expect(await page.locator('#ambiguous-drop-status').textContent()).toBe('Nothing uploaded')
+      expect(await page.locator('#resume-upload').evaluate((el: HTMLInputElement) => el.files?.length ?? 0)).toBe(0)
+      expect(await page.locator('#cover-upload').evaluate((el: HTMLInputElement) => el.files?.length ?? 0)).toBe(0)
+    } finally {
+      await rm(coverFile, { force: true })
+      await page.close()
+    }
+  })
+
+  it('does not treat a lone form-level sibling input as proof that a plain div accepts drops', async () => {
+    const page = await browser.newPage({ viewport: { width: 900, height: 700 } })
+    const uploadFile = join(tmpdir(), `geometra-plain-drop-${Date.now()}.pdf`)
+    await writeFile(uploadFile, 'document')
+    await page.setContent(`
+      <form>
+        <div id="plain-drop" style="width:360px;height:120px;border:1px solid #aaa;">
+          Plain div, no handlers
+        </div>
+        <input id="only-upload" type="file" hidden />
+      </form>
+    `)
+
+    try {
+      const target = await page.locator('#plain-drop').boundingBox()
+      if (!target) throw new Error('expected plain div bounds')
+      await expect(attachFiles(page, [uploadFile], {
+        strategy: 'drop',
+        dropX: target.x + target.width / 2,
+        dropY: target.y + target.height / 2,
+      })).rejects.toThrow('drop target did not accept')
+
+      expect(await page.locator('#plain-drop').textContent()).toContain('Plain div, no handlers')
+      expect(await page.locator('#only-upload').evaluate((el: HTMLInputElement) => el.files?.length ?? 0)).toBe(0)
+    } finally {
+      await rm(uploadFile, { force: true })
+      await page.close()
+    }
+  })
+
+  it('does not infer drop association from a generic wrapper containing a sibling file input', async () => {
+    const page = await browser.newPage({ viewport: { width: 900, height: 700 } })
+    const uploadFile = join(tmpdir(), `geometra-generic-drop-${Date.now()}.pdf`)
+    await writeFile(uploadFile, 'document')
+    await page.setContent(`
+      <div id="generic-wrapper">
+        <div id="generic-plain" style="width:360px;height:120px;border:1px solid #aaa;">
+          Plain div inside generic wrapper
+        </div>
+        <input id="generic-upload" type="file" hidden />
+      </div>
+    `)
+
+    try {
+      const target = await page.locator('#generic-plain').boundingBox()
+      if (!target) throw new Error('expected generic plain div bounds')
+      await expect(attachFiles(page, [uploadFile], {
+        strategy: 'drop',
+        dropX: target.x + target.width / 2,
+        dropY: target.y + target.height / 2,
+      })).rejects.toThrow('drop target did not accept')
+
+      expect(await page.locator('#generic-plain').textContent()).toContain('Plain div inside generic wrapper')
+      expect(await page.locator('#generic-upload').evaluate((el: HTMLInputElement) => el.files?.length ?? 0)).toBe(0)
+    } finally {
+      await rm(uploadFile, { force: true })
       await page.close()
     }
   })
@@ -1691,7 +2091,7 @@ describe('attachFiles', () => {
       await expect(attachFiles(page, [tempFile], {
         fieldLabel: 'Resume',
         strategy: 'hidden',
-      })).rejects.toThrow('rejected or cleared')
+      })).rejects.toThrow('upload outcome is ambiguous')
       expect(await page.locator('#resume').evaluate((el: HTMLInputElement) => el.files?.length ?? 0)).toBe(0)
 
       await page.setContent(`
@@ -1710,7 +2110,7 @@ describe('attachFiles', () => {
         strategy: 'chooser',
         clickX: box.x + box.width / 2,
         clickY: box.y + box.height / 2,
-      })).rejects.toThrow('rejected or cleared')
+      })).rejects.toThrow('upload outcome is ambiguous')
       expect(await page.locator('#chooser-input').evaluate((el: HTMLInputElement) => el.files?.length ?? 0)).toBe(0)
 
       await page.setContent(`
@@ -1730,6 +2130,315 @@ describe('attachFiles', () => {
         clickY: blockedBox.y + blockedBox.height / 2,
       })).rejects.toThrow('chooser input is not mutable')
       expect(await page.locator('#blocked-chooser-input').evaluate((el: HTMLInputElement) => el.files?.length ?? 0)).toBe(0)
+    } finally {
+      await rm(tempFile, { force: true })
+      await page.close()
+    }
+  })
+
+  it('rejects a statically disabled exact hidden target without events or chooser fallback', async () => {
+    const page = await browser.newPage({ viewport: { width: 900, height: 700 } })
+    const tempFile = join(tmpdir(), `geometra-upload-static-disabled-${Date.now()}.txt`)
+    await writeFile(tempFile, 'resume')
+    await page.setContent(`
+      <div>
+        <label for="disabled-exact-upload">Resume</label>
+        <input id="disabled-exact-upload" type="file" accept=".txt" disabled />
+        <button id="disabled-upload-fallback" type="button">Attach Resume</button>
+        <input id="disabled-fallback-input" type="file" hidden />
+      </div>
+      <script>
+        globalThis.__geometraStaticUploadEvents = {
+          targetInput: 0,
+          targetChange: 0,
+          fallbackClicks: 0,
+          fallbackInput: 0,
+          fallbackChange: 0,
+        }
+        const target = document.getElementById('disabled-exact-upload')
+        const button = document.getElementById('disabled-upload-fallback')
+        const fallback = document.getElementById('disabled-fallback-input')
+        target.addEventListener('input', () => { globalThis.__geometraStaticUploadEvents.targetInput++ })
+        target.addEventListener('change', () => { globalThis.__geometraStaticUploadEvents.targetChange++ })
+        button.addEventListener('click', () => {
+          globalThis.__geometraStaticUploadEvents.fallbackClicks++
+          fallback.click()
+        })
+        fallback.addEventListener('input', () => { globalThis.__geometraStaticUploadEvents.fallbackInput++ })
+        fallback.addEventListener('change', () => { globalThis.__geometraStaticUploadEvents.fallbackChange++ })
+      </script>
+    `)
+
+    try {
+      await expect(attachFiles(page, [tempFile], {
+        fieldLabel: 'Resume',
+        strategy: 'auto',
+      })).rejects.toThrow('matched input is not mutable (disabled)')
+
+      expect(await page.evaluate(() => ({
+        events: (globalThis as unknown as {
+          __geometraStaticUploadEvents: Record<string, number>
+        }).__geometraStaticUploadEvents,
+        targetFiles: Array.from((document.getElementById('disabled-exact-upload') as HTMLInputElement).files ?? [])
+          .map(file => file.name),
+        fallbackFiles: Array.from((document.getElementById('disabled-fallback-input') as HTMLInputElement).files ?? [])
+          .map(file => file.name),
+      }))).toEqual({
+        events: {
+          targetInput: 0,
+          targetChange: 0,
+          fallbackClicks: 0,
+          fallbackInput: 0,
+          fallbackChange: 0,
+        },
+        targetFiles: [],
+        fallbackFiles: [],
+      })
+    } finally {
+      await rm(tempFile, { force: true })
+      await page.close()
+    }
+  })
+
+  it('marks a hidden microtask-disable race ambiguous, clears it, and never tries a second uploader', async () => {
+    const page = await browser.newPage({ viewport: { width: 900, height: 700 } })
+    const tempFile = join(tmpdir(), `geometra-upload-hidden-race-${Date.now()}.txt`)
+    await writeFile(tempFile, 'resume')
+    await page.setContent(`
+      <div>
+        <label for="racing-hidden-upload">Resume</label>
+        <input id="racing-hidden-upload" type="file" accept=".txt" />
+        <button id="racing-upload-fallback" type="button">Attach Resume</button>
+        <input id="racing-fallback-input" type="file" hidden />
+      </div>
+      <script>
+        globalThis.__geometraHiddenRaceEvents = {
+          targetInput: 0,
+          targetChange: 0,
+          fallbackClicks: 0,
+          fallbackInput: 0,
+          fallbackChange: 0,
+        }
+        const target = document.getElementById('racing-hidden-upload')
+        const button = document.getElementById('racing-upload-fallback')
+        const fallback = document.getElementById('racing-fallback-input')
+        target.addEventListener('input', () => { globalThis.__geometraHiddenRaceEvents.targetInput++ })
+        target.addEventListener('change', () => { globalThis.__geometraHiddenRaceEvents.targetChange++ })
+        button.addEventListener('click', () => {
+          globalThis.__geometraHiddenRaceEvents.fallbackClicks++
+          fallback.click()
+        })
+        fallback.addEventListener('input', () => { globalThis.__geometraHiddenRaceEvents.fallbackInput++ })
+        fallback.addEventListener('change', () => { globalThis.__geometraHiddenRaceEvents.fallbackChange++ })
+
+        const NativeMutationObserver = globalThis.MutationObserver
+        let raceArmed = true
+        globalThis.MutationObserver = class extends NativeMutationObserver {
+          observe(observedTarget, options) {
+            super.observe(observedTarget, options)
+            const filter = Array.from(options?.attributeFilter ?? [])
+            const isUploadCommitGuard = options?.attributeOldValue === true &&
+              options?.childList === true &&
+              options?.subtree === true &&
+              ['accept', 'type', 'disabled', 'readonly', 'inert', 'aria-disabled', 'aria-readonly']
+                .every(attribute => filter.includes(attribute))
+            if (raceArmed && isUploadCommitGuard) {
+              raceArmed = false
+              queueMicrotask(() => { target.disabled = true })
+            }
+          }
+        }
+      </script>
+    `)
+
+    try {
+      await expect(attachFiles(page, [tempFile], {
+        fieldLabel: 'Resume',
+        strategy: 'auto',
+      })).rejects.toThrow(/upload outcome is ambiguous.*Do not retry/i)
+
+      const result = await page.evaluate(() => ({
+        events: (globalThis as unknown as {
+          __geometraHiddenRaceEvents: Record<string, number>
+        }).__geometraHiddenRaceEvents,
+        targetDisabled: (document.getElementById('racing-hidden-upload') as HTMLInputElement).disabled,
+        targetFiles: Array.from((document.getElementById('racing-hidden-upload') as HTMLInputElement).files ?? [])
+          .map(file => file.name),
+        fallbackFiles: Array.from((document.getElementById('racing-fallback-input') as HTMLInputElement).files ?? [])
+          .map(file => file.name),
+      }))
+      expect(result.targetDisabled).toBe(true)
+      expect(result.targetFiles).toEqual([])
+      expect(result.fallbackFiles).toEqual([])
+      expect(result.events.targetInput).toBeGreaterThan(0)
+      expect(result.events.targetChange).toBeGreaterThan(0)
+      expect(result.events).toMatchObject({ fallbackClicks: 0, fallbackInput: 0, fallbackChange: 0 })
+    } finally {
+      await rm(tempFile, { force: true })
+      await page.close()
+    }
+  })
+
+  it('marks a chooser microtask-disable race ambiguous and leaves alternate inputs untouched', async () => {
+    const page = await browser.newPage({ viewport: { width: 900, height: 700 } })
+    const tempFile = join(tmpdir(), `geometra-upload-chooser-race-${Date.now()}.txt`)
+    await writeFile(tempFile, 'resume')
+    await page.setContent(`
+      <button id="racing-chooser-button" type="button">Choose resume</button>
+      <input id="racing-chooser-input" type="file" accept=".txt" hidden />
+      <input id="alternate-chooser-input" type="file" hidden />
+      <script>
+        globalThis.__geometraChooserRaceEvents = {
+          targetInput: 0,
+          targetChange: 0,
+          alternateInput: 0,
+          alternateChange: 0,
+        }
+        const button = document.getElementById('racing-chooser-button')
+        const target = document.getElementById('racing-chooser-input')
+        const alternate = document.getElementById('alternate-chooser-input')
+        button.addEventListener('click', () => target.click())
+        target.addEventListener('input', () => { globalThis.__geometraChooserRaceEvents.targetInput++ })
+        target.addEventListener('change', () => { globalThis.__geometraChooserRaceEvents.targetChange++ })
+        alternate.addEventListener('input', () => { globalThis.__geometraChooserRaceEvents.alternateInput++ })
+        alternate.addEventListener('change', () => { globalThis.__geometraChooserRaceEvents.alternateChange++ })
+
+      </script>
+    `)
+
+    try {
+      // Force the state transition at the exact Playwright protocol boundary:
+      // after Geometra has installed its commit guard, immediately before the
+      // underlying ElementHandle.setInputFiles call.
+      const nativeWaitForEvent = page.waitForEvent.bind(page)
+      Object.defineProperty(page, 'waitForEvent', {
+        configurable: true,
+        value: async (...args: unknown[]) => {
+          const chooser = await Reflect.apply(nativeWaitForEvent, page, args)
+          return new Proxy(chooser, {
+            get(target, property) {
+              if (property === 'element') {
+                return () => {
+                  const input = target.element()
+                  return new Proxy(input, {
+                    get(handle, handleProperty) {
+                      if (handleProperty === 'setInputFiles') {
+                        return async (...setArgs: unknown[]) => {
+                          await handle.evaluate((el: Element) => {
+                            if (el instanceof HTMLInputElement) el.disabled = true
+                          })
+                          return Reflect.apply(handle.setInputFiles, handle, setArgs)
+                        }
+                      }
+                      const value = Reflect.get(handle, handleProperty, handle)
+                      return typeof value === 'function' ? value.bind(handle) : value
+                    },
+                  })
+                }
+              }
+              const value = Reflect.get(target, property, target)
+              return typeof value === 'function' ? value.bind(target) : value
+            },
+          })
+        },
+      })
+      const box = await page.locator('#racing-chooser-button').boundingBox()
+      if (!box) throw new Error('expected racing chooser button bounds')
+      await expect(attachFiles(page, [tempFile], {
+        strategy: 'chooser',
+        clickX: box.x + box.width / 2,
+        clickY: box.y + box.height / 2,
+      })).rejects.toThrow(/upload outcome is ambiguous.*Do not retry/i)
+
+      const result = await page.evaluate(() => ({
+        events: (globalThis as unknown as {
+          __geometraChooserRaceEvents: Record<string, number>
+        }).__geometraChooserRaceEvents,
+        targetDisabled: (document.getElementById('racing-chooser-input') as HTMLInputElement).disabled,
+        targetFiles: Array.from((document.getElementById('racing-chooser-input') as HTMLInputElement).files ?? [])
+          .map(file => file.name),
+        alternateFiles: Array.from((document.getElementById('alternate-chooser-input') as HTMLInputElement).files ?? [])
+          .map(file => file.name),
+      }))
+      expect(result.targetDisabled).toBe(true)
+      expect(result.targetFiles).toEqual([])
+      expect(result.alternateFiles).toEqual([])
+      expect(result.events.targetInput).toBeGreaterThan(0)
+      expect(result.events.targetChange).toBeGreaterThan(0)
+      expect(result.events).toMatchObject({ alternateInput: 0, alternateChange: 0 })
+    } finally {
+      await rm(tempFile, { force: true })
+      await page.close()
+    }
+  })
+
+  it('preserves a preexisting same-named selection when an ambiguous upload cannot prove replacement', async () => {
+    const page = await browser.newPage({ viewport: { width: 900, height: 700 } })
+    const tempFile = join(tmpdir(), `geometra-upload-same-name-${Date.now()}.txt`)
+    await writeFile(tempFile, 'resume')
+    await page.setContent(`
+      <label for="same-name-upload">Resume</label>
+      <input id="same-name-upload" type="file" accept=".txt" />
+      <script>
+        globalThis.__geometraSameNameEvents = { input: 0, change: 0 }
+        const sameNameTarget = document.getElementById('same-name-upload')
+        sameNameTarget.addEventListener('input', () => { globalThis.__geometraSameNameEvents.input++ })
+        sameNameTarget.addEventListener('change', () => { globalThis.__geometraSameNameEvents.change++ })
+        globalThis.__armGeometraSameNameRace = () => {
+          const NativeMutationObserver = globalThis.MutationObserver
+          let raceArmed = true
+          globalThis.MutationObserver = class extends NativeMutationObserver {
+            observe(observedTarget, options) {
+              super.observe(observedTarget, options)
+              const filter = Array.from(options?.attributeFilter ?? [])
+              const isUploadCommitGuard = options?.attributeOldValue === true &&
+                options?.childList === true &&
+                options?.subtree === true &&
+                ['accept', 'type', 'disabled', 'readonly', 'inert', 'aria-disabled', 'aria-readonly']
+                  .every(attribute => filter.includes(attribute))
+              if (raceArmed && isUploadCommitGuard) {
+                raceArmed = false
+                queueMicrotask(() => { sameNameTarget.disabled = true })
+              }
+            }
+          }
+        }
+      </script>
+    `)
+
+    try {
+      await attachFiles(page, [tempFile], { fieldLabel: 'Resume', strategy: 'hidden' })
+      const before = await page.evaluate(() => ({
+        events: { ...(globalThis as unknown as {
+          __geometraSameNameEvents: { input: number; change: number }
+        }).__geometraSameNameEvents },
+        names: Array.from((document.getElementById('same-name-upload') as HTMLInputElement).files ?? [])
+          .map(file => file.name),
+      }))
+      await page.evaluate(() => {
+        (globalThis as unknown as { __armGeometraSameNameRace: () => void }).__armGeometraSameNameRace()
+      })
+
+      await expect(attachFiles(page, [tempFile], {
+        fieldLabel: 'Resume',
+        strategy: 'hidden',
+      })).rejects.toThrow(/preexisting selection was preserved.*Do not retry/i)
+
+      const after = await page.evaluate(() => ({
+        events: (globalThis as unknown as {
+          __geometraSameNameEvents: { input: number; change: number }
+        }).__geometraSameNameEvents,
+        disabled: (document.getElementById('same-name-upload') as HTMLInputElement).disabled,
+        names: Array.from((document.getElementById('same-name-upload') as HTMLInputElement).files ?? [])
+          .map(file => file.name),
+      }))
+      expect(before.names).toEqual([tempFile.split('/').pop()])
+      expect(after.names).toEqual(before.names)
+      expect(after.disabled).toBe(true)
+      // Playwright suppresses change/input for a same-path reselection. The
+      // guard must still report ambiguity without erasing the indistinguishable
+      // preexisting value or manufacturing cleanup events.
+      expect(after.events).toEqual(before.events)
     } finally {
       await rm(tempFile, { force: true })
       await page.close()
@@ -1907,6 +2616,33 @@ describe('setFieldText', () => {
     expect(await page.locator('#inert-name').inputValue()).toBe('')
     expect(await page.locator('#fieldset-name').inputValue()).toBe('')
     expect(await page.locator('#legend-name').inputValue()).toBe('Allowed')
+    await page.close()
+  })
+
+  it('rechecks text mutability in the same page task as the commit', async () => {
+    const page = await browser.newPage({ viewport: { width: 900, height: 700 } })
+    await page.setContent(`
+      <label>Reactive name <input id="reactive-name" /></label>
+      <script>
+        const input = document.getElementById('reactive-name')
+        const nativeMatches = Element.prototype.matches
+        let disabledChecks = 0
+        window.textMutationEvents = []
+        input.matches = function(selector) {
+          const result = nativeMatches.call(this, selector)
+          if (selector === ':disabled' && ++disabledChecks === 2) {
+            queueMicrotask(() => { input.disabled = true })
+          }
+          return result
+        }
+        input.addEventListener('input', () => window.textMutationEvents.push('input'))
+        input.addEventListener('change', () => window.textMutationEvents.push('change'))
+      </script>
+    `)
+
+    await expect(setFieldText(page, 'Reactive name', 'Alice', { exact: true })).rejects.toThrow('not mutable')
+    expect(await page.locator('#reactive-name').inputValue()).toBe('')
+    expect(await page.evaluate(() => (window as unknown as { textMutationEvents: string[] }).textMutationEvents)).toEqual([])
     await page.close()
   })
 
@@ -2204,6 +2940,37 @@ describe('setFieldChoice', () => {
     expect(await page.locator('#country').inputValue()).toBe('Canada')
     await expect(setFieldChoice(page, 'Office', 'Berlin', { exact: true })).rejects.toThrow('not mutable')
     expect(await page.locator('#office-options').isHidden()).toBe(true)
+    await page.close()
+  })
+
+  it('rechecks native-select mutability in the same page task as the commit', async () => {
+    const page = await browser.newPage({ viewport: { width: 900, height: 700 } })
+    await page.setContent(`
+      <label for="reactive-country">Reactive country</label>
+      <select id="reactive-country">
+        <option value="ca">Canada</option>
+        <option value="de">Germany</option>
+      </select>
+      <script>
+        const select = document.getElementById('reactive-country')
+        const nativeMatches = Element.prototype.matches
+        let disabledChecks = 0
+        window.selectMutationEvents = []
+        select.matches = function(selector) {
+          const result = nativeMatches.call(this, selector)
+          if (selector === ':disabled' && ++disabledChecks === 2) {
+            queueMicrotask(() => { select.disabled = true })
+          }
+          return result
+        }
+        select.addEventListener('input', () => window.selectMutationEvents.push('input'))
+        select.addEventListener('change', () => window.selectMutationEvents.push('change'))
+      </script>
+    `)
+
+    await expect(setFieldChoice(page, 'Reactive country', 'de', { exact: true })).rejects.toThrow()
+    expect(await page.locator('#reactive-country').inputValue()).toBe('ca')
+    expect(await page.evaluate(() => (window as unknown as { selectMutationEvents: string[] }).selectMutationEvents)).toEqual([])
     await page.close()
   })
 })
@@ -2507,6 +3274,45 @@ describe('fillFields auto', () => {
 
     expect(await page.locator('#share-profile').isChecked()).toBe(true)
     expect(await page.locator('#state').textContent()).toBe('on')
+    await page.close()
+  })
+
+  it('matches and verifies an open-shadow radio using shadow-local IDREFs', async () => {
+    const page = await browser.newPage({ viewport: { width: 900, height: 700 } })
+    await page.setContent(`
+      <span id="toggle-label">Wrong light-DOM label</span>
+      <span id="missing-toggle-label">Leaked light-DOM option</span>
+      <div id="toggle-host"></div>
+    `)
+    await page.evaluate(() => {
+      const root = document.getElementById('toggle-host')!.attachShadow({ mode: 'open' })
+      root.innerHTML = `
+        <style>input { width:24px;height:24px }</style>
+        <span id="toggle-label">Shadow-local option</span>
+        <input type="radio" name="shadow-choice" aria-labelledby="toggle-label" />
+        <input type="radio" name="missing-choice" aria-labelledby="missing-toggle-label" />
+      `
+    })
+
+    await expect(setCheckedControl(page, 'Wrong light-DOM label', {
+      checked: true,
+      exact: true,
+      controlType: 'radio',
+    })).rejects.toThrow('no visible radio')
+
+    await expect(setCheckedControl(page, 'Leaked light-DOM option', {
+      checked: true,
+      exact: true,
+      controlType: 'radio',
+    })).rejects.toThrow('no visible radio')
+
+    await setCheckedControl(page, 'Shadow-local option', {
+      checked: true,
+      exact: true,
+      controlType: 'radio',
+    })
+
+    expect(await page.locator('#toggle-host').locator('input[name="shadow-choice"]').isChecked()).toBe(true)
     await page.close()
   })
 

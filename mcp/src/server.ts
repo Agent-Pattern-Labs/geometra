@@ -1450,7 +1450,7 @@ Captures the current URL, then polls until the URL changes and a stable UI tree 
     'geometra_fill_fields',
     `Fill several labeled form fields in one MCP call. This is the preferred high-level primitive for long forms.
 
-Use \`kind: "text"\` for textboxes / textareas, \`"choice"\` for selects / comboboxes / radio-style questions addressed by field label + answer, \`"toggle"\` for individually labeled checkboxes or radios, and \`"file"\` for labeled uploads. When \`fieldId\` from \`geometra_form_schema\` is present, MCP can resolve the current label server-side so you do not need to duplicate \`fieldLabel\` / \`label\` for text, choice, and toggle fields.`,
+Use \`kind: "text"\` for textboxes / textareas, \`"choice"\` for selects / comboboxes / radio-style questions addressed by field label + answer, \`"toggle"\` for individually labeled checkboxes or radios, and \`"file"\` for labeled uploads. When \`fieldId\` from \`geometra_form_schema\` is present, MCP can resolve the current label server-side so you do not need to duplicate \`fieldLabel\` / \`label\` for text, choice, toggle, or file fields.`,
     {
       fields: z.array(fillFieldSchema).min(1).max(80).describe('Ordered field operations to apply. Use fieldId from geometra_form_schema to omit duplicate fieldLabel/label on schema-backed fields.'),
       stopOnError: z.boolean().optional().default(true).describe('Stop at the first failing field (default true)'),
@@ -1727,6 +1727,49 @@ Pass \`valuesById\` with field ids from \`geometra_form_schema\` for the most st
           const wait = await sendFillFields(session, toProxyFillFields(planned.fields))
           assertActionWaitConfirmed('Batched form fill', wait)
           const ackResult = parseProxyFillAckResult(wait.result)
+          const batchIncludesFile = planned.fields.some(field => field.kind === 'file')
+          if (batchIncludesFile) {
+            // Legacy proxies do not return a structured fillFields result.
+            // Because a file chooser may already have mutated, replaying the
+            // batch or falling back sequentially would be unsafe. Current
+            // proxies only emit this result after attachFiles confirms the
+            // exact input retained the requested files.
+            if (!ackResult) {
+              throw new AmbiguousActionOutcomeError(
+                'Batched file fill',
+                wait,
+                'Batched file fill was acknowledged without structured proxy confirmation; the upload may already have happened. Do not retry blindly.',
+              )
+            }
+            await waitForDeferredBatchUpdate(session, startRevision, wait)
+            const verification = verifyFills ? verifyFormFills(session, planned.planned) : undefined
+            const payload = {
+              ...connection,
+              completed: true,
+              execution: 'batched',
+              finalSource: 'proxy',
+              formId: schema.formId,
+              requestedValueCount: entryCount,
+              fieldCount: planned.fields.length,
+              successCount: planned.fields.length,
+              errorCount: 0,
+              ...(verification ? { verification } : {}),
+              final: ackResult,
+            }
+            recordWorkflowFill(
+              session,
+              schema.formId,
+              schema.name,
+              valuesById,
+              valuesByLabel,
+              ackResult.invalidCount,
+              planned.fields.length,
+            )
+            if (failOnInvalid && ackResult.invalidCount > 0) {
+              return err(JSON.stringify(payload, null, detail === 'verbose' ? 2 : undefined))
+            }
+            return ok(JSON.stringify(payload, null, detail === 'verbose' ? 2 : undefined))
+          }
           if (ackResult && ackResult.invalidCount === 0) {
             usedBatch = true
             if (!verifyFills) {
@@ -5314,6 +5357,26 @@ function pad2(n: number): string {
 }
 
 function plannedFillInputsForField(field: FormSchemaField, value: FormValueInput): ResolvedFillFieldInput[] | { error: string } {
+  if (field.kind === 'file') {
+    if (!Array.isArray(value)) {
+      return { error: `Field "${field.label}" expects a non-empty string array of proxy-host file paths` }
+    }
+    const paths = value.map(path => path.trim()).filter(Boolean)
+    if (paths.length === 0 || paths.length !== value.length) {
+      return { error: `Field "${field.label}" expects a non-empty string array of proxy-host file paths` }
+    }
+    if (field.format?.multiple !== true && paths.length > 1) {
+      return { error: `Field "${field.label}" accepts only one file` }
+    }
+    return [{
+      kind: 'file',
+      fieldId: field.id,
+      ...(field.fieldKey ? { fieldKey: field.fieldKey } : {}),
+      fieldLabel: field.label,
+      paths,
+    }]
+  }
+
   if (field.kind === 'text') {
     if (typeof value !== 'string') return { error: `Field "${field.label}" expects a string value` }
     const normalized = normalizeFieldValue(value, field.format)
@@ -5463,13 +5526,13 @@ function resolveFillFieldInputs(
   fields: FillFieldInput[],
 ): { ok: true; fields: ResolvedFillFieldInput[] } | { ok: false; error: string } {
   const unresolved = fields.filter(field => !isResolvedFillFieldInput(field))
+  const requiresSchemaLookup = fields.some(field => typeof field.fieldId === 'string')
   const a11y = sessionA11y(session)
-  if (unresolved.length === 0 && !a11y) {
+  if (unresolved.length === 0 && !requiresSchemaLookup && !a11y) {
     return { ok: true, fields: fields as ResolvedFillFieldInput[] }
   }
 
   if (!a11y) {
-    if (unresolved.length === 0) return { ok: true, fields: fields as ResolvedFillFieldInput[] }
     return { ok: false, error: 'No UI tree available to resolve fieldId entries from geometra_form_schema' }
   }
 
@@ -5487,9 +5550,15 @@ function resolveFillFieldInputs(
         return { ok: false, error: `Unknown form field id ${field.fieldId}. Refresh geometra_form_schema and try again.` }
       }
       if (schemaField) {
-        const expectedKind = field.kind === 'file' ? 'file' : field.kind
-        if (field.kind !== 'file' && schemaField.kind !== expectedKind) {
+        if (schemaField.kind !== field.kind) {
           return { ok: false, error: `Field id ${field.fieldId} resolves to kind "${schemaField.kind}", not ${field.kind}.` }
+        }
+        const suppliedLabel = field.kind === 'toggle' ? field.label : field.fieldLabel
+        if (normalizeLookupKey(suppliedLabel) !== normalizeLookupKey(schemaField.label)) {
+          return {
+            ok: false,
+            error: `Field id ${field.fieldId} now resolves to "${schemaField.label}", not "${suppliedLabel}". Refresh geometra_form_schema; Geometra refused to downgrade the stale id to a label-only mutation.`,
+          }
         }
       }
       const suppliedLabel = field.kind === 'toggle' ? field.label : field.fieldLabel
@@ -5601,10 +5670,14 @@ function resolveFillFieldInputs(
       continue
     }
 
-    return {
-      ok: false,
-      error: `File field id ${field.fieldId} still needs fieldLabel. geometra_form_schema does not reliably expose proxy file inputs yet.`,
+    if (schemaField.kind !== 'file') {
+      return { ok: false, error: `Field id ${field.fieldId} resolves to kind "${schemaField.kind}", not file.` }
     }
+    resolved.push({
+      ...field,
+      ...(schemaField.fieldKey ? { fieldKey: schemaField.fieldKey } : {}),
+      fieldLabel: schemaField.label,
+    })
   }
 
   return { ok: true, fields: resolved }
@@ -5677,6 +5750,21 @@ async function tryBatchedResolvedFields(
     assertActionWaitConfirmed('Batched field fill', wait)
     const ackResult = parseProxyFillAckResult(wait.result)
     batchAckResult = ackResult
+    if (fields.some(field => field.kind === 'file')) {
+      if (!ackResult) {
+        throw new AmbiguousActionOutcomeError(
+          'Batched file fill',
+          wait,
+          'Batched file fill was acknowledged without structured proxy confirmation; the upload may already have happened. Do not retry blindly.',
+        )
+      }
+      return {
+        ok: true,
+        finalSource: 'proxy',
+        final: ackResult,
+        invalidRemaining: ackResult.invalidCount,
+      }
+    }
     if (ackResult && ackResult.invalidCount === 0) {
       return {
         ok: true,
@@ -5788,8 +5876,8 @@ function assertBatchActionConfirmed(actionType: BatchAction['type'], wait: Updat
 class AmbiguousActionOutcomeError extends Error {
   readonly wait: UpdateWaitResult
 
-  constructor(actionName: string, wait: UpdateWaitResult) {
-    super(`${actionName} timed out after ${wait.timeoutMs}ms; its outcome is unconfirmed. ${ambiguousActionGuidance(wait)}`)
+  constructor(actionName: string, wait: UpdateWaitResult, message?: string) {
+    super(message ?? `${actionName} timed out after ${wait.timeoutMs}ms; its outcome is unconfirmed. ${ambiguousActionGuidance(wait)}`)
     this.name = 'AmbiguousActionOutcomeError'
     this.wait = wait
   }

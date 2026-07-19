@@ -660,18 +660,19 @@ describe('batch MCP result shaping', () => {
     })
   })
 
-  it('resolves fieldId-only fill_fields entries from the current form schema', async () => {
+  it('resolves fieldId-only fill_fields entries, including files, from the current form schema', async () => {
     const handler = getToolHandler('geometra_fill_fields')
     mockState.formSchemas = [{
       formId: 'fm:0',
       name: 'Application',
-      fieldCount: 3,
+      fieldCount: 4,
       requiredCount: 0,
       invalidCount: 0,
       fields: [
         { id: 'ff:0.0', kind: 'text', label: 'Full name' },
         { id: 'ff:0.1', kind: 'choice', label: 'Preferred location', choiceType: 'select' },
         { id: 'ff:0.2', kind: 'toggle', label: 'Share my profile for future roles', controlType: 'checkbox' },
+        { id: 'ff:0.3', fieldKey: 'id:resume-upload', kind: 'file', label: 'Resume', format: { inputType: 'file', accept: '.pdf' } },
       ],
     }]
 
@@ -680,6 +681,7 @@ describe('batch MCP result shaping', () => {
         { kind: 'text', fieldId: 'ff:0.0', value: 'Taylor Applicant' },
         { kind: 'choice', fieldId: 'ff:0.1', value: 'Berlin, Germany' },
         { kind: 'toggle', fieldId: 'ff:0.2', checked: true },
+        { kind: 'file', fieldId: 'ff:0.3', paths: ['/tmp/resume.pdf'] },
       ],
       stopOnError: true,
       failOnInvalid: false,
@@ -708,12 +710,184 @@ describe('batch MCP result shaping', () => {
       { checked: true, exact: undefined, controlType: 'checkbox' },
       undefined,
     )
+    expect(mockState.sendFileUpload).toHaveBeenCalledWith(
+      mockState.session,
+      ['/tmp/resume.pdf'],
+      {
+        fieldId: 'ff:0.3',
+        fieldKey: 'id:resume-upload',
+        fieldLabel: 'Resume',
+        exact: undefined,
+      },
+      8000,
+    )
     expect(payload).toMatchObject({
       completed: true,
-      fieldCount: 3,
-      successCount: 3,
+      fieldCount: 4,
+      successCount: 4,
       errorCount: 0,
     })
+  })
+
+  it('refuses a fill kind that disagrees with the exact schema field identity', async () => {
+    const handler = getToolHandler('geometra_fill_fields')
+    mockState.formSchemas = [{
+      formId: 'fm:0',
+      fieldCount: 1,
+      requiredCount: 1,
+      invalidCount: 0,
+      fields: [{ id: 'ff:0.0', kind: 'file', label: 'Resume', required: true }],
+    }]
+
+    const result = await handler({
+      fields: [{ kind: 'text', fieldId: 'ff:0.0', value: '/tmp/resume.pdf' }],
+      includeSteps: true,
+    })
+
+    expect(result.isError).toBe(true)
+    expect(result.content[0]!.text).toContain('resolves to kind "file", not text')
+    expect(mockState.sendFieldText).not.toHaveBeenCalled()
+    expect(mockState.sendFileUpload).not.toHaveBeenCalled()
+  })
+
+  it('does not downgrade a caller-supplied fieldId to a label-only mutation without a current schema', async () => {
+    const handler = getToolHandler('geometra_fill_fields')
+    mockState.currentA11yRoot = null
+
+    const result = await handler({
+      fields: [{
+        kind: 'file',
+        fieldId: 'ff:stale',
+        fieldLabel: 'Resume',
+        paths: ['/tmp/resume.pdf'],
+      }],
+    })
+
+    expect(result.isError).toBe(true)
+    expect(result.content[0]!.text).toContain('No UI tree available to resolve fieldId')
+    expect(mockState.sendFillFields).not.toHaveBeenCalled()
+    expect(mockState.sendFileUpload).not.toHaveBeenCalled()
+  })
+
+  it('rejects a stale fieldId whose current schema label disagrees with the supplied target', async () => {
+    const handler = getToolHandler('geometra_fill_fields')
+    mockState.formSchemas = [{
+      formId: 'fm:0',
+      fieldCount: 2,
+      requiredCount: 2,
+      invalidCount: 0,
+      fields: [
+        { id: 'ff:0.0', kind: 'file', label: 'Cover letter' },
+        { id: 'ff:0.1', kind: 'file', label: 'Resume' },
+      ],
+    }]
+
+    const result = await handler({
+      fields: [{
+        kind: 'file',
+        fieldId: 'ff:0.0',
+        fieldLabel: 'Resume',
+        paths: ['/tmp/resume.pdf'],
+      }],
+    })
+
+    expect(result.isError).toBe(true)
+    expect(result.content[0]!.text).toContain('now resolves to "Cover letter", not "Resume"')
+    expect(result.content[0]!.text).toContain('refused to downgrade')
+    expect(mockState.sendFillFields).not.toHaveBeenCalled()
+    expect(mockState.sendFileUpload).not.toHaveBeenCalled()
+  })
+
+  it('plans exact file uploads from fill_form valuesById', async () => {
+    const handler = getToolHandler('geometra_fill_form')
+    mockState.sendFillFields.mockResolvedValueOnce({
+      status: 'acknowledged',
+      timeoutMs: 6000,
+      result: {
+        pageUrl: 'https://jobs.example.com/application',
+        invalidCount: 0,
+        alertCount: 0,
+        dialogCount: 0,
+        busyCount: 0,
+      },
+    })
+    mockState.formSchemas = [{
+      formId: 'fm:0',
+      name: 'Application',
+      fieldCount: 1,
+      requiredCount: 1,
+      invalidCount: 0,
+      fields: [{
+        id: 'id:resume-upload',
+        fieldKey: 'id:resume-upload',
+        kind: 'file',
+        label: 'Resume',
+        required: true,
+        format: { inputType: 'file', accept: '.pdf' },
+      }],
+    }]
+
+    const result = await handler({
+      valuesById: { 'id:resume-upload': ['/tmp/resume.pdf'] },
+      includeSteps: false,
+    })
+
+    expect(mockState.sendFillFields).toHaveBeenCalledWith(mockState.session, [{
+      kind: 'file',
+      fieldId: 'id:resume-upload',
+      fieldKey: 'id:resume-upload',
+      fieldLabel: 'Resume',
+      paths: ['/tmp/resume.pdf'],
+    }])
+    expect(JSON.parse(result.content[0]!.text)).toMatchObject({
+      completed: true,
+      formId: 'fm:0',
+      fieldCount: 1,
+      successCount: 1,
+    })
+  })
+
+  it('does not replay a batched file fill when a legacy proxy cannot confirm its outcome', async () => {
+    const handler = getToolHandler('geometra_fill_form')
+    mockState.sendFillFields.mockResolvedValueOnce({
+      status: 'acknowledged',
+      timeoutMs: 6000,
+      requestId: 'request-file-legacy',
+      actionId: 'action-file-legacy',
+      result: undefined,
+    })
+    mockState.formSchemas = [{
+      formId: 'fm:0',
+      name: 'Application',
+      fieldCount: 1,
+      requiredCount: 1,
+      invalidCount: 0,
+      fields: [{
+        id: 'id:resume-upload',
+        fieldKey: 'id:resume-upload',
+        kind: 'file',
+        label: 'Resume',
+        required: true,
+      }],
+    }]
+
+    const result = await handler({
+      valuesById: { 'id:resume-upload': ['/tmp/resume.pdf'] },
+      includeSteps: false,
+    })
+    const payload = JSON.parse(result.content[0]!.text)
+
+    expect(result.isError).toBe(true)
+    expect(payload).toMatchObject({
+      completed: false,
+      execution: 'batched',
+      outcome: 'unconfirmed',
+      retrySafety: 'inspect-first',
+      requestId: 'request-file-legacy',
+      actionId: 'action-file-legacy',
+    })
+    expect(mockState.sendFillFields).toHaveBeenCalledOnce()
+    expect(mockState.sendFileUpload).not.toHaveBeenCalled()
   })
 
   it('lets run_actions omit step listings while keeping capped final validation state', async () => {

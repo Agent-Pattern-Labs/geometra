@@ -21,7 +21,7 @@ function snapshot(tree: TreeSnapshot): GeometrySnapshot {
 }
 
 describe('shouldEnrichSnapshotWithCdpAx', () => {
-  it('skips CDP AX when interactive nodes are already labeled', () => {
+  it('skips heuristic CDP AX when interactive nodes are already labeled', () => {
     const tree: TreeSnapshot = {
       kind: 'box',
       props: {},
@@ -77,7 +77,7 @@ describe('shouldEnrichSnapshotWithCdpAx', () => {
     expect(shouldEnrichSnapshotWithCdpAx(snapshot(tree))).toBe(true)
   })
 
-  it('skips CDP AX when the only unlabeled interactive is one tiny link', () => {
+  it('skips heuristic CDP AX when the only unlabeled interactive is one tiny link', () => {
     const tree: TreeSnapshot = {
       kind: 'box',
       props: {},
@@ -122,13 +122,19 @@ describe('createCdpAxSessionManager', () => {
   it('reuses one enabled CDP session until reset', async () => {
     const detach = vi.fn(async () => {})
     const send = vi.fn(async () => undefined)
-    const session = { send, detach }
+    const listeners = new Map<string, () => void>()
+    const session = {
+      send,
+      detach,
+      on: vi.fn((event: string, listener: () => void) => listeners.set(event, listener)),
+    }
     const newCDPSession = vi.fn(async () => session)
     const page = {
       context: () => ({ newCDPSession }),
     }
 
-    const manager = createCdpAxSessionManager()
+    const onRevision = vi.fn()
+    const manager = createCdpAxSessionManager(onRevision)
     const first = await manager.get(page as never)
     const second = await manager.get(page as never)
 
@@ -137,6 +143,12 @@ describe('createCdpAxSessionManager', () => {
     expect(newCDPSession).toHaveBeenCalledTimes(1)
     expect(send).toHaveBeenNthCalledWith(1, 'Accessibility.enable')
     expect(send).toHaveBeenNthCalledWith(2, 'DOM.enable')
+    expect(send).toHaveBeenNthCalledWith(3, 'DOM.getDocument', { depth: -1, pierce: true })
+    expect(onRevision).not.toHaveBeenCalled()
+    const revisionBeforeMutation = manager.revisionToken()
+    listeners.get('DOM.attributeModified')?.()
+    expect(manager.revisionToken()).not.toBe(revisionBeforeMutation)
+    expect(onRevision).toHaveBeenCalledTimes(1)
 
     await manager.reset()
     expect(detach).toHaveBeenCalledTimes(1)

@@ -57,6 +57,14 @@ export interface A11yNode {
     inputPattern?: string
     inputType?: string
     autocomplete?: string
+    /** True when this semantic node represents an `<input type="file">`. */
+    fileInput?: boolean
+    /** Authored file-type filter from the input's `accept` attribute. */
+    accept?: string
+    /** True when the file input accepts more than one file. */
+    multiple?: boolean
+    /** Geometry-only fallback that cannot be resolved by semantic proxy actions. */
+    coordinateOnly?: boolean
     /**
      * True when the extractor detected that this `<input>` (or role=textbox)
      * lives inside an autocomplete / searchable combobox wrapper — React
@@ -273,7 +281,7 @@ export interface PageSectionDetail {
   textPreview: string[]
 }
 
-export type FormSchemaFieldKind = 'text' | 'choice' | 'toggle' | 'multi_choice'
+export type FormSchemaFieldKind = 'text' | 'choice' | 'toggle' | 'multi_choice' | 'file'
 export type FormSchemaChoiceType = 'select' | 'group' | 'listbox'
 export type FormSchemaContextMode = 'auto' | 'always' | 'none'
 
@@ -306,7 +314,14 @@ export interface FormSchemaField {
   options?: string[]
   optionDetails?: FormSchemaOption[]
   aliases?: Record<string, string[]>
-  format?: { placeholder?: string; pattern?: string; inputType?: string; autocomplete?: string }
+  format?: {
+    placeholder?: string
+    pattern?: string
+    inputType?: string
+    autocomplete?: string
+    accept?: string
+    multiple?: boolean
+  }
   context?: NodeContextModel
 }
 
@@ -487,6 +502,7 @@ export interface Session {
     atomicTypeText?: boolean
     proxyActions?: boolean
     exactFieldIdentity?: boolean
+    verifiedFileUploads?: boolean
     binaryFraming?: boolean
   }
   /** Present when this session owns a child geometra-proxy process (pageUrl connect). */
@@ -835,6 +851,7 @@ function updatePeerProtocol(session: Session, msg: InboundServerMessage): void {
       atomicTypeText: typeof capabilities.atomicTypeText === 'boolean' ? capabilities.atomicTypeText : undefined,
       proxyActions: typeof capabilities.proxyActions === 'boolean' ? capabilities.proxyActions : undefined,
       exactFieldIdentity: typeof capabilities.exactFieldIdentity === 'boolean' ? capabilities.exactFieldIdentity : undefined,
+      verifiedFileUploads: typeof capabilities.verifiedFileUploads === 'boolean' ? capabilities.verifiedFileUploads : undefined,
       binaryFraming: typeof capabilities.binaryFraming === 'boolean' ? capabilities.binaryFraming : undefined,
     }
   }
@@ -3270,6 +3287,11 @@ const FORM_FIELD_ROLES = new Set([
   'radio',
 ])
 
+function isFormFieldNode(node: A11yNode): boolean {
+  if (node.meta?.coordinateOnly === true) return false
+  return FORM_FIELD_ROLES.has(node.role) || node.meta?.fileInput === true
+}
+
 const ACTION_ROLES = new Set([
   'button',
   'link',
@@ -3918,6 +3940,7 @@ function schemaOptionLabel(node: A11yNode): string | undefined {
 }
 
 function isGroupedChoiceControl(node: A11yNode): boolean {
+  if (node.meta?.coordinateOnly === true) return false
   return node.role === 'radio' || node.role === 'checkbox' || (node.role === 'button' && node.focusable)
 }
 
@@ -3986,7 +4009,10 @@ function buildFieldFormat(node: A11yNode): FormSchemaField['format'] {
   if (m.placeholder) format.placeholder = m.placeholder
   if (m.inputPattern) format.pattern = m.inputPattern
   if (m.inputType) format.inputType = m.inputType
+  else if (m.fileInput) format.inputType = 'file'
   if (m.autocomplete) format.autocomplete = m.autocomplete
+  if (m.accept) format.accept = m.accept
+  if (m.multiple) format.multiple = true
   return Object.keys(format).length > 0 ? format : undefined
 }
 
@@ -4059,6 +4085,34 @@ function simpleSchemaField(root: A11yNode, node: A11yNode): FormSchemaField | nu
     ...(optionDetails ? { optionCount: optionDetails.length, optionDetails } : {}),
     ...(enabledOptions && enabledOptions.length > 0 ? { options: enabledOptions } : {}),
     ...(enabledOptions && computeOptionAliases(enabledOptions) ? { aliases: computeOptionAliases(enabledOptions) } : {}),
+    ...(format ? { format } : {}),
+    ...(compactSchemaContext(context, label) ? { context: compactSchemaContext(context, label) } : {}),
+  }
+}
+
+function fileSchemaField(root: A11yNode, node: A11yNode): FormSchemaField | null {
+  const context = nodeContextForNode(root, node)
+  // Hidden dropzone inputs are commonly missing an accessible name even when
+  // they retain an authored `name`/`id`. Keep them in the schema so required
+  // upload fields cannot disappear; the authored identity remains the exact
+  // action target and the generated fallback is display-only when no such
+  // identity exists.
+  const label = fieldLabel(node)
+    ?? sanitizeInlineName(node.name, 80)
+    ?? sanitizeInlineName(node.meta?.controlName, 80)
+    ?? sanitizeInlineName(node.meta?.controlId, 80)
+    ?? context?.prompt
+    ?? 'Unlabeled file upload'
+
+  const fieldKey = uniqueSchemaFieldKey(root, node)
+  const format = buildFieldFormat(node)
+  return {
+    id: fieldKey ?? formFieldIdForPath(node.path),
+    ...(fieldKey ? { fieldKey } : {}),
+    kind: 'file',
+    label,
+    ...(node.state?.required ? { required: true } : {}),
+    ...(node.state?.invalid ? { invalid: true } : {}),
     ...(format ? { format } : {}),
     ...(compactSchemaContext(context, label) ? { context: compactSchemaContext(context, label) } : {}),
   }
@@ -4174,11 +4228,14 @@ function buildFormSchemaForNode(
     collectDescendants(
       formNode,
       candidate =>
-        candidate.role === 'textbox' ||
-        candidate.role === 'combobox' ||
-        candidate.role === 'checkbox' ||
-        candidate.role === 'radio' ||
-        (candidate.role === 'button' && candidate.focusable),
+        candidate.meta?.coordinateOnly !== true && (
+          candidate.role === 'textbox' ||
+          candidate.role === 'combobox' ||
+          candidate.role === 'checkbox' ||
+          candidate.role === 'radio' ||
+          candidate.meta?.fileInput === true ||
+          (candidate.role === 'button' && candidate.focusable)
+        ),
     ),
   )
 
@@ -4188,6 +4245,13 @@ function buildFormSchemaForNode(
   for (const candidate of candidates) {
     const candidateKey = pathKey(candidate.path)
     if (consumed.has(candidateKey)) continue
+
+    if (candidate.meta?.fileInput === true) {
+      const field = fileSchemaField(root, candidate)
+      if (field) fields.push(field)
+      consumed.add(candidateKey)
+      continue
+    }
 
     if (candidate.role === 'textbox' || candidate.role === 'combobox') {
       const field = simpleSchemaField(root, candidate)
@@ -4513,7 +4577,7 @@ export function buildPageModel(
     }
 
     if (node.role === 'form') {
-      const fields = collectDescendants(node, candidate => FORM_FIELD_ROLES.has(candidate.role))
+      const fields = collectDescendants(node, isFormFieldNode)
       const actions = collectDescendants(
         node,
         candidate => ACTION_ROLES.has(candidate.role) && candidate.focusable,
@@ -4530,7 +4594,7 @@ export function buildPageModel(
     }
 
     if (DIALOG_ROLES.has(node.role)) {
-      const fields = collectDescendants(node, candidate => FORM_FIELD_ROLES.has(candidate.role))
+      const fields = collectDescendants(node, isFormFieldNode)
       const actions = collectDescendants(
         node,
         candidate => ACTION_ROLES.has(candidate.role) && candidate.focusable,
@@ -4617,8 +4681,11 @@ export function buildFormSchemas(
     ...collectDescendants(root, candidate => candidate.role === 'form'),
   ]
 
-  // Infer forms from group/region containers with 2+ form fields (e.g. Ashby-style UIs without <form>)
-  const inferredForms = collectDescendants(root, candidate => {
+  // Infer forms from group/region containers with 2+ form fields (e.g.
+  // Ashby-style UIs without <form>). A standalone upload is also a complete
+  // form surface when it is required or has a unique authored identity;
+  // otherwise common one-field upload widgets disappear from the schema.
+  const inferredCandidates = collectDescendants(root, candidate => {
     if (candidate.role !== 'group' && candidate.role !== 'region') return false
     // Skip descendants of explicit forms
     for (const form of explicitForms) {
@@ -4627,9 +4694,38 @@ export function buildFormSchemas(
         return false
       }
     }
-    const fields = collectDescendants(candidate, child => FORM_FIELD_ROLES.has(child.role))
-    return fields.length >= 2
+    const fields = collectDescendants(candidate, isFormFieldNode)
+    if (fields.length >= 2) return true
+    if (fields.length !== 1 || fields[0]?.meta?.fileInput !== true) return false
+    const file = fields[0]
+    return file.state?.required === true || uniqueSchemaFieldKey(root, file) !== undefined
   })
+
+  // Nested layout groups often describe the same inferred form surface. Keep
+  // one stable container for an identical field set so callers do not receive
+  // duplicate formIds and then fail with an artificial ambiguous-form error.
+  // Explicit native forms are intentionally untouched.
+  const inferredByFieldSet = new Map<string, A11yNode>()
+  for (const candidate of inferredCandidates) {
+    const fieldSet = collectDescendants(candidate, isFormFieldNode)
+      .map(field => pathKey(field.path))
+      .sort()
+      .join('|')
+    const current = inferredByFieldSet.get(fieldSet)
+    if (!current) {
+      inferredByFieldSet.set(fieldSet, candidate)
+      continue
+    }
+    const currentNamed = Boolean(sanitizeContainerName(current.name, 80))
+    const candidateNamed = Boolean(sanitizeContainerName(candidate.name, 80))
+    const candidateIsPreferred = candidateNamed !== currentNamed
+      ? candidateNamed
+      : candidate.path.length > current.path.length || (
+          candidate.path.length === current.path.length && pathKey(candidate.path) < pathKey(current.path)
+        )
+    if (candidateIsPreferred) inferredByFieldSet.set(fieldSet, candidate)
+  }
+  const inferredForms = [...inferredByFieldSet.values()]
 
   const forms = sortByBounds([...explicitForms, ...inferredForms])
   return forms
@@ -4715,6 +4811,7 @@ function formSchemaFieldToFormGraphField(
       ...(field.controlType ? { controlType: field.controlType } : {}),
       ...(field.booleanChoice ? { booleanChoice: true } : {}),
       ...(field.invalid ? { invalid: true } : {}),
+      ...(field.format ? { format: field.format } : {}),
       ...(field.context ? { context: field.context } : {}),
       ...(field.optionDetails ? { optionDetails: field.optionDetails } : {}),
     },
@@ -4890,7 +4987,7 @@ export function expandPageSection(
     collectDescendants(node, candidate => candidate.role === 'heading' && !!sanitizeInlineName(candidate.name, 80)),
   )
   const fieldsAll = sortByBounds(
-    collectDescendants(node, candidate => FORM_FIELD_ROLES.has(candidate.role)),
+    collectDescendants(node, isFormFieldNode),
   )
   const actionsAll = sortByBounds(
     collectDescendants(node, candidate => ACTION_ROLES.has(candidate.role) && candidate.focusable),
@@ -5369,6 +5466,10 @@ function walkNode(element: Record<string, unknown>, layout: Record<string, unkno
   if (typeof semantic?.inputPattern === 'string') meta.inputPattern = semantic.inputPattern
   if (typeof semantic?.inputType === 'string') meta.inputType = semantic.inputType
   if (typeof semantic?.autocomplete === 'string') meta.autocomplete = semantic.autocomplete
+  if (semantic?.fileInput === true) meta.fileInput = true
+  if (typeof semantic?.accept === 'string' && semantic.accept.trim().length > 0) meta.accept = semantic.accept.trim()
+  if (semantic?.multiple === true) meta.multiple = true
+  if (semantic?.coordinateOnly === true) meta.coordinateOnly = true
   if (semantic?.isAutocompleteCombobox === true) meta.isAutocompleteCombobox = true
 
   const children: A11yNode[] = []
@@ -5464,6 +5565,18 @@ async function sendAndWaitForUpdate(
   opts?: { requireUpdateOnAck?: boolean; requiredProtocolVersion?: number },
 ): Promise<UpdateWaitResult> {
   await ensureSessionConnected(session)
+  const includesFileMutation = message.type === 'file' || (
+    message.type === 'fillFields' &&
+    Array.isArray(message.fields) &&
+    message.fields.some(field =>
+      typeof field === 'object' && field !== null && (field as { kind?: unknown }).kind === 'file'
+    )
+  )
+  if (includesFileMutation && session.peerProtocolCapabilities?.verifiedFileUploads !== true) {
+    throw new Error(
+      'file_upload_capability_required: This peer does not advertise verified file uploads. Update @geometra/proxy to v1.65.0 or newer and reconnect. No file mutation was sent.',
+    )
+  }
   const fingerprint = actionFingerprint(message)
   const existing = ambiguousOperationFor(session, fingerprint)
   if (existing) {

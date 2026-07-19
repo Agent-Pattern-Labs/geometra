@@ -1,3 +1,4 @@
+import { randomUUID } from 'node:crypto'
 import type { CDPSession, Page } from 'playwright'
 import type { GeometrySnapshot, LayoutSnapshot, TreeSnapshot } from './types.js'
 
@@ -21,6 +22,8 @@ interface AxSnapshotCandidate {
 
 export interface CdpAxSessionManager {
   get(page: Page): Promise<CDPSession>
+  /** Opaque host-side Accessibility-domain revision for cache invalidation. */
+  revisionToken(): string | undefined
   reset(): Promise<void>
   close(): Promise<void>
 }
@@ -33,6 +36,13 @@ const INTERACTIVE_AX_ROLES = new Set([
   'checkbox',
   'radio',
   'tab',
+])
+
+const FORM_LIKE_AX_ROLES = new Set([
+  'textbox',
+  'combobox',
+  'checkbox',
+  'radio',
 ])
 
 const INTERESTING_AX_ROLES = new Set([
@@ -214,21 +224,19 @@ function summarizeUnnamedInteractiveSnapshotNodes(
         layout.width <= 56 &&
         layout.height <= 56 &&
         layout.width * layout.height <= 2_500
-      if (isTinyLink) {
-        summary.ignoredTinyLinkCount += 1
-      } else {
-        summary.criticalCount += 1
-      }
+      if (isTinyLink) summary.ignoredTinyLinkCount += 1
+      else summary.criticalCount += 1
     }
   }
 
-  const treeChildren = tree.children ?? []
-  for (let i = 0; i < treeChildren.length; i++) {
-    const childSummary = summarizeUnnamedInteractiveSnapshotNodes(treeChildren[i]!, layout.children[i]!, false)
+  const children = tree.children ?? []
+  for (let index = 0; index < children.length; index++) {
+    const childLayout = layout.children[index]
+    if (!childLayout) continue
+    const childSummary = summarizeUnnamedInteractiveSnapshotNodes(children[index]!, childLayout, false)
     summary.criticalCount += childSummary.criticalCount
     summary.ignoredTinyLinkCount += childSummary.ignoredTinyLinkCount
   }
-
   return summary
 }
 
@@ -246,14 +254,72 @@ async function detachCdpSession(session: CDPSession | undefined): Promise<void> 
   }
 }
 
-async function createEnabledCdpSession(page: Page): Promise<CDPSession> {
+async function createEnabledCdpSession(
+  page: Page,
+  onAccessibilityOrDomMutation?: () => void,
+  onTrackingReliability?: (reliable: boolean) => void,
+): Promise<CDPSession> {
   const session = await page.context().newCDPSession(page)
   try {
+    if (onAccessibilityOrDomMutation) {
+      const eventSession = session as CDPSession & {
+        on?: (event: string, listener: () => void) => unknown
+      }
+      for (const event of [
+        'Accessibility.nodesUpdated',
+        'Accessibility.loadComplete',
+        'DOM.attributeModified',
+        'DOM.attributeRemoved',
+        'DOM.characterDataModified',
+        'DOM.childNodeCountUpdated',
+        'DOM.childNodeInserted',
+        'DOM.childNodeRemoved',
+        'DOM.shadowRootPopped',
+        'DOM.shadowRootPushed',
+      ]) {
+        eventSession.on?.(event, onAccessibilityOrDomMutation)
+      }
+    }
     await session.send('Accessibility.enable')
     try {
       await session.send('DOM.enable')
-    } catch {
-      /* optional */
+      if (onAccessibilityOrDomMutation) {
+        // Materialize the complete pierced tree once so Chrome emits trusted
+        // host-side DOM events for preexisting open and closed shadow roots.
+        // This runs only in the background AX session, never on the DOM/ACK
+        // extraction critical path.
+        await session.send('DOM.getDocument', { depth: -1, pierce: true })
+        onTrackingReliability?.(true)
+        const eventSession = session as CDPSession & {
+          on?: (event: string, listener: () => void) => unknown
+        }
+        let rematerializePromise: Promise<unknown> | undefined
+        eventSession.on?.('DOM.documentUpdated', () => {
+          onTrackingReliability?.(false)
+          onAccessibilityOrDomMutation()
+          if (rematerializePromise) return
+          rematerializePromise = session.send('DOM.getDocument', { depth: -1, pierce: true })
+            .then(
+              value => {
+                onTrackingReliability?.(true)
+                onAccessibilityOrDomMutation()
+                return value
+              },
+              () => {
+                onTrackingReliability?.(false)
+                onAccessibilityOrDomMutation()
+              },
+            )
+            .finally(() => {
+              rematerializePromise = undefined
+            })
+        })
+      }
+    } catch (err) {
+      // DOM tracking is optional only for one-shot temporary enrichment. A
+      // persistent cache manager must prove it can observe the fully pierced
+      // tree; otherwise it cannot issue a trustworthy revision token.
+      if (onAccessibilityOrDomMutation) throw err
     }
     return session
   } catch (err) {
@@ -267,15 +333,20 @@ function isRecoverableCdpSessionError(err: unknown): boolean {
   return /Session closed|Target closed|Browser has been closed|page has been closed|Protocol error/i.test(message)
 }
 
-export function createCdpAxSessionManager(): CdpAxSessionManager {
+export function createCdpAxSessionManager(onRevision?: () => void): CdpAxSessionManager {
+  const managerIdentity = randomUUID()
   let activeSession: CDPSession | undefined
   let sessionPromise: Promise<CDPSession> | undefined
+  let sessionGeneration = 0
+  let accessibilityRevision = 0
+  let revisionReliable = false
 
   const clear = async (): Promise<void> => {
     const pending = sessionPromise
     sessionPromise = undefined
     const session = activeSession ?? await pending?.catch(() => undefined)
     activeSession = undefined
+    revisionReliable = false
     await detachCdpSession(session)
   }
 
@@ -283,8 +354,27 @@ export function createCdpAxSessionManager(): CdpAxSessionManager {
     async get(page: Page): Promise<CDPSession> {
       if (activeSession) return activeSession
       if (!sessionPromise) {
-        sessionPromise = createEnabledCdpSession(page)
+        const markAccessibilityChanged = () => {
+          accessibilityRevision += 1
+          if (activeSession) {
+            try {
+              onRevision?.()
+            } catch {
+              // Freshness notification is advisory; the revision token still
+              // invalidates cache on the next extraction.
+            }
+          }
+        }
+        revisionReliable = false
+        sessionPromise = createEnabledCdpSession(
+          page,
+          markAccessibilityChanged,
+          reliable => {
+            revisionReliable = reliable
+          },
+        )
           .then(session => {
+            sessionGeneration += 1
             activeSession = session
             return session
           })
@@ -295,6 +385,11 @@ export function createCdpAxSessionManager(): CdpAxSessionManager {
           })
       }
       return sessionPromise
+    },
+    revisionToken(): string | undefined {
+      return activeSession && revisionReliable
+        ? `${managerIdentity}:${sessionGeneration}:${accessibilityRevision}`
+        : undefined
     },
     reset: clear,
     close: clear,
@@ -333,11 +428,17 @@ function buildAxFallbackChildren(candidates: AxSnapshotCandidate[]): {
       children: [],
     }
 
+    const interactive = INTERACTIVE_AX_ROLES.has(candidate.role)
+    const coordinateOnly = interactive
     const semantic: Record<string, unknown> = {
       tag: 'ax-fallback',
-      role: candidate.role,
       a11yEnriched: true,
       a11yFallback: true,
+    }
+    if (!FORM_LIKE_AX_ROLES.has(candidate.role)) semantic.role = candidate.role
+    if (coordinateOnly) {
+      semantic.a11yRoleHint = candidate.role
+      semantic.coordinateOnly = true
     }
     if (candidate.name) semantic.ariaLabel = candidate.name
     if (candidate.selected !== undefined) semantic.ariaSelected = candidate.selected
@@ -355,7 +456,7 @@ function buildAxFallbackChildren(candidates: AxSnapshotCandidate[]): {
             ? { src: '', alt: candidate.name ?? '' }
             : {},
       semantic,
-      ...(INTERACTIVE_AX_ROLES.has(candidate.role)
+      ...(interactive
         ? { handlers: { onClick: true, onKeyDown: true, onKeyUp: true } }
         : {}),
     }
@@ -365,6 +466,75 @@ function buildAxFallbackChildren(candidates: AxSnapshotCandidate[]): {
   }
 
   return { layoutChildren, treeChildren }
+}
+
+function boundsRepresentSameNode(layout: LayoutSnapshot, bounds: AxBounds): boolean {
+  const delta = Math.max(
+    Math.abs(layout.x - bounds.left),
+    Math.abs(layout.y - bounds.top),
+    Math.abs(layout.width - bounds.width),
+    Math.abs(layout.height - bounds.height),
+  )
+  if (delta <= 3) return true
+
+  const left = Math.max(layout.x, bounds.left)
+  const top = Math.max(layout.y, bounds.top)
+  const right = Math.min(layout.x + layout.width, bounds.left + bounds.width)
+  const bottom = Math.min(layout.y + layout.height, bounds.top + bounds.height)
+  const intersection = Math.max(0, right - left) * Math.max(0, bottom - top)
+  const layoutArea = Math.max(0, layout.width) * Math.max(0, layout.height)
+  const candidateArea = Math.max(0, bounds.width) * Math.max(0, bounds.height)
+  const smallerArea = Math.min(layoutArea, candidateArea)
+  const largerArea = Math.max(layoutArea, candidateArea)
+  return smallerArea > 0 && intersection / smallerArea >= 0.85 && largerArea / smallerArea <= 2
+}
+
+function snapshotRepresentsAxCandidate(
+  tree: TreeSnapshot,
+  layout: LayoutSnapshot,
+  candidate: AxSnapshotCandidate,
+): boolean {
+  const semantic = tree.semantic ?? {}
+  const role = typeof semantic.role === 'string'
+    ? normalizeAxRole(semantic.role)
+    : typeof semantic.a11yRoleHint === 'string'
+      ? normalizeAxRole(semantic.a11yRoleHint)
+      : undefined
+  const sameRole = role === candidate.role
+  // Authored DOM identity wins. AX engines can normalize or inherit a
+  // different label, but a same-role node at the same bounds is represented
+  // already and must never gain a duplicate coordinate fallback.
+  if (sameRole && boundsRepresentSameNode(layout, candidate.bounds)) return true
+
+  const children = tree.children ?? []
+  for (let index = 0; index < children.length; index++) {
+    const childLayout = layout.children[index]
+    if (childLayout && snapshotRepresentsAxCandidate(children[index]!, childLayout, candidate)) return true
+  }
+  return false
+}
+
+function appendMissingInteractiveAxCandidates(
+  snap: GeometrySnapshot,
+  candidates: AxSnapshotCandidate[],
+): number {
+  const missing = candidates.filter(candidate =>
+    INTERACTIVE_AX_ROLES.has(candidate.role) &&
+    !snapshotRepresentsAxCandidate(snap.tree, snap.layout, candidate),
+  )
+  if (missing.length === 0) return 0
+
+  const appended = buildAxFallbackChildren(missing)
+  for (const tree of appended.treeChildren) {
+    tree.semantic = {
+      ...(tree.semantic ?? {}),
+      a11yAppended: true,
+    }
+  }
+  snap.layout.children.push(...appended.layoutChildren)
+  if (!snap.tree.children) snap.tree.children = []
+  snap.tree.children.push(...appended.treeChildren)
+  return appended.treeChildren.length
 }
 
 async function boundsForBackendNode(session: CDPSession, backendDOMNodeId: number | undefined): Promise<AxBounds | null> {
@@ -419,23 +589,42 @@ async function collectAxSnapshotCandidates(
 }
 
 function applyAxSnapshotCandidates(snap: GeometrySnapshot, candidates: AxSnapshotCandidate[]): void {
+  const meaningfulBeforeEnrichment = countMeaningfulSnapshotNodes(snap.tree)
   const visit = (tNode: TreeSnapshot, lNode: LayoutSnapshot): void => {
-    const sem = tNode.semantic
-    if (sem?.ariaLabel || sem?.a11yEnriched) {
-      /* skip */
-    } else {
-      const cx = lNode.x + lNode.width / 2
-      const cy = lNode.y + lNode.height / 2
-      for (const c of candidates) {
-        const b = c.bounds
-        if (cx >= b.left && cx <= b.left + b.width && cy >= b.top && cy <= b.top + b.height) {
-          tNode.semantic = {
-            ...(sem ?? {}),
-            ariaLabel: c.name,
-            a11yRoleHint: c.role,
-            a11yEnriched: true,
-          }
-          break
+    const sem = tNode.semantic ?? {}
+    const snapshotRole = typeof sem.role === 'string'
+      ? normalizeAxRole(sem.role)
+      : typeof sem.a11yRoleHint === 'string'
+        ? normalizeAxRole(sem.a11yRoleHint)
+        : undefined
+    const snapshotInteractive =
+      (snapshotRole !== undefined && INTERACTIVE_AX_ROLES.has(snapshotRole)) ||
+      !!tNode.handlers?.onClick ||
+      !!tNode.handlers?.onKeyDown ||
+      !!tNode.handlers?.onKeyUp
+    if (!sem.a11yEnriched && !snapshotNodeLabel(tNode) && snapshotInteractive) {
+      const compatible = candidates
+        .filter(candidate =>
+          !!candidate.name &&
+          INTERACTIVE_AX_ROLES.has(candidate.role) &&
+          (!snapshotRole || snapshotRole === candidate.role) &&
+          boundsRepresentSameNode(lNode, candidate.bounds),
+        )
+        .sort((a, b) => {
+          const score = (candidate: AxSnapshotCandidate) =>
+            Math.abs(lNode.x - candidate.bounds.left) +
+            Math.abs(lNode.y - candidate.bounds.top) +
+            Math.abs(lNode.width - candidate.bounds.width) +
+            Math.abs(lNode.height - candidate.bounds.height)
+          return score(a) - score(b)
+        })
+      const best = compatible[0]
+      if (best) {
+        tNode.semantic = {
+          ...sem,
+          ariaLabel: best.name,
+          ...(!snapshotRole ? { a11yRoleHint: best.role } : {}),
+          a11yEnriched: true,
         }
       }
     }
@@ -448,7 +637,7 @@ function applyAxSnapshotCandidates(snap: GeometrySnapshot, candidates: AxSnapsho
 
   visit(snap.tree, snap.layout)
 
-  if (countMeaningfulSnapshotNodes(snap.tree) <= 1) {
+  if (meaningfulBeforeEnrichment === 0) {
     const fallback = buildAxFallbackChildren(candidates)
     if (fallback.treeChildren.length > 0) {
       snap.layout.children = fallback.layoutChildren
@@ -456,6 +645,15 @@ function applyAxSnapshotCandidates(snap: GeometrySnapshot, candidates: AxSnapsho
       snap.tree.semantic = {
         ...(snap.tree.semantic ?? {}),
         a11yFallbackUsed: true,
+      }
+    }
+  } else {
+    const appendedCount = appendMissingInteractiveAxCandidates(snap, candidates)
+    if (appendedCount > 0) {
+      snap.tree.semantic = {
+        ...(snap.tree.semantic ?? {}),
+        a11yAppendUsed: true,
+        a11yAppendedCount: appendedCount,
       }
     }
   }
@@ -469,7 +667,7 @@ export async function enrichSnapshotWithCdpAx(
   page: Page,
   snap: GeometrySnapshot,
   sessionManager?: CdpAxSessionManager,
-): Promise<void> {
+): Promise<boolean> {
   let temporarySession: CDPSession | undefined
   for (let attempt = 0; attempt < 2; attempt++) {
     try {
@@ -478,17 +676,18 @@ export async function enrichSnapshotWithCdpAx(
         : (temporarySession = await createEnabledCdpSession(page))
       const candidates = await collectAxSnapshotCandidates(session, snap.layout)
       applyAxSnapshotCandidates(snap, candidates)
-      return
+      return true
     } catch (err) {
       if (sessionManager && attempt === 0 && !page.isClosed() && isRecoverableCdpSessionError(err)) {
         await sessionManager.reset()
         continue
       }
-      return
+      return false
     } finally {
       if (!sessionManager && temporarySession) {
         await detachCdpSession(temporarySession)
       }
     }
   }
+  return false
 }

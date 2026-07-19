@@ -39,6 +39,8 @@ export interface ProxyProtocolCapabilities {
   atomicTypeText: true
   proxyActions: true
   exactFieldIdentity: true
+  /** File actions acknowledge only after the exact target retains the requested files. */
+  verifiedFileUploads: true
 }
 export type ClientChoiceType = 'select' | 'group' | 'listbox'
 

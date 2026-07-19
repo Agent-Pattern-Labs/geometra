@@ -265,6 +265,42 @@ async function nextWireMessage(
   })
 }
 
+function wireMessageHasWidth(message: Record<string, unknown>, expected: number): boolean {
+  if (message.type === 'patch' && Array.isArray(message.patches)) {
+    return message.patches.some(patch => {
+      if (typeof patch !== 'object' || patch === null) return false
+      const width = (patch as { width?: unknown }).width
+      return typeof width === 'number' && Math.abs(width - expected) < 1
+    })
+  }
+  if (message.type !== 'frame') return false
+  const visit = (layout: unknown): boolean => {
+    if (typeof layout !== 'object' || layout === null) return false
+    const candidate = layout as { width?: unknown; children?: unknown }
+    if (typeof candidate.width === 'number' && Math.abs(candidate.width - expected) < 1) return true
+    return Array.isArray(candidate.children) && candidate.children.some(visit)
+  }
+  return visit(message.layout)
+}
+
+function wireMessageHasX(message: Record<string, unknown>, expected: number): boolean {
+  if (message.type === 'patch' && Array.isArray(message.patches)) {
+    return message.patches.some(patch => {
+      if (typeof patch !== 'object' || patch === null) return false
+      const x = (patch as { x?: unknown }).x
+      return typeof x === 'number' && Math.abs(x - expected) < 1
+    })
+  }
+  if (message.type !== 'frame') return false
+  const visit = (layout: unknown): boolean => {
+    if (typeof layout !== 'object' || layout === null) return false
+    const candidate = layout as { x?: unknown; children?: unknown }
+    if (typeof candidate.x === 'number' && Math.abs(candidate.x - expected) < 1) return true
+    return Array.isArray(candidate.children) && candidate.children.some(visit)
+  }
+  return visit(message.layout)
+}
+
 describe('proxy action acknowledgement liveness', () => {
   it('keeps one idempotency ledger for the lifetime of a hub', async () => {
     const browser = await chromium.launch({ headless: true })
@@ -398,6 +434,7 @@ describe('proxy action acknowledgement liveness', () => {
           requestScopedAcks: true,
           actionDeadlines: true,
           idempotentRequestIds: true,
+          verifiedFileUploads: true,
         },
       })
       expect(Date.now() - startedAt).toBeLessThan(900)
@@ -429,6 +466,564 @@ describe('proxy action acknowledgement liveness', () => {
       }).catch(() => {})
       controller?.close()
       await hub.close()
+      await browser.close()
+    }
+  })
+})
+
+describe('proxy geometry freshness instrumentation', () => {
+  it('coalesces sustained mutation notifications before they reach the Playwright bridge', async () => {
+    const browser = await chromium.launch({ headless: true })
+    const page = await browser.newPage()
+    await page.setContent('<main><span id="tick">0</span></main>')
+    const scheduleExtract = vi.fn()
+
+    try {
+      await installDomObserver(page, scheduleExtract)
+      // Let the one bounded document-font settle window finish so only the
+      // mutation burst below contributes to the bridge-call count.
+      await new Promise(resolve => setTimeout(resolve, 650))
+      scheduleExtract.mockClear()
+
+      const mutationCount = await page.evaluate(async () => {
+        let tick = 0
+        const interval = window.setInterval(() => {
+          document.getElementById('tick')!.textContent = String(++tick)
+        }, 1)
+        await new Promise(resolve => setTimeout(resolve, 250))
+        clearInterval(interval)
+        return tick
+      })
+      await new Promise(resolve => setTimeout(resolve, 100))
+
+      expect(mutationCount).toBeGreaterThan(25)
+      expect(scheduleExtract).toHaveBeenCalled()
+      // The page-side bridge admits at most one call per 25ms plus one final
+      // trailing call; hundreds of observer callbacks must not become a
+      // protocol-message flood.
+      expect(scheduleExtract.mock.calls.length).toBeLessThanOrEqual(15)
+
+      const afterBurst = scheduleExtract.mock.calls.length
+      await page.evaluate(() => {
+        document.getElementById('tick')!.textContent = 'final mutation'
+      })
+      await vi.waitFor(() => {
+        expect(scheduleExtract.mock.calls.length).toBeGreaterThan(afterBurst)
+      })
+
+      scheduleExtract.mockClear()
+      await page.evaluate(() => {
+        document.dispatchEvent(new Event('transitionstart'))
+      })
+      await vi.waitFor(
+        () => expect(scheduleExtract).toHaveBeenCalledWith(true),
+        { timeout: 1_500 },
+      )
+    } finally {
+      await browser.close()
+    }
+  })
+
+  it('refreshes an AX-only closed-root label and preserves its delayed retry across flush', async () => {
+    const browser = await chromium.launch({ headless: true })
+    const page = await browser.newPage({ viewport: { width: 640, height: 480 } })
+    await page.setContent(`
+      <button>Healthy A</button><button>Healthy B</button>
+      <div id="late-host" style="position:relative;width:1px;height:1px"></div>
+    `)
+    await page.evaluate(() => {
+      const root = document.getElementById('late-host')!.attachShadow({ mode: 'closed' })
+      root.innerHTML = `
+        <style>button { position:absolute;left:260px;top:100px;width:170px;height:42px }</style>
+        <button aria-label="Delete account">Delete account</button>
+      `
+      ;(globalThis as unknown as { __geometraLateClosedAction: HTMLButtonElement })
+        .__geometraLateClosedAction = root.querySelector('button')!
+    })
+    let resolvePort!: (port: number) => void
+    const portPromise = new Promise<number>(resolve => { resolvePort = resolve })
+    const hub = startGeometryWebSocket({
+      port: 0,
+      authToken: AUTH_TOKEN,
+      page,
+      debounceMs: 20,
+      onListening: resolvePort,
+    })
+    let controller: WsClient | undefined
+    const frameHasLabel = (message: Record<string, unknown>, label: string): boolean => {
+      if (message.type !== 'frame') return false
+      const visit = (node: unknown): boolean => {
+        if (!node || typeof node !== 'object') return false
+        const candidate = node as {
+          semantic?: { ariaLabel?: unknown }
+          children?: unknown
+        }
+        if (candidate.semantic?.ariaLabel === label) return true
+        return Array.isArray(candidate.children) && candidate.children.some(visit)
+      }
+      return visit(message.tree)
+    }
+
+    try {
+      // Install after the root exists: the page MutationObserver cannot pierce
+      // it, so this exercises the trusted host CDP revision signal.
+      await installDomObserver(page, hub.scheduleExtract)
+      controller = await openAuthorized(`ws://127.0.0.1:${await portPromise}`)
+      const initialAxFrame = nextWireMessage(
+        controller,
+        message => frameHasLabel(message, 'Delete account'),
+        5_000,
+      )
+      await hub.flushExtract()
+      await initialAxFrame
+
+      const staleRemoval = nextWireMessage(
+        controller,
+        message => message.type === 'frame' && !frameHasLabel(message, 'Delete account'),
+        3_000,
+      )
+      await page.evaluate(() => {
+        const action = (globalThis as unknown as { __geometraLateClosedAction: HTMLButtonElement })
+          .__geometraLateClosedAction
+        action.setAttribute('aria-label', 'Submit')
+        action.textContent = 'Submit'
+      })
+      await staleRemoval
+
+      // A manual flush before the 10s cadence must not cancel the host-owned
+      // one-shot retry that will discover the fresh AX-only label.
+      await hub.flushExtract()
+      const refreshedAxFrame = nextWireMessage(
+        controller,
+        message => frameHasLabel(message, 'Submit'),
+        15_000,
+      )
+      await refreshedAxFrame
+    } finally {
+      controller?.close()
+      await hub.close()
+      await browser.close()
+    }
+  })
+
+  it('captures closed shadow roots before application code in every new document', async () => {
+    const browser = await chromium.launch({ headless: true })
+    const page = await browser.newPage()
+    const scheduleExtract = vi.fn()
+
+    try {
+      await installDomObserver(page, scheduleExtract)
+      const navigateWithClosedRoot = async (label: string) => {
+        const html = `<!doctype html><html><body><div id="host"></div><script>
+          const host = document.getElementById('host');
+          const root = host.attachShadow({ mode: 'closed' });
+          const button = document.createElement('button');
+          button.textContent = ${JSON.stringify(label)};
+          root.append(button);
+        </script></body></html>`
+        await page.goto(`data:text/html,${encodeURIComponent(html)}`, { waitUntil: 'domcontentloaded' })
+        return await page.evaluate(() => {
+          const host = document.getElementById('host')!
+          const registry = (globalThis as unknown as Record<symbol, unknown>)[
+            Symbol.for('geometra.closedShadowRoots')
+          ]
+          const root = registry instanceof WeakMap
+            ? registry.get(host) as ShadowRoot | undefined
+            : undefined
+          return {
+            registryIsWeakMap: registry instanceof WeakMap,
+            publicRootIsClosed: host.shadowRoot === null,
+            text: root?.querySelector('button')?.textContent,
+            hostAttributes: host.getAttributeNames(),
+            attachShadowName: Element.prototype.attachShadow.name,
+            attachShadowLength: Element.prototype.attachShadow.length,
+          }
+        })
+      }
+
+      await expect(navigateWithClosedRoot('first document')).resolves.toEqual({
+        registryIsWeakMap: true,
+        publicRootIsClosed: true,
+        text: 'first document',
+        hostAttributes: ['id'],
+        attachShadowName: 'attachShadow',
+        attachShadowLength: 1,
+      })
+      await expect(navigateWithClosedRoot('second document')).resolves.toEqual({
+        registryIsWeakMap: true,
+        publicRootIsClosed: true,
+        text: 'second document',
+        hostAttributes: ['id'],
+        attachShadowName: 'attachShadow',
+        attachShadowLength: 1,
+      })
+      expect(scheduleExtract).toHaveBeenCalled()
+    } finally {
+      await browser.close()
+    }
+  })
+
+  it('keeps freshness signals alive when the closed-root registry symbol is locked by a collision', async () => {
+    const browser = await chromium.launch({ headless: true })
+    const page = await browser.newPage()
+    const scheduleExtract = vi.fn()
+
+    try {
+      await page.evaluate(() => {
+        Object.defineProperty(globalThis, Symbol.for('geometra.closedShadowRoots'), {
+          value: 'preexisting-non-registry',
+          configurable: false,
+          enumerable: false,
+          writable: false,
+        })
+      })
+      await installDomObserver(page, scheduleExtract)
+      const result = await page.evaluate(() => {
+        const host = document.createElement('div')
+        const root = host.attachShadow({ mode: 'closed' })
+        root.innerHTML = '<button>still native</button>'
+        document.body.append(host)
+        document.body.dataset.freshnessProbe = 'mutated'
+        return {
+          collision: (globalThis as unknown as Record<symbol, unknown>)[
+            Symbol.for('geometra.closedShadowRoots')
+          ],
+          closed: host.shadowRoot === null,
+          buttonText: root.querySelector('button')?.textContent,
+        }
+      })
+
+      expect(result).toEqual({
+        collision: 'preexisting-non-registry',
+        closed: true,
+        buttonText: 'still native',
+      })
+      await vi.waitFor(() => expect(scheduleExtract).toHaveBeenCalled())
+    } finally {
+      await browser.close()
+    }
+  })
+
+  it('ignores a page-preseeded legacy freshness sentinel', async () => {
+    const browser = await chromium.launch({ headless: true })
+    const page = await browser.newPage()
+    const scheduleExtract = vi.fn()
+
+    try {
+      await page.setContent('<main id="target">Hostile sentinel probe</main>')
+      await page.evaluate(() => {
+        Object.defineProperty(globalThis, Symbol.for('geometra.proxyFreshnessInstalled'), {
+          value: true,
+          configurable: false,
+          enumerable: false,
+          writable: false,
+        })
+        Object.defineProperty(globalThis, '__geometraProxyNotify', {
+          value: () => undefined,
+          configurable: false,
+          enumerable: false,
+          writable: false,
+        })
+      })
+
+      await installDomObserver(page, scheduleExtract)
+      await new Promise(resolve => setTimeout(resolve, 50))
+      scheduleExtract.mockClear()
+      await page.evaluate(() => {
+        document.getElementById('target')!.setAttribute('data-updated', 'true')
+      })
+
+      await vi.waitFor(() => expect(scheduleExtract).toHaveBeenCalled())
+    } finally {
+      await browser.close()
+    }
+  })
+
+  it('rate-limits direct immediate extraction hints from untrusted page code', async () => {
+    const browser = await chromium.launch({ headless: true })
+    const page = await browser.newPage({ viewport: { width: 640, height: 480 } })
+    await page.setContent('<main><button>Bridge target</button></main>')
+    const hub = startGeometryWebSocket({
+      port: 0,
+      authToken: AUTH_TOKEN,
+      page,
+      debounceMs: 25,
+    })
+
+    try {
+      await installDomObserver(page, hub.scheduleExtract)
+      await new Promise(resolve => setTimeout(resolve, 650))
+      await hub.flushExtract()
+      const baseline = hub.getTrace().extractCount
+
+      await page.evaluate(() => {
+        const globals = globalThis as unknown as Record<string, unknown>
+        const bindingName = Object.getOwnPropertyNames(globalThis)
+          .find(name => name.startsWith('__geometraProxyNotify_'))
+        const notify = bindingName
+          ? globals[bindingName] as ((urgency?: 'settled') => Promise<void>) | undefined
+          : undefined
+        for (let index = 0; index < 200; index++) void notify?.('settled')
+      })
+
+      await vi.waitFor(
+        () => expect(hub.getTrace().extractCount - baseline).toBeGreaterThan(0),
+        { timeout: 5_000 },
+      )
+      // Let any single coalesced post-completion refresh become eligible. The
+      // assertion remains stable on loaded CI hosts without weakening the
+      // hard upper bound on a finite untrusted hint burst.
+      await new Promise(resolve => setTimeout(resolve, 350))
+
+      const forcedExtracts = hub.getTrace().extractCount - baseline
+      expect(forcedExtracts).toBeLessThanOrEqual(2)
+    } finally {
+      await hub.close()
+      await browser.close()
+    }
+  })
+
+  it('keeps a post-completion cooldown under sustained immediate page spam', async () => {
+    const browser = await chromium.launch({ headless: true })
+    const page = await browser.newPage({ viewport: { width: 640, height: 480 } })
+    await page.setContent('<main><button>Sustained bridge target</button></main>')
+    let releaseBeforeInput!: () => void
+    const beforeInput = new Promise<void>(resolve => { releaseBeforeInput = resolve })
+    const hub = startGeometryWebSocket({
+      port: 0,
+      authToken: AUTH_TOKEN,
+      page,
+      debounceMs: 25,
+      beforeInput,
+    })
+
+    try {
+      await installDomObserver(page, hub.scheduleExtract)
+      await page.evaluate(() => {
+        const globals = globalThis as unknown as Record<string, unknown>
+        const bindingName = Object.getOwnPropertyNames(globalThis)
+          .find(name => name.startsWith('__geometraProxyNotify_'))
+        const notify = bindingName
+          ? globals[bindingName] as ((urgency?: 'settled') => Promise<void>) | undefined
+          : undefined
+        const state = globalThis as unknown as { __geometraImmediateSpam?: number }
+        state.__geometraImmediateSpam = window.setInterval(() => void notify?.('settled'), 5)
+      })
+      await new Promise(resolve => setTimeout(resolve, 350))
+      expect(hub.getTrace().extractCount).toBe(0)
+
+      releaseBeforeInput()
+      await vi.waitFor(
+        () => expect(hub.getTrace().extractCount).toBeGreaterThan(0),
+        { timeout: 5_000 },
+      )
+      const afterFirstCompletion = hub.getTrace().extractCount
+      const observationStartedAt = performance.now()
+      await new Promise(resolve => setTimeout(resolve, 100))
+      // Spam observed during the slow extract is coalesced behind a full
+      // post-completion cooldown rather than keeping the extraction loop hot.
+      // Use actual monotonic elapsed time: under full-suite load a requested
+      // 100ms Node timer can resume after one or more 250ms cadence windows.
+      const observationElapsedMs = performance.now() - observationStartedAt
+      const additionalExtracts = hub.getTrace().extractCount - afterFirstCompletion
+      const maximumAdditionalExtracts = Math.floor((observationElapsedMs + 75) / 250)
+      expect(additionalExtracts).toBeLessThanOrEqual(maximumAdditionalExtracts)
+    } finally {
+      await page.evaluate(() => {
+        const state = globalThis as unknown as { __geometraImmediateSpam?: number }
+        if (state.__geometraImmediateSpam !== undefined) clearInterval(state.__geometraImmediateSpam)
+      }).catch(() => {})
+      releaseBeforeInput()
+      await hub.close()
+      await browser.close()
+    }
+  })
+
+  it('broadcasts geometry after a stylesheet rule changes without a DOM mutation', async () => {
+    const browser = await chromium.launch({ headless: true })
+    const page = await browser.newPage({ viewport: { width: 640, height: 480 } })
+    await page.setContent(`
+      <style id="rules">#target { box-sizing: border-box; width: 80px; height: 30px; }</style>
+      <button id="target">Resize from CSSOM</button>
+    `)
+    let resolvePort!: (port: number) => void
+    const portPromise = new Promise<number>(resolve => { resolvePort = resolve })
+    const hub = startGeometryWebSocket({
+      port: 0,
+      authToken: AUTH_TOKEN,
+      page,
+      debounceMs: 25,
+      onListening: resolvePort,
+    })
+    let controller: WsClient | undefined
+
+    try {
+      await installDomObserver(page, hub.scheduleExtract)
+      controller = await openAuthorized(`ws://127.0.0.1:${await portPromise}`)
+      const initialFrame = nextWireMessage(controller, message => message.type === 'frame')
+      await hub.flushExtract()
+      await expect(initialFrame).resolves.toSatisfy(message => wireMessageHasWidth(message, 80))
+
+      const updatedGeometry = nextWireMessage(
+        controller,
+        message => wireMessageHasWidth(message, 180),
+        3_000,
+      )
+      await page.evaluate(() => {
+        const sheet = (document.getElementById('rules') as HTMLStyleElement).sheet!
+        sheet.insertRule('#target { width: 180px !important; }', sheet.cssRules.length)
+      })
+
+      await expect(updatedGeometry).resolves.toSatisfy(message => wireMessageHasWidth(message, 180))
+    } finally {
+      controller?.close()
+      await hub.close()
+      await browser.close()
+    }
+  })
+
+  it('observes a cached CSS rule declaration assigned through a direct property setter', async () => {
+    const browser = await chromium.launch({ headless: true })
+    const page = await browser.newPage({ viewport: { width: 640, height: 480 } })
+    await page.setContent(`
+      <style>#target { position: absolute; left: 20px; top: 20px; width: 90px; height: 30px; }</style>
+      <button id="target">Transform from cached CSS declaration</button>
+    `)
+    let resolvePort!: (port: number) => void
+    const portPromise = new Promise<number>(resolve => { resolvePort = resolve })
+    const hub = startGeometryWebSocket({
+      port: 0,
+      authToken: AUTH_TOKEN,
+      page,
+      debounceMs: 25,
+      onListening: resolvePort,
+    })
+    let controller: WsClient | undefined
+
+    try {
+      await installDomObserver(page, hub.scheduleExtract)
+      controller = await openAuthorized(`ws://127.0.0.1:${await portPromise}`)
+      const initialFrame = nextWireMessage(controller, message => message.type === 'frame')
+      await hub.flushExtract()
+      await initialFrame
+
+      await page.evaluate(() => {
+        const state = globalThis as unknown as { __geometraCachedRuleStyle?: CSSStyleDeclaration }
+        state.__geometraCachedRuleStyle = (document.styleSheets[0]!.cssRules[0] as CSSStyleRule).style
+      })
+      // Let the bounded getter sampler finish. The later assignment must be
+      // detected by the declaration setter itself; transforms do not trigger
+      // ResizeObserver and CSSOM edits do not trigger MutationObserver.
+      await new Promise(resolve => setTimeout(resolve, 650))
+      await hub.flushExtract()
+
+      const transformedGeometry = nextWireMessage(
+        controller,
+        message => wireMessageHasX(message, 140),
+        3_000,
+      )
+      const assignmentStartedAt = Date.now()
+      await page.evaluate(() => {
+        const state = globalThis as unknown as { __geometraCachedRuleStyle: CSSStyleDeclaration }
+        state.__geometraCachedRuleStyle.transform = 'translateX(120px)'
+      })
+
+      await expect(transformedGeometry).resolves.toSatisfy(message => wireMessageHasX(message, 140))
+      expect(Date.now() - assignmentStartedAt).toBeLessThan(1_000)
+      await expect(page.locator('#target').evaluate(element => element.getBoundingClientRect().x)).resolves.toBeCloseTo(140, 0)
+    } finally {
+      controller?.close()
+      await hub.close()
+      await browser.close()
+    }
+  })
+
+  it('broadcasts the final bounds of a CSS transition', async () => {
+    const browser = await chromium.launch({ headless: true })
+    const page = await browser.newPage({ viewport: { width: 640, height: 480 } })
+    await page.setContent(`
+      <style>
+        #target {
+          box-sizing: border-box;
+          width: 80px;
+          height: 30px;
+          transition: width 180ms linear;
+        }
+      </style>
+      <button id="target">Animated resize</button>
+    `)
+    let resolvePort!: (port: number) => void
+    const portPromise = new Promise<number>(resolve => { resolvePort = resolve })
+    const hub = startGeometryWebSocket({
+      port: 0,
+      authToken: AUTH_TOKEN,
+      page,
+      debounceMs: 25,
+      onListening: resolvePort,
+    })
+    let controller: WsClient | undefined
+
+    try {
+      await installDomObserver(page, hub.scheduleExtract)
+      controller = await openAuthorized(`ws://127.0.0.1:${await portPromise}`)
+      const initialFrame = nextWireMessage(controller, message => message.type === 'frame')
+      await hub.flushExtract()
+      await initialFrame
+
+      const finalGeometry = nextWireMessage(
+        controller,
+        message => wireMessageHasWidth(message, 220),
+        3_000,
+      )
+      await page.evaluate(() => {
+        document.getElementById('target')!.style.width = '220px'
+      })
+
+      await expect(finalGeometry).resolves.toSatisfy(message => wireMessageHasWidth(message, 220))
+      await expect(page.locator('#target').evaluate(element => element.getBoundingClientRect().width)).resolves.toBeCloseTo(220, 0)
+    } finally {
+      controller?.close()
+      await hub.close()
+      await browser.close()
+    }
+  })
+
+  it('stops settle sampling instead of extracting continuously on an idle page', async () => {
+    const browser = await chromium.launch({ headless: true })
+    const page = await browser.newPage({ viewport: { width: 640, height: 480 } })
+    await page.setContent('<main><button>Idle target</button></main>')
+    const scheduleExtract = vi.fn()
+
+    try {
+      // Observe the page bridge directly. Hub extraction also owns an
+      // independent background AX/CDP refresh cadence, which is not evidence
+      // that the page-side settle sampler stayed alive.
+      await installDomObserver(page, scheduleExtract)
+      // document.fonts.ready and ResizeObserver may legitimately start one
+      // bounded settle window during installation. Wait on the renderer's
+      // own RAF/performance clock: a loaded host can advance a Node timer
+      // while Chromium has not yet delivered the sampler's final frame.
+      await page.evaluate(async () => {
+        const deadline = performance.now() + 600
+        await new Promise<void>(resolve => {
+          const afterRendererHorizon = () => {
+            if (performance.now() >= deadline) {
+              resolve()
+            } else {
+              requestAnimationFrame(afterRendererHorizon)
+            }
+          }
+          requestAnimationFrame(afterRendererHorizon)
+        })
+      })
+      // Drain the page-side 25ms notification cadence before taking the
+      // strict idle baseline.
+      await new Promise(resolve => setTimeout(resolve, 75))
+      expect(scheduleExtract).toHaveBeenCalled()
+      const settledCallCount = scheduleExtract.mock.calls.length
+      await new Promise(resolve => setTimeout(resolve, 350))
+      expect(scheduleExtract.mock.calls.length).toBe(settledCallCount)
+    } finally {
       await browser.close()
     }
   })

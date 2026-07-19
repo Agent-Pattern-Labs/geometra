@@ -1,6 +1,13 @@
-import { afterAll, beforeAll, describe, expect, it } from 'vitest'
+import { performance as nodePerformance } from 'node:perf_hooks'
+import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest'
 import { chromium, type Browser } from 'playwright'
-import { extractGeometry } from '../extractor.ts'
+import { createCdpAxSessionManager, type CdpAxSessionManager } from '../a11y-enrich.ts'
+import {
+  extractFrameGeometry,
+  extractGeometry,
+  mergeAllIframes,
+  type ExtractGeometryTrace,
+} from '../extractor.ts'
 import type { LayoutSnapshot, TreeSnapshot } from '../types.js'
 
 interface SnapshotNode {
@@ -15,6 +22,20 @@ function flattenSnapshot(tree: TreeSnapshot, layout: LayoutSnapshot): SnapshotNo
     out.push(...flattenSnapshot(treeChildren[i]!, layout.children[i]!))
   }
   return out
+}
+
+function findTreePath(
+  tree: TreeSnapshot,
+  predicate: (node: TreeSnapshot) => boolean,
+  path: TreeSnapshot[] = [],
+): TreeSnapshot[] | undefined {
+  const nextPath = [...path, tree]
+  if (predicate(tree)) return nextPath
+  for (const child of tree.children ?? []) {
+    const found = findTreePath(child, predicate, nextPath)
+    if (found) return found
+  }
+  return undefined
 }
 
 describe('extractGeometry', () => {
@@ -557,6 +578,11 @@ describe('extractGeometry', () => {
 
   it('falls back to accessibility-tree nodes when DOM extraction is effectively empty', async () => {
     const page = await browser.newPage({ viewport: { width: 900, height: 700 } })
+    const axSessionManager = createCdpAxSessionManager()
+    const cdpSession = await axSessionManager.get(page)
+    const sendSpy = vi.spyOn(cdpSession, 'send')
+    const fullAxRequestCount = () => sendSpy.mock.calls
+      .filter(([method]) => method === 'Accessibility.getFullAXTree').length
     await page.setContent(`
       <style>
         #host { position: relative; width: 0; height: 0; }
@@ -569,17 +595,875 @@ describe('extractGeometry', () => {
       </script>
     `)
 
-    const snapshot = await extractGeometry(page)
+    const firstTrace: ExtractGeometryTrace = {}
+    const onAxReady = vi.fn()
+    const firstStartedAt = Date.now()
+    const snapshot = await extractGeometry(page, { axSessionManager, trace: firstTrace, onAxReady })
+    expect(Date.now() - firstStartedAt).toBeLessThan(1_000)
     const nodes = flattenSnapshot(snapshot.tree, snapshot.layout)
     const button = nodes.find(node =>
       node.tree.semantic?.role === 'button' &&
       node.tree.semantic?.ariaLabel === 'Apply now',
     )
 
-    expect(snapshot.tree.semantic?.a11yFallbackUsed).toBe(true)
-    expect(button).toBeDefined()
-    expect(button?.tree.semantic?.a11yFallback).toBe(true)
-    expect(button?.tree.handlers?.onClick).toBe(true)
+    expect(firstTrace).toMatchObject({
+      axRan: false,
+      axBackgroundStarted: true,
+      axFirstDocumentProbe: true,
+    })
+    expect(snapshot.tree.semantic?.a11yFallbackUsed).toBeUndefined()
+    expect(button).toBeUndefined()
+    await vi.waitFor(() => expect(onAxReady).toHaveBeenCalledTimes(1), { timeout: 5_000 })
+    expect(fullAxRequestCount()).toBe(1)
+
+    const repeatedTrace: ExtractGeometryTrace = {}
+    const repeated = await extractGeometry(page, { axSessionManager, trace: repeatedTrace })
+    const repeatedButton = flattenSnapshot(repeated.tree, repeated.layout).find(node =>
+      node.tree.semantic?.role === 'button' && node.tree.semantic?.ariaLabel === 'Apply now',
+    )
+    expect(repeatedTrace).toMatchObject({ axRan: false, axCacheReplayedCount: 1 })
+    expect(repeated.tree.semantic?.a11yFallbackUsed).toBe(true)
+    expect(repeatedButton?.tree.handlers?.onClick).toBe(true)
+    expect(repeatedButton?.tree.semantic).toMatchObject({
+      a11yFallback: true,
+      a11yReplayed: true,
+      coordinateOnly: true,
+    })
+    expect(fullAxRequestCount()).toBe(1)
+
+    await axSessionManager.close()
+    await page.close()
+  })
+
+  it('replays background AX semantic patches for an existing unnamed control', async () => {
+    const page = await browser.newPage({ viewport: { width: 900, height: 700 } })
+    const axSessionManager = createCdpAxSessionManager()
+    await page.setContent(`
+      <style>
+        #generated-name::before { content: 'Save draft'; }
+        #generated-name { width: 140px; height: 42px; }
+      </style>
+      <button>Healthy A</button>
+      <button>Healthy B</button>
+      <button id="generated-name"></button>
+    `)
+
+    const firstTrace: ExtractGeometryTrace = {}
+    const onAxReady = vi.fn()
+    const first = await extractGeometry(page, {
+      axSessionManager,
+      trace: firstTrace,
+      onAxReady,
+    })
+    const firstControl = flattenSnapshot(first.tree, first.layout)
+      .find(node => node.tree.semantic?.controlId === 'generated-name')
+    expect(firstTrace).toMatchObject({ axRan: false, axBackgroundStarted: true })
+    expect(firstControl?.tree.semantic?.ariaLabel).toBeUndefined()
+    await vi.waitFor(() => expect(onAxReady).toHaveBeenCalledTimes(1), { timeout: 5_000 })
+
+    const replayTrace: ExtractGeometryTrace = {}
+    const replay = await extractGeometry(page, { axSessionManager, trace: replayTrace })
+    const replayedControl = flattenSnapshot(replay.tree, replay.layout)
+      .find(node => node.tree.semantic?.controlId === 'generated-name')
+    expect(replayTrace.axRan).toBe(false)
+    expect(replayTrace.axCacheReplayedCount).toBeGreaterThan(0)
+    expect(replayedControl?.tree.semantic).toMatchObject({
+      ariaLabel: 'Save draft',
+      a11yEnriched: true,
+      a11yReplayed: true,
+    })
+    expect(replay.tree.semantic).toMatchObject({
+      a11yPatchReplayed: true,
+    })
+    expect(Number(replay.tree.semantic?.a11yPatchedCount)).toBeGreaterThan(0)
+
+    await axSessionManager.close()
+    await page.close()
+  })
+
+  it('does not borrow a containing region label for an unnamed button or append a duplicate', async () => {
+    const page = await browser.newPage({ viewport: { width: 900, height: 700 } })
+    const axSessionManager = createCdpAxSessionManager()
+    await page.setContent(`
+      <button>Healthy action</button>
+      <section role="region" aria-label="Danger zone" style="width:320px;height:180px;padding:20px">
+        <button id="empty-action" style="width:120px;height:40px"></button>
+      </section>
+      <div id="menu-action" role="menuitem" tabindex="0" aria-label="Authored menu action"
+        style="width:150px;height:38px"></div>
+    `)
+
+    const firstTrace: ExtractGeometryTrace = {}
+    const onAxReady = vi.fn()
+    await extractGeometry(page, { axSessionManager, trace: firstTrace, onAxReady })
+    await vi.waitFor(() => expect(firstTrace.axProbeSucceeded).toBe(true), { timeout: 5_000 })
+    expect(onAxReady).not.toHaveBeenCalled()
+
+    const replay = await extractGeometry(page, { axSessionManager })
+    const nodes = flattenSnapshot(replay.tree, replay.layout)
+    const emptyButton = nodes.find(node => node.tree.semantic?.controlId === 'empty-action')
+    expect(emptyButton?.tree.semantic?.ariaLabel).toBeUndefined()
+    expect(emptyButton?.tree.semantic?.a11yRoleHint).toBeUndefined()
+    const coincidentButtons = nodes.filter(node =>
+      node.tree.semantic?.role === 'button' &&
+      node.layout.x === emptyButton?.layout.x &&
+      node.layout.y === emptyButton?.layout.y &&
+      node.layout.width === emptyButton?.layout.width &&
+      node.layout.height === emptyButton?.layout.height,
+    )
+    expect(coincidentButtons).toHaveLength(1)
+    const menuAction = nodes.find(node =>
+      node.tree.semantic?.role === 'menuitem' &&
+      node.tree.semantic?.ariaLabel === 'Authored menu action',
+    )
+    expect(menuAction?.tree.semantic).toMatchObject({
+      role: 'menuitem',
+      ariaLabel: 'Authored menu action',
+    })
+    expect(nodes.some(node =>
+      node !== menuAction &&
+      node.tree.semantic?.coordinateOnly === true &&
+      node.layout.x === menuAction?.layout.x &&
+      node.layout.y === menuAction?.layout.y &&
+      node.layout.width === menuAction?.layout.width &&
+      node.layout.height === menuAction?.layout.height,
+    )).toBe(false)
+
+    await axSessionManager.close()
+    await page.close()
+  })
+
+  it('retries a failed first-document AX probe only after the bounded cadence', async () => {
+    const page = await browser.newPage({ viewport: { width: 900, height: 700 } })
+    await page.setContent('<button>Healthy A</button><button>Healthy B</button>')
+    const baseManager = createCdpAxSessionManager()
+    let failProbe = true
+    const flakyManager: CdpAxSessionManager = {
+      get: async targetPage => {
+        if (failProbe) throw new Error('transient AX setup failure')
+        return await baseManager.get(targetPage)
+      },
+      revisionToken: () => baseManager.revisionToken(),
+      reset: async () => await baseManager.reset(),
+      close: async () => await baseManager.close(),
+    }
+    let fakeNow = 20_000
+    const nowSpy = vi.spyOn(nodePerformance, 'now').mockImplementation(() => fakeNow)
+    const onAxRetryDue = vi.fn()
+
+    const failedTrace: ExtractGeometryTrace = {}
+    await extractGeometry(page, {
+      axSessionManager: flakyManager,
+      trace: failedTrace,
+      onAxRetryDue,
+    })
+    expect(failedTrace).toMatchObject({
+      axRan: false,
+      axBackgroundStarted: true,
+      axFirstDocumentProbe: true,
+    })
+    await vi.waitFor(() => expect(failedTrace.axProbeSucceeded).toBe(false))
+    expect(onAxRetryDue).toHaveBeenCalledWith(10_000)
+
+    const throttledTrace: ExtractGeometryTrace = {}
+    await extractGeometry(page, {
+      axSessionManager: flakyManager,
+      trace: throttledTrace,
+      onAxRetryDue,
+    })
+    expect(throttledTrace).toMatchObject({
+      axRan: false,
+      axBackgroundStarted: false,
+      axFirstDocumentProbe: false,
+    })
+    expect(onAxRetryDue).toHaveBeenCalledTimes(1)
+
+    failProbe = false
+    fakeNow += 10_000
+    const retryTrace: ExtractGeometryTrace = {}
+    await extractGeometry(page, { axSessionManager: flakyManager, trace: retryTrace })
+    expect(retryTrace).toMatchObject({
+      axRan: false,
+      axBackgroundStarted: true,
+      axFirstDocumentProbe: false,
+    })
+    await vi.waitFor(() => expect(retryTrace.axProbeSucceeded).toBe(true))
+
+    // A successful probe that found no append/patch results is still a cache
+    // revision. It must refresh at the same bounded cadence so a later
+    // accessibility-only control cannot remain undiscovered indefinitely.
+    fakeNow += 10_000
+    const emptyCacheRefreshTrace: ExtractGeometryTrace = {}
+    await extractGeometry(page, { axSessionManager: flakyManager, trace: emptyCacheRefreshTrace })
+    expect(emptyCacheRefreshTrace).toMatchObject({
+      axRan: false,
+      axBackgroundStarted: true,
+    })
+    expect(emptyCacheRefreshTrace.axCacheReplaySuppressed).toBeUndefined()
+    await vi.waitFor(() => expect(emptyCacheRefreshTrace.axProbeSucceeded).toBe(true))
+
+    nowSpy.mockRestore()
+    await flakyManager.close()
+    await page.close()
+  })
+
+  it('appends missing closed-root AX controls to a healthy DOM snapshot without duplicating or advertising form fields', async () => {
+    const page = await browser.newPage({ viewport: { width: 900, height: 700 } })
+    const axSessionManager = createCdpAxSessionManager()
+    const cdpSession = await axSessionManager.get(page)
+    const sendSpy = vi.spyOn(cdpSession, 'send')
+    let fakeNow = 1_000
+    const nowSpy = vi.spyOn(nodePerformance, 'now').mockImplementation(() => fakeNow)
+    const fullAxRequestCount = () => sendSpy.mock.calls
+      .filter(([method]) => method === 'Accessibility.getFullAXTree').length
+    await page.setContent(`
+      <button aria-label="Light action">Light action</button>
+      <a href="#next" aria-label="Light link">Light link</a>
+      <div id="preexisting-closed-host" style="position:relative;width:1px;height:1px"></div>
+    `)
+    await page.evaluate(() => {
+      const host = document.getElementById('preexisting-closed-host')!
+      const root = host.attachShadow({ mode: 'closed' })
+      root.innerHTML = `
+        <style>
+          button { position:absolute;left:300px;top:80px;width:150px;height:40px }
+          input { position:absolute;left:300px;top:140px;width:180px;height:32px }
+        </style>
+        <button aria-label="Preexisting closed action">Apply</button>
+        <input aria-label="Preexisting closed field" />
+      `
+    })
+
+    const firstTrace: ExtractGeometryTrace = {}
+    const onFirstAxReady = vi.fn()
+    const firstStartedAt = Date.now()
+    const snapshot = await extractGeometry(page, {
+      axSessionManager,
+      trace: firstTrace,
+      onAxReady: onFirstAxReady,
+    })
+    const firstElapsedMs = Date.now() - firstStartedAt
+    const firstNodes = flattenSnapshot(snapshot.tree, snapshot.layout)
+
+    expect(firstNodes.filter(node => node.tree.semantic?.ariaLabel === 'Light action')).toHaveLength(1)
+    expect(firstNodes.some(node => node.tree.semantic?.ariaLabel === 'Preexisting closed action')).toBe(false)
+    expect(firstElapsedMs).toBeLessThan(1_000)
+    expect(firstTrace).toMatchObject({
+      axRan: false,
+      axBackgroundStarted: true,
+      axFirstDocumentProbe: true,
+    })
+    await vi.waitFor(() => expect(onFirstAxReady).toHaveBeenCalledTimes(1), { timeout: 5_000 })
+    expect(fullAxRequestCount()).toBe(1)
+
+    const repeatedTrace: ExtractGeometryTrace = {}
+    const repeated = await extractGeometry(page, { axSessionManager, trace: repeatedTrace })
+    expect(repeatedTrace).toMatchObject({
+      axRan: false,
+      axBackgroundStarted: false,
+      axFirstDocumentProbe: false,
+      axCacheReplayedCount: 2,
+    })
+    expect(repeated.tree.semantic).toMatchObject({
+      a11yAppendUsed: true,
+      a11yAppendReplayed: true,
+    })
+    const repeatedNodes = flattenSnapshot(repeated.tree, repeated.layout)
+    const closedAction = repeatedNodes.find(node => node.tree.semantic?.ariaLabel === 'Preexisting closed action')
+    const closedField = repeatedNodes.find(node => node.tree.semantic?.ariaLabel === 'Preexisting closed field')
+    expect(closedAction?.tree.semantic).toMatchObject({
+      role: 'button',
+      a11yAppended: true,
+      a11yReplayed: true,
+      coordinateOnly: true,
+    })
+    expect(closedField?.tree.semantic).toMatchObject({
+      a11yRoleHint: 'textbox',
+      a11yAppended: true,
+      a11yReplayed: true,
+      coordinateOnly: true,
+    })
+    expect(closedField?.tree.semantic?.role).toBeUndefined()
+    expect(closedField?.tree.semantic?.controlKey).toBeUndefined()
+    expect(repeatedNodes.filter(node => node.tree.semantic?.ariaLabel === 'Preexisting closed action')).toHaveLength(1)
+    expect(repeatedNodes.filter(node => node.tree.semantic?.ariaLabel === 'Preexisting closed field')).toHaveLength(1)
+    expect(fullAxRequestCount()).toBe(1)
+
+    fakeNow += 10_000
+    const ageRefreshTrace: ExtractGeometryTrace = {}
+    const ageRefresh = await extractGeometry(page, { axSessionManager, trace: ageRefreshTrace })
+    expect(ageRefreshTrace).toMatchObject({
+      axRan: false,
+      axBackgroundStarted: true,
+      axCacheReplayedCount: 2,
+    })
+    expect(ageRefreshTrace.axCacheReplaySuppressed).toBeUndefined()
+    expect(flattenSnapshot(ageRefresh.tree, ageRefresh.layout)
+      .some(node => node.tree.semantic?.ariaLabel === 'Preexisting closed action')).toBe(true)
+    await vi.waitFor(() => expect(ageRefreshTrace.axProbeSucceeded).toBe(true), { timeout: 5_000 })
+    expect(fullAxRequestCount()).toBe(2)
+
+    await page.evaluate(() => {
+      document.getElementById('preexisting-closed-host')!.style.marginLeft = '80px'
+    })
+    fakeNow += 100
+    const changedLayoutTrace: ExtractGeometryTrace = {}
+    const changedLayout = await extractGeometry(page, { axSessionManager, trace: changedLayoutTrace })
+    expect(changedLayoutTrace).toMatchObject({
+      axRan: false,
+      axFirstDocumentProbe: false,
+      axCacheReplaySuppressed: true,
+    })
+    expect(flattenSnapshot(changedLayout.tree, changedLayout.layout)
+      .some(node => node.tree.semantic?.ariaLabel === 'Preexisting closed action')).toBe(false)
+    expect(fullAxRequestCount()).toBe(2)
+
+    fakeNow += 10_000
+    const refreshedLayoutTrace: ExtractGeometryTrace = {}
+    const onRefreshedAxReady = vi.fn()
+    const refreshedLayout = await extractGeometry(page, {
+      axSessionManager,
+      trace: refreshedLayoutTrace,
+      onAxReady: onRefreshedAxReady,
+    })
+    expect(refreshedLayoutTrace).toMatchObject({
+      axRan: false,
+      axBackgroundStarted: true,
+      axFirstDocumentProbe: false,
+    })
+    expect(flattenSnapshot(refreshedLayout.tree, refreshedLayout.layout)
+      .some(node => node.tree.semantic?.ariaLabel === 'Preexisting closed action')).toBe(false)
+    await vi.waitFor(() => expect(onRefreshedAxReady).toHaveBeenCalledTimes(1), { timeout: 5_000 })
+    expect(fullAxRequestCount()).toBe(3)
+    const refreshedReplay = await extractGeometry(page, { axSessionManager })
+    const refreshedClosedAction = flattenSnapshot(refreshedReplay.tree, refreshedReplay.layout)
+      .find(node => node.tree.semantic?.ariaLabel === 'Preexisting closed action')
+    expect(refreshedClosedAction?.layout.x).toBeGreaterThan(closedAction?.layout.x ?? 0)
+
+    await page.goto(`data:text/html,${encodeURIComponent('<button>New document A</button><button>New document B</button>')}`)
+    const navigatedTrace: ExtractGeometryTrace = {}
+    await extractGeometry(page, { axSessionManager, trace: navigatedTrace })
+    expect(navigatedTrace).toMatchObject({
+      axRan: false,
+      axBackgroundStarted: true,
+      axFirstDocumentProbe: true,
+    })
+    await vi.waitFor(() => expect(navigatedTrace.axProbeSucceeded).toBe(true), { timeout: 5_000 })
+    expect(fullAxRequestCount()).toBe(4)
+
+    nowSpy.mockRestore()
+    await axSessionManager.close()
+    await page.close()
+  })
+
+  it('does not replay a stale AX action after a same-bounds semantic replacement', async () => {
+    const page = await browser.newPage({ viewport: { width: 900, height: 700 } })
+    const axSessionManager = createCdpAxSessionManager()
+    let fakeNow = 30_000
+    const nowSpy = vi.spyOn(nodePerformance, 'now').mockImplementation(() => fakeNow)
+    await page.setContent(`
+      <button>Healthy A</button>
+      <button>Healthy B</button>
+      <div id="closed-host" aria-label="Delete account" style="position:relative;width:1px;height:1px"></div>
+    `)
+    await page.evaluate(() => {
+      const host = document.getElementById('closed-host')!
+      const root = host.attachShadow({ mode: 'closed' })
+      root.innerHTML = `
+        <style>button { position:absolute;left:280px;top:120px;width:160px;height:40px }</style>
+        <button aria-label="Delete account">Delete account</button>
+      `
+      ;(globalThis as unknown as { __geometraClosedAction: HTMLButtonElement })
+        .__geometraClosedAction = root.querySelector('button')!
+    })
+
+    const onAxReady = vi.fn()
+    await extractGeometry(page, { axSessionManager, onAxReady })
+    await vi.waitFor(() => expect(onAxReady).toHaveBeenCalledTimes(1), { timeout: 5_000 })
+
+    const cached = await extractGeometry(page, { axSessionManager })
+    expect(flattenSnapshot(cached.tree, cached.layout).some(node =>
+      node.tree.semantic?.ariaLabel === 'Delete account' &&
+      node.tree.semantic?.a11yReplayed === true,
+    )).toBe(true)
+
+    const revisionBeforeReplacement = axSessionManager.revisionToken()
+    await page.evaluate(() => {
+      const action = (globalThis as unknown as { __geometraClosedAction: HTMLButtonElement })
+        .__geometraClosedAction
+      action.setAttribute('aria-label', 'Submit')
+      action.textContent = 'Submit'
+    })
+    await vi.waitFor(() => {
+      expect(axSessionManager.revisionToken()).not.toBe(revisionBeforeReplacement)
+    }, { timeout: 5_000 })
+    const replacementTrace: ExtractGeometryTrace = {}
+    const onAxRetryDue = vi.fn()
+    const suppressed = await extractGeometry(page, {
+      axSessionManager,
+      trace: replacementTrace,
+      onAxRetryDue,
+    })
+    expect(replacementTrace).toMatchObject({
+      axRan: false,
+      axBackgroundStarted: false,
+      axCacheReplaySuppressed: true,
+    })
+    expect(onAxRetryDue).toHaveBeenCalledWith(10_000)
+    expect(flattenSnapshot(suppressed.tree, suppressed.layout).some(node =>
+      node.tree.semantic?.ariaLabel === 'Delete account' &&
+      node.tree.semantic?.a11yReplayed === true,
+    )).toBe(false)
+
+    fakeNow += 10_000
+    const refreshTrace: ExtractGeometryTrace = {}
+    const onFreshAxReady = vi.fn()
+    const replacement = await extractGeometry(page, {
+      axSessionManager,
+      trace: refreshTrace,
+      onAxReady: onFreshAxReady,
+    })
+    const replacementNodes = flattenSnapshot(replacement.tree, replacement.layout)
+
+    expect(refreshTrace).toMatchObject({
+      axRan: false,
+      axBackgroundStarted: true,
+      axCacheReplaySuppressed: true,
+    })
+    expect(replacementNodes.some(node =>
+      node.tree.semantic?.ariaLabel === 'Delete account' &&
+      node.tree.semantic?.a11yReplayed === true,
+    )).toBe(false)
+    await vi.waitFor(() => expect(onFreshAxReady).toHaveBeenCalledTimes(1), { timeout: 5_000 })
+    const refreshed = await extractGeometry(page, { axSessionManager })
+    const refreshedNodes = flattenSnapshot(refreshed.tree, refreshed.layout)
+    expect(refreshedNodes.some(node =>
+      node.tree.semantic?.ariaLabel === 'Submit' &&
+      node.tree.semantic?.a11yReplayed === true,
+    )).toBe(true)
+    expect(refreshedNodes.some(node =>
+      node.tree.semantic?.ariaLabel === 'Delete account' &&
+      node.tree.semantic?.a11yReplayed === true,
+    )).toBe(false)
+
+    nowSpy.mockRestore()
+    await axSessionManager.close()
+    await page.close()
+  })
+
+  it('discards an AX tree captured before a closed-root label mutates during bounds collection', async () => {
+    const page = await browser.newPage({ viewport: { width: 900, height: 700 } })
+    await page.setContent(`
+      <button>Healthy A</button><button>Healthy B</button>
+      <div id="race-host" aria-label="Delete account" style="position:relative;width:1px;height:1px"></div>
+    `)
+    await page.evaluate(() => {
+      const root = document.getElementById('race-host')!.attachShadow({ mode: 'closed' })
+      root.innerHTML = `
+        <style>button { position:absolute;left:260px;top:100px;width:170px;height:42px }</style>
+        <button aria-label="Delete account">Delete account</button>
+      `
+      ;(globalThis as unknown as { __geometraRaceAction: HTMLButtonElement })
+        .__geometraRaceAction = root.querySelector('button')!
+    })
+
+    const baseManager = createCdpAxSessionManager()
+    const session = await baseManager.get(page)
+    const rawSend = session.send.bind(session) as (
+      method: string,
+      params?: Record<string, unknown>,
+    ) => Promise<unknown>
+    let mutatedDuringProbe = false
+    const interceptedSession = new Proxy(session, {
+      get(target, property, receiver) {
+        if (property !== 'send') return Reflect.get(target, property, receiver)
+        return async (method: string, params?: Record<string, unknown>) => {
+          const result = await rawSend(method, params)
+          if (method === 'Accessibility.getFullAXTree' && !mutatedDuringProbe) {
+            mutatedDuringProbe = true
+            const revisionBefore = baseManager.revisionToken()
+            await page.evaluate(() => {
+              const action = (globalThis as unknown as { __geometraRaceAction: HTMLButtonElement })
+                .__geometraRaceAction
+              action.setAttribute('aria-label', 'Submit')
+              action.textContent = 'Submit'
+            })
+            await vi.waitFor(() => {
+              expect(baseManager.revisionToken()).not.toBe(revisionBefore)
+            }, { timeout: 5_000 })
+          }
+          return result
+        }
+      },
+    })
+    const interceptManager: CdpAxSessionManager = {
+      get: async () => interceptedSession,
+      revisionToken: () => baseManager.revisionToken(),
+      reset: async () => await baseManager.reset(),
+      close: async () => await baseManager.close(),
+    }
+
+    const trace: ExtractGeometryTrace = {}
+    const onAxReady = vi.fn()
+    const onAxRetryDue = vi.fn()
+    await extractGeometry(page, {
+      axSessionManager: interceptManager,
+      trace,
+      onAxReady,
+      onAxRetryDue,
+    })
+    await vi.waitFor(() => expect(trace.axProbeSucceeded).toBe(true), { timeout: 5_000 })
+    expect(mutatedDuringProbe).toBe(true)
+    expect(onAxReady).not.toHaveBeenCalled()
+    expect(Number(onAxRetryDue.mock.calls[0]?.[0])).toBeGreaterThan(9_000)
+
+    const afterRace = await extractGeometry(page, { axSessionManager: interceptManager })
+    expect(flattenSnapshot(afterRace.tree, afterRace.layout).some(node =>
+      node.tree.semantic?.ariaLabel === 'Delete account' &&
+      node.tree.semantic?.a11yReplayed === true,
+    )).toBe(false)
+
+    await interceptManager.close()
+    await page.close()
+  })
+
+  it('signals a refresh when an age probe safely removes the prior AX cache payload', async () => {
+    const page = await browser.newPage({ viewport: { width: 900, height: 700 } })
+    await page.setContent(`
+      <button>Healthy A</button><button>Healthy B</button>
+      <div id="ghost-host" style="position:relative;width:1px;height:1px"></div>
+    `)
+    await page.evaluate(() => {
+      const root = document.getElementById('ghost-host')!.attachShadow({ mode: 'closed' })
+      root.innerHTML = `
+        <style>button { position:absolute;left:250px;top:100px;width:170px;height:42px }</style>
+        <button aria-label="Transient AX action">Transient AX action</button>
+      `
+    })
+
+    const baseManager = createCdpAxSessionManager()
+    const session = await baseManager.get(page)
+    const rawSend = session.send.bind(session) as (
+      method: string,
+      params?: Record<string, unknown>,
+    ) => Promise<unknown>
+    let returnEmptyAxTree = false
+    const interceptedSession = new Proxy(session, {
+      get(target, property, receiver) {
+        if (property !== 'send') return Reflect.get(target, property, receiver)
+        return async (method: string, params?: Record<string, unknown>) => {
+          if (method === 'Accessibility.getFullAXTree' && returnEmptyAxTree) return { nodes: [] }
+          return await rawSend(method, params)
+        }
+      },
+    })
+    const manager: CdpAxSessionManager = {
+      get: async () => interceptedSession,
+      revisionToken: () => baseManager.revisionToken(),
+      reset: async () => await baseManager.reset(),
+      close: async () => await baseManager.close(),
+    }
+    let fakeNow = 40_000
+    const nowSpy = vi.spyOn(nodePerformance, 'now').mockImplementation(() => fakeNow)
+
+    const initialReady = vi.fn()
+    await extractGeometry(page, { axSessionManager: manager, onAxReady: initialReady })
+    await vi.waitFor(() => expect(initialReady).toHaveBeenCalledTimes(1), { timeout: 5_000 })
+    const cached = await extractGeometry(page, { axSessionManager: manager })
+    expect(flattenSnapshot(cached.tree, cached.layout).some(node =>
+      node.tree.semantic?.ariaLabel === 'Transient AX action' &&
+      node.tree.semantic?.a11yReplayed === true,
+    )).toBe(true)
+
+    returnEmptyAxTree = true
+    fakeNow += 10_000
+    const removalReady = vi.fn()
+    const ageRefresh = await extractGeometry(page, {
+      axSessionManager: manager,
+      onAxReady: removalReady,
+    })
+    // The old cache is safe for this returned frame while the refresh runs.
+    expect(flattenSnapshot(ageRefresh.tree, ageRefresh.layout).some(node =>
+      node.tree.semantic?.ariaLabel === 'Transient AX action' &&
+      node.tree.semantic?.a11yReplayed === true,
+    )).toBe(true)
+    await vi.waitFor(() => expect(removalReady).toHaveBeenCalledTimes(1), { timeout: 5_000 })
+
+    const afterRemoval = await extractGeometry(page, { axSessionManager: manager })
+    expect(flattenSnapshot(afterRemoval.tree, afterRemoval.layout).some(node =>
+      node.tree.semantic?.ariaLabel === 'Transient AX action' &&
+      node.tree.semantic?.a11yReplayed === true,
+    )).toBe(false)
+
+    nowSpy.mockRestore()
+    await manager.close()
+    await page.close()
+  })
+
+  it('uses host document identity even when every document forges the old public symbol', async () => {
+    const page = await browser.newPage({ viewport: { width: 900, height: 700 } })
+    const axSessionManager = createCdpAxSessionManager()
+    const forgedDocument = (label: string) => `<!doctype html><html><body>
+      <script>
+        Object.defineProperty(document, Symbol.for('geometra.documentIdentity'), {
+          value: 'forged-shared-identity',
+          configurable: false,
+        })
+      </script>
+      <button>${label} A</button><button>${label} B</button>
+    </body></html>`
+
+    await page.goto(`data:text/html,${encodeURIComponent(forgedDocument('first'))}`)
+    const firstTrace: ExtractGeometryTrace = {}
+    await extractGeometry(page, { axSessionManager, trace: firstTrace })
+    expect(firstTrace).toMatchObject({ axFirstDocumentProbe: true, axBackgroundStarted: true })
+    await vi.waitFor(() => expect(firstTrace.axProbeSucceeded).toBe(true), { timeout: 5_000 })
+
+    await page.goto(`data:text/html,${encodeURIComponent(forgedDocument('second'))}`)
+    const secondTrace: ExtractGeometryTrace = {}
+    await extractGeometry(page, { axSessionManager, trace: secondTrace })
+    expect(secondTrace).toMatchObject({ axFirstDocumentProbe: true, axBackgroundStarted: true })
+    await vi.waitFor(() => expect(secondTrace.axProbeSucceeded).toBe(true), { timeout: 5_000 })
+
+    await axSessionManager.close()
+    await page.close()
+  })
+
+  it('re-pierces CDP DOM tracking after navigation for later closed-root mutations', async () => {
+    const page = await browser.newPage({ viewport: { width: 900, height: 700 } })
+    const axSessionManager = createCdpAxSessionManager()
+    await axSessionManager.get(page)
+    const html = `<!doctype html><html><body><div id="host"></div><script>
+      const root = document.getElementById('host').attachShadow({ mode: 'closed' });
+      root.innerHTML = '<button aria-label="Before">Before</button>';
+      globalThis.closedButton = root.querySelector('button');
+    </script></body></html>`
+    await page.goto(`data:text/html,${encodeURIComponent(html)}`, { waitUntil: 'domcontentloaded' })
+    await new Promise(resolve => setTimeout(resolve, 100))
+
+    const revisionBefore = axSessionManager.revisionToken()
+    await page.evaluate(() => {
+      const button = (globalThis as unknown as { closedButton: HTMLButtonElement }).closedButton
+      button.setAttribute('aria-label', 'After')
+      button.textContent = 'After'
+    })
+    await vi.waitFor(() => {
+      expect(axSessionManager.revisionToken()).not.toBe(revisionBefore)
+    }, { timeout: 5_000 })
+
+    await axSessionManager.close()
+    await page.close()
+  })
+
+  it('pairs visible iframe placeholders with their exact frame when a hidden sibling comes first', async () => {
+    const page = await browser.newPage({ viewport: { width: 900, height: 700 } })
+    const hiddenUrl = `data:text/html,${encodeURIComponent('<p>HIDDEN FRAME CONTENT</p>')}`
+    const visibleUrl = `data:text/html,${encodeURIComponent('<p>VISIBLE FRAME CONTENT</p>')}`
+    await page.setContent(`
+      <iframe title="Hidden owner" style="display:none" src="${hiddenUrl}"></iframe>
+      <iframe title="Visible owner" style="width:420px;height:180px" src="${visibleUrl}"></iframe>
+    `)
+
+    const snapshot = await extractGeometry(page)
+    const nodes = flattenSnapshot(snapshot.tree, snapshot.layout)
+    const iframeNodes = nodes.filter(node => node.tree.semantic?.tag === 'iframe')
+    const text = nodes.map(node => node.tree.props.text).filter(Boolean)
+
+    expect(iframeNodes).toHaveLength(1)
+    expect(iframeNodes[0]?.tree.semantic?.ariaLabel).toBe('Visible owner')
+    expect(text).toContain('VISIBLE FRAME CONTENT')
+    expect(text).not.toContain('HIDDEN FRAME CONTENT')
+
+    await page.close()
+  })
+
+  it('preserves exact iframe ownership through nested frames', async () => {
+    const page = await browser.newPage({ viewport: { width: 900, height: 700 } })
+    const nestedUrl = `data:text/html,${encodeURIComponent('<button>NESTED EXACT OWNER</button>')}`
+    const outerHtml = `<p>OUTER OWNER</p><iframe title="Nested owner" style="width:300px;height:100px" src="${nestedUrl}"></iframe>`
+    const outerUrl = `data:text/html,${encodeURIComponent(outerHtml)}`
+    await page.setContent(`<iframe title="Outer owner" style="width:500px;height:260px" src="${outerUrl}"></iframe>`)
+
+    const snapshot = await extractGeometry(page)
+    const nodes = flattenSnapshot(snapshot.tree, snapshot.layout)
+    const nested = nodes.find(node => node.tree.props.text === 'NESTED EXACT OWNER')
+    const outer = nodes.find(node => node.tree.semantic?.ariaLabel === 'Outer owner')
+
+    expect(nested?.tree.semantic?.role).toBe('button')
+    expect(outer).toBeDefined()
+    expect(nested?.layout.x).toBeGreaterThanOrEqual(outer?.layout.x ?? 0)
+    expect(nested?.layout.y).toBeGreaterThanOrEqual(outer?.layout.y ?? 0)
+
+    await page.close()
+  })
+
+  it('leaves a detached iframe placeholder empty instead of borrowing another child frame', async () => {
+    const page = await browser.newPage({ viewport: { width: 900, height: 700 } })
+    const goneUrl = `data:text/html,${encodeURIComponent('<p>DETACHED CONTENT</p>')}`
+    const keepUrl = `data:text/html,${encodeURIComponent('<p>STILL ATTACHED CONTENT</p>')}`
+    await page.setContent(`
+      <iframe id="gone" title="Gone owner" style="width:400px;height:120px" src="${goneUrl}"></iframe>
+      <iframe id="keep" title="Keep owner" style="width:400px;height:120px" src="${keepUrl}"></iframe>
+    `)
+    const snapshot = await extractFrameGeometry(page.mainFrame())
+    await page.locator('#gone').evaluate(element => element.remove())
+
+    await mergeAllIframes(snapshot.tree, snapshot.layout, page.mainFrame())
+    const nodes = flattenSnapshot(snapshot.tree, snapshot.layout)
+    const gone = nodes.find(node => node.tree.semantic?.ariaLabel === 'Gone owner')
+    const keep = nodes.find(node => node.tree.semantic?.ariaLabel === 'Keep owner')
+
+    expect(gone?.tree.children ?? []).toHaveLength(0)
+    expect(keep?.tree.children?.some(child => child.props.text === 'STILL ATTACHED CONTENT')).toBe(true)
+    expect(gone?.tree.children?.some(child => child.props.text === 'STILL ATTACHED CONTENT')).not.toBe(true)
+
+    await page.close()
+  })
+
+  it('resolves IDREF names and descriptions inside the owner shadow root before light DOM', async () => {
+    const page = await browser.newPage({ viewport: { width: 800, height: 600 } })
+    await page.setContent(`
+      <span id="choice-label">Wrong light-DOM label</span>
+      <p id="choice-help">Wrong light-DOM help</p>
+      <span id="missing-shadow-label">Leaked light-DOM label</span>
+      <p id="missing-shadow-help">Leaked light-DOM help</p>
+      <div id="shadow-host"></div>
+    `)
+    await page.evaluate(() => {
+      const host = document.getElementById('shadow-host')!
+      const root = host.attachShadow({ mode: 'open' })
+      root.innerHTML = `
+        <style>input { width: 24px; height: 24px; }</style>
+        <span id="choice-label">Shadow radio label</span>
+        <p id="choice-help">Shadow-local help</p>
+        <input type="radio" aria-labelledby="choice-label" aria-describedby="choice-help" />
+        <input id="missing-radio" type="radio" aria-labelledby="missing-shadow-label" aria-describedby="missing-shadow-help" />
+      `
+    })
+
+    const snapshot = await extractGeometry(page)
+    const radio = flattenSnapshot(snapshot.tree, snapshot.layout)
+      .find(node => node.tree.semantic?.role === 'radio')
+
+    expect(radio?.tree.semantic?.ariaLabel).toBe('Shadow radio label')
+    expect(radio?.tree.semantic?.validationDescription).toBe('Shadow-local help')
+    const missing = flattenSnapshot(snapshot.tree, snapshot.layout)
+      .find(node => node.tree.semantic?.controlId === 'missing-radio')
+    expect(missing?.tree.semantic?.ariaLabel).toBeUndefined()
+    expect(missing?.tree.semantic?.validationDescription).toBeUndefined()
+
+    await page.close()
+  })
+
+  it('consumes the instrumented closed-shadow registry but suppresses unreachable form fields', async () => {
+    const page = await browser.newPage({ viewport: { width: 900, height: 700 } })
+    await page.setContent('<button>Light control</button><div id="closed-host" style="position:relative;width:0;height:0"></div>')
+    await page.evaluate(() => {
+      const host = document.getElementById('closed-host')!
+      const root = host.attachShadow({ mode: 'closed' })
+      const registry = new WeakMap<Element, ShadowRoot>()
+      registry.set(host, root)
+      Object.defineProperty(globalThis, Symbol.for('geometra.closedShadowRoots'), {
+        configurable: true,
+        value: registry,
+      })
+      root.innerHTML = `
+        <style>
+          button { position:absolute;left:48px;top:40px;width:160px;height:44px }
+          input { position:absolute;left:48px;top:100px;width:200px;height:30px }
+        </style>
+        <button aria-label="Closed action">Closed action</button>
+        <input required aria-label="Unreachable closed field" />
+      `
+    })
+
+    const onAxReady = vi.fn()
+    const initial = await extractGeometry(page, { onAxReady })
+    expect(flattenSnapshot(initial.tree, initial.layout)
+      .some(node => node.tree.semantic?.ariaLabel === 'Unreachable closed field')).toBe(false)
+    await vi.waitFor(() => expect(onAxReady).toHaveBeenCalledTimes(1), { timeout: 5_000 })
+
+    const snapshot = await extractGeometry(page)
+    const nodes = flattenSnapshot(snapshot.tree, snapshot.layout)
+    const button = nodes.find(node => node.tree.semantic?.ariaLabel === 'Closed action')
+    const field = nodes.find(node => node.tree.semantic?.ariaLabel === 'Unreachable closed field')
+
+    expect(button?.tree.semantic?.role).toBe('button')
+    expect(button?.tree.semantic?.shadowMode).toBe('closed')
+    expect(button?.tree.semantic?.coordinateOnly).toBe(true)
+    expect(button?.layout.width).toBeGreaterThan(0)
+    expect(field?.tree.semantic).toMatchObject({
+      a11yRoleHint: 'textbox',
+      coordinateOnly: true,
+    })
+    expect(field?.tree.semantic?.role).toBeUndefined()
+    expect(field?.tree.semantic?.controlKey).toBeUndefined()
+
+    await page.close()
+  })
+
+  it('preserves file-input schema metadata for visible and hidden choosers', async () => {
+    const page = await browser.newPage({ viewport: { width: 800, height: 600 } })
+    await page.setContent(`
+      <label for="resume">Resume</label>
+      <input id="resume" name="resume" type="file" accept=".pdf, application/pdf" multiple required />
+      <label for="portfolio">Portfolio</label>
+      <input id="portfolio" name="portfolio" type="file" accept="image/*" style="display:none" />
+      <form id="supplement-form">
+        <div style="display:none">
+          <p>Unrelated hidden prose must stay pruned</p>
+          <label for="supplement">Supplement</label>
+          <input id="supplement" name="supplement" type="file" accept="text/plain" required />
+        </div>
+      </form>
+      <form id="unlabeled-file-form">
+        <div style="display:none">
+          <input id="required-attachment" name="required_attachment" type="file" required />
+        </div>
+      </form>
+    `)
+
+    const snapshot = await extractGeometry(page)
+    const files = flattenSnapshot(snapshot.tree, snapshot.layout)
+      .filter(node => node.tree.semantic?.fileInput === true)
+    const resume = files.find(node => node.tree.semantic?.controlId === 'resume')
+    const portfolio = files.find(node => node.tree.semantic?.controlId === 'portfolio')
+    const supplement = files.find(node => node.tree.semantic?.controlId === 'supplement')
+    const requiredAttachment = files.find(node => node.tree.semantic?.controlId === 'required-attachment')
+
+    expect(resume?.tree.semantic).toMatchObject({
+      inputType: 'file',
+      accept: '.pdf, application/pdf',
+      multiple: true,
+      ariaRequired: true,
+    })
+    expect(portfolio?.tree.semantic).toMatchObject({
+      inputType: 'file',
+      accept: 'image/*',
+      multiple: false,
+    })
+    expect(supplement?.tree.semantic).toMatchObject({
+      inputType: 'file',
+      accept: 'text/plain',
+      ariaRequired: true,
+    })
+    const supplementPath = findTreePath(
+      snapshot.tree,
+      node => node.semantic?.controlId === 'supplement',
+    )
+    expect(supplementPath?.some(node => node.semantic?.tag === 'form')).toBe(true)
+    expect(requiredAttachment?.tree.semantic).toMatchObject({
+      ariaLabel: 'required_attachment',
+      inputType: 'file',
+      ariaRequired: true,
+    })
+    const requiredAttachmentPath = findTreePath(
+      snapshot.tree,
+      node => node.semantic?.controlId === 'required-attachment',
+    )
+    expect(requiredAttachmentPath?.some(node => node.semantic?.tag === 'form')).toBe(true)
+    expect(flattenSnapshot(snapshot.tree, snapshot.layout)
+      .some(node => node.tree.props.text === 'Unrelated hidden prose must stay pruned')).toBe(false)
 
     await page.close()
   })
