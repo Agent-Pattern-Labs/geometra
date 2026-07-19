@@ -31,4 +31,36 @@ describe('proxy WebSocket action contract', () => {
       message: 'Invalid setChecked message: label must be a trimmed, non-empty string',
     })
   })
+
+  it('rejects a newer explicit proxy-action protocol before acquiring a page', async () => {
+    const sent: string[] = []
+    const ws = { send: (value: string) => sent.push(value) } as unknown as WebSocket
+    const waitForPage = vi.fn(async () => { throw new Error('must not acquire page') }) as unknown as () => Promise<Page>
+
+    await handleClientMessage(
+      waitForPage,
+      ws,
+      JSON.stringify({
+        type: 'resize',
+        width: 100,
+        height: 100,
+        protocolVersion: 1,
+        geometryProtocolVersion: 1,
+        proxyActionProtocolVersion: 999,
+      }),
+      createFillLookupCache(),
+      async () => {},
+      () => {},
+      () => {},
+    )
+
+    expect(waitForPage).not.toHaveBeenCalled()
+    expect(JSON.parse(sent[0]!)).toMatchObject({
+      type: 'error',
+      geometryProtocolVersion: 1,
+      proxyActionProtocolVersion: 2,
+      protocolCapabilities: { transport: 'proxy' },
+      message: 'Client proxy-action protocol 999 is newer than proxy action protocol 2',
+    })
+  })
 })

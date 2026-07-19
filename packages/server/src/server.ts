@@ -13,6 +13,18 @@ import {
 } from '@geometra/core'
 import type { UIElement, EventHandlers } from '@geometra/core'
 import { diffLayout, coalescePatches, PROTOCOL_VERSION, isProtocolCompatible, CLOSE_AUTH_FAILED, CLOSE_FORBIDDEN } from './protocol.js'
+
+const NATIVE_PROTOCOL_METADATA = {
+  protocolVersion: PROTOCOL_VERSION,
+  geometryProtocolVersion: PROTOCOL_VERSION,
+  protocolCapabilities: {
+    transport: 'native',
+    requestScopedAcks: true,
+    proxyActions: false,
+    exactFieldIdentity: false,
+    binaryFraming: true,
+  },
+} as const
 import type { ServerMessage, ClientMessage, ServerDataMessage } from './protocol.js'
 import { encodeBinaryFrameJson } from './binary-frame.js'
 
@@ -197,12 +209,12 @@ export async function createServer(
         if (patches.length === 0) return true
         // Patch streams are only safe when the render tree is byte-for-byte stable.
         if (patches.length > 20) {
-          msg = { type: 'frame', layout, tree: currentTree, protocolVersion: PROTOCOL_VERSION }
+          msg = { type: 'frame', layout, tree: currentTree, ...NATIVE_PROTOCOL_METADATA }
         } else {
-          msg = { type: 'patch', patches, protocolVersion: PROTOCOL_VERSION }
+          msg = { type: 'patch', patches, ...NATIVE_PROTOCOL_METADATA }
         }
       } else {
-        msg = { type: 'frame', layout, tree: currentTree, protocolVersion: PROTOCOL_VERSION }
+        msg = { type: 'frame', layout, tree: currentTree, ...NATIVE_PROTOCOL_METADATA }
       }
 
       prevLayout = layout
@@ -218,7 +230,7 @@ export async function createServer(
           }
           const clientMsg: ServerMessage =
             needsResync.has(client)
-              ? { type: 'frame', layout, tree: currentTree, protocolVersion: PROTOCOL_VERSION }
+              ? { type: 'frame', layout, tree: currentTree, ...NATIVE_PROTOCOL_METADATA }
               : msg
           if (needsResync.has(client)) needsResync.delete(client)
           const json = JSON.stringify(clientMsg)
@@ -243,7 +255,7 @@ export async function createServer(
         console.error('Geometra server error:', err)
       }
       // Send error to clients
-      const errorMsg: ServerMessage = { type: 'error', message: String(err), protocolVersion: PROTOCOL_VERSION }
+      const errorMsg: ServerMessage = { type: 'error', message: String(err), ...NATIVE_PROTOCOL_METADATA }
       const data = JSON.stringify(errorMsg)
       for (const client of clients) {
         if (client.readyState === client.OPEN) {
@@ -285,7 +297,7 @@ export async function createServer(
         type: 'frame',
         layout: prevLayout,
         tree: currentTree,
-        protocolVersion: PROTOCOL_VERSION,
+        ...NATIVE_PROTOCOL_METADATA,
       }
       const json = JSON.stringify(msg)
       if (clientBinaryFraming.get(ws)) {
@@ -306,7 +318,7 @@ export async function createServer(
           const ack: ServerMessage = {
             type: 'ack',
             requestId,
-            protocolVersion: PROTOCOL_VERSION,
+            ...NATIVE_PROTOCOL_METADATA,
           }
           ws.send(JSON.stringify(ack))
         }
@@ -316,12 +328,24 @@ export async function createServer(
             message,
             ...(code !== undefined ? { code } : {}),
             ...(requestId ? { requestId } : {}),
-            protocolVersion: PROTOCOL_VERSION,
+            ...NATIVE_PROTOCOL_METADATA,
           }
           ws.send(JSON.stringify(errorMsg))
         }
-        if (!isProtocolCompatible(msg.protocolVersion, PROTOCOL_VERSION)) {
-          sendError(`Client protocol ${msg.protocolVersion} is newer than server protocol ${PROTOCOL_VERSION}`)
+        const nativeInputMessage = msg.type === 'event' || msg.type === 'key' ||
+          msg.type === 'composition' || msg.type === 'resize'
+        // @geometra/mcp@1.64.0 accidentally put proxy-action v2 in the legacy
+        // geometry field. Accept that one known envelope for native inputs so
+        // upgrading either side repairs the released incompatibility.
+        const legacyConflatedProxyVersion = msg.geometryProtocolVersion === undefined &&
+          msg.proxyActionProtocolVersion === undefined &&
+          msg.protocolVersion === 2 &&
+          nativeInputMessage
+        const clientGeometryProtocolVersion = legacyConflatedProxyVersion
+          ? PROTOCOL_VERSION
+          : msg.geometryProtocolVersion ?? msg.protocolVersion
+        if (!isProtocolCompatible(clientGeometryProtocolVersion, PROTOCOL_VERSION)) {
+          sendError(`Client geometry protocol ${clientGeometryProtocolVersion} is newer than server geometry protocol ${PROTOCOL_VERSION}`)
           return
         }
         if (options.onMessage) {
@@ -449,7 +473,7 @@ export async function createServer(
       type: 'data',
       channel,
       payload,
-      protocolVersion: PROTOCOL_VERSION,
+      ...NATIVE_PROTOCOL_METADATA,
     }
     const json = JSON.stringify(dataMsg)
     for (const client of clients) {

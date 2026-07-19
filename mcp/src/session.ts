@@ -469,6 +469,20 @@ export interface Session {
   tree: Record<string, unknown> | null
   url: string
   updateRevision: number
+  /** Negotiated owner of the WebSocket endpoint. */
+  peerTransport?: 'native' | 'proxy'
+  /** Negotiated shared geometry protocol version. */
+  peerGeometryProtocolVersion?: number
+  /** Negotiated browser-only action protocol version. */
+  peerProxyActionProtocolVersion?: number
+  /** True when the peer advertised the split protocol contract explicitly. */
+  peerAdvertisedSplitProtocol?: boolean
+  peerProtocolCapabilities?: {
+    requestScopedAcks?: boolean
+    proxyActions?: boolean
+    exactFieldIdentity?: boolean
+    binaryFraming?: boolean
+  }
   /** Present when this session owns a child geometra-proxy process (pageUrl connect). */
   proxyChild?: ChildProcess
   proxyRuntime?: EmbeddedProxyRuntime
@@ -581,8 +595,153 @@ const FILL_BATCH_TOGGLE_FIELD_TIMEOUT_MS = 225
 const FILL_BATCH_FILE_FIELD_TIMEOUT_MS = 5000
 const FILL_BATCH_MAX_TIMEOUT_MS = 60_000
 const SESSION_RECONNECT_TIMEOUT_MS = 5_000
-const PROXY_PROTOCOL_VERSION = 2
+const GEOMETRY_PROTOCOL_VERSION = 1
+const PROXY_ACTION_PROTOCOL_VERSION = 2
 let nextRequestSequence = 0
+
+type InboundServerMessage = Record<string, unknown> & { type: string }
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null && !Array.isArray(value)
+}
+
+function optionalFiniteProtocolVersion(value: unknown, field: string): number | undefined {
+  if (value === undefined) return undefined
+  if (typeof value !== 'number' || !Number.isFinite(value)) {
+    throw new Error(`Invalid Geometra server message: ${field} must be a finite number when present`)
+  }
+  return value
+}
+
+function validatePatchMessage(patches: unknown): void {
+  if (!Array.isArray(patches)) {
+    throw new Error('Invalid Geometra server patch: patches must be an array')
+  }
+  for (const patch of patches) {
+    if (!isRecord(patch) || !Array.isArray(patch.path) || !patch.path.every(
+      segment => typeof segment === 'number' && Number.isInteger(segment) && segment >= 0,
+    )) {
+      throw new Error('Invalid Geometra server patch: every patch needs a non-negative integer path')
+    }
+    for (const key of ['x', 'y', 'width', 'height'] as const) {
+      const value = patch[key]
+      if (value === undefined) continue
+      if (typeof value !== 'number' || !Number.isFinite(value) || (
+        (key === 'width' || key === 'height') && value < 0
+      )) {
+        throw new Error(`Invalid Geometra server patch: ${key} must be a finite${key === 'width' || key === 'height' ? ' non-negative' : ''} number`)
+      }
+    }
+  }
+}
+
+function parseInboundServerMessage(data: WebSocket.Data): InboundServerMessage {
+  let parsed: unknown
+  try {
+    parsed = JSON.parse(String(data)) as unknown
+  } catch {
+    throw new Error('Invalid Geometra server message: expected valid JSON')
+  }
+  if (!isRecord(parsed) || typeof parsed.type !== 'string') {
+    throw new Error('Invalid Geometra server message: expected an object with a string type')
+  }
+
+  const geometryVersion = optionalFiniteProtocolVersion(parsed.geometryProtocolVersion, 'geometryProtocolVersion')
+  const proxyActionVersion = optionalFiniteProtocolVersion(parsed.proxyActionProtocolVersion, 'proxyActionProtocolVersion')
+  const legacyVersion = optionalFiniteProtocolVersion(parsed.protocolVersion, 'protocolVersion')
+  if (geometryVersion !== undefined && geometryVersion > GEOMETRY_PROTOCOL_VERSION) {
+    throw new Error(
+      `Server geometry protocol ${geometryVersion} is newer than MCP geometry protocol ${GEOMETRY_PROTOCOL_VERSION}`,
+    )
+  }
+  if (proxyActionVersion !== undefined && proxyActionVersion > PROXY_ACTION_PROTOCOL_VERSION) {
+    throw new Error(
+      `Server proxy-action protocol ${proxyActionVersion} is newer than MCP proxy-action protocol ${PROXY_ACTION_PROTOCOL_VERSION}`,
+    )
+  }
+  if (geometryVersion === undefined && proxyActionVersion === undefined && legacyVersion !== undefined && legacyVersion > PROXY_ACTION_PROTOCOL_VERSION) {
+    throw new Error(
+      `Server protocol ${legacyVersion} is newer than MCP's supported geometry/proxy protocols`,
+    )
+  }
+
+  if (parsed.type === 'frame') {
+    if (!isRecord(parsed.layout) || !isRecord(parsed.tree)) {
+      throw new Error('Invalid Geometra server frame: layout and tree must be objects')
+    }
+    for (const key of ['x', 'y', 'width', 'height'] as const) {
+      const value = parsed.layout[key]
+      if (typeof value !== 'number' || !Number.isFinite(value) || (
+        (key === 'width' || key === 'height') && value < 0
+      )) {
+        throw new Error(`Invalid Geometra server frame: layout.${key} is invalid`)
+      }
+    }
+    if (!Array.isArray(parsed.layout.children)) {
+      throw new Error('Invalid Geometra server frame: layout.children must be an array')
+    }
+  } else if (parsed.type === 'patch') {
+    validatePatchMessage(parsed.patches)
+  } else if (parsed.type === 'error' && typeof parsed.message !== 'string') {
+    throw new Error('Invalid Geometra server error: message must be a string')
+  } else if (parsed.type === 'ack' && parsed.requestId !== undefined && typeof parsed.requestId !== 'string') {
+    throw new Error('Invalid Geometra server ack: requestId must be a string when present')
+  }
+  return parsed as InboundServerMessage
+}
+
+function updatePeerProtocol(session: Session, msg: InboundServerMessage): void {
+  const geometryVersion = typeof msg.geometryProtocolVersion === 'number'
+    ? msg.geometryProtocolVersion
+    : undefined
+  const proxyActionVersion = typeof msg.proxyActionProtocolVersion === 'number'
+    ? msg.proxyActionProtocolVersion
+    : undefined
+  const legacyVersion = typeof msg.protocolVersion === 'number' ? msg.protocolVersion : undefined
+  const capabilities = isRecord(msg.protocolCapabilities) ? msg.protocolCapabilities : undefined
+  const transport = capabilities?.transport
+
+  if (geometryVersion !== undefined || proxyActionVersion !== undefined || capabilities) {
+    session.peerAdvertisedSplitProtocol = true
+  }
+  session.peerGeometryProtocolVersion = geometryVersion ?? (
+    legacyVersion === PROXY_ACTION_PROTOCOL_VERSION ? GEOMETRY_PROTOCOL_VERSION : legacyVersion
+  ) ?? session.peerGeometryProtocolVersion ?? GEOMETRY_PROTOCOL_VERSION
+  session.peerProxyActionProtocolVersion = proxyActionVersion ?? (
+    legacyVersion === PROXY_ACTION_PROTOCOL_VERSION ? legacyVersion : session.peerProxyActionProtocolVersion
+  )
+  if (transport === 'native' || transport === 'proxy') {
+    session.peerTransport = transport
+  } else if (proxyActionVersion !== undefined || legacyVersion === PROXY_ACTION_PROTOCOL_VERSION) {
+    session.peerTransport = 'proxy'
+  }
+  if (capabilities) {
+    session.peerProtocolCapabilities = {
+      requestScopedAcks: typeof capabilities.requestScopedAcks === 'boolean' ? capabilities.requestScopedAcks : undefined,
+      proxyActions: typeof capabilities.proxyActions === 'boolean' ? capabilities.proxyActions : undefined,
+      exactFieldIdentity: typeof capabilities.exactFieldIdentity === 'boolean' ? capabilities.exactFieldIdentity : undefined,
+      binaryFraming: typeof capabilities.binaryFraming === 'boolean' ? capabilities.binaryFraming : undefined,
+    }
+  }
+}
+
+function outboundProtocolMetadata(session: Session): Record<string, number> {
+  const geometryVersion = Math.min(
+    session.peerGeometryProtocolVersion ?? GEOMETRY_PROTOCOL_VERSION,
+    GEOMETRY_PROTOCOL_VERSION,
+  )
+  const proxyActionVersion = session.peerProxyActionProtocolVersion === undefined
+    ? undefined
+    : Math.min(session.peerProxyActionProtocolVersion, PROXY_ACTION_PROTOCOL_VERSION)
+  if (session.peerAdvertisedSplitProtocol) {
+    return {
+      protocolVersion: proxyActionVersion ?? geometryVersion,
+      geometryProtocolVersion: geometryVersion,
+      ...(proxyActionVersion !== undefined ? { proxyActionProtocolVersion: proxyActionVersion } : {}),
+    }
+  }
+  return { protocolVersion: proxyActionVersion ?? geometryVersion }
+}
 
 export type ProxyFillField =
   | { kind: 'auto'; fieldId?: string; fieldKey?: string; fieldLabel: string; value: string | boolean; exact?: boolean }
@@ -604,6 +763,28 @@ function invalidateSessionCaches(session: Session): void {
   session.cachedA11y = null
   session.cachedA11yRevision = -1
   session.cachedFormSchemas?.clear()
+}
+
+function applyInboundSessionMessage(session: Session, data: WebSocket.Data): InboundServerMessage {
+  const msg = parseInboundServerMessage(data)
+  updatePeerProtocol(session, msg)
+  if (msg.type === 'frame') {
+    session.layout = msg.layout as Record<string, unknown>
+    session.tree = msg.tree as Record<string, unknown>
+    session.updateRevision++
+    invalidateSessionCaches(session)
+  } else if (msg.type === 'patch' && session.layout) {
+    applyPatches(session.layout, msg.patches as Array<{
+      path: number[]
+      x?: number
+      y?: number
+      width?: number
+      height?: number
+    }>)
+    session.updateRevision++
+    invalidateSessionCaches(session)
+  }
+  return msg
 }
 
 function sameReusableProxyEntry(
@@ -1535,7 +1716,10 @@ export function connect(
       if (!opts?.skipInitialResize) {
         const width = opts?.width ?? 1024
         const height = opts?.height ?? 768
-        ws.send(JSON.stringify({ type: 'resize', width, height, protocolVersion: PROXY_PROTOCOL_VERSION }))
+        // Start with the shared GEOM v1 envelope. The first frame explicitly
+        // advertises whether this is a native server or a proxy-action peer.
+        // Legacy proxy v1/v2 endpoints both accept this compatibility hello.
+        ws.send(JSON.stringify({ type: 'resize', width, height, protocolVersion: GEOMETRY_PROTOCOL_VERSION }))
       }
       if (opts?.awaitInitialFrame === false && !resolved) {
         resolved = true
@@ -1558,12 +1742,8 @@ export function connect(
       noteSessionSocketActivity(session, ws)
       if (session.ws !== ws) return
       try {
-        const msg = JSON.parse(String(data))
+        const msg = applyInboundSessionMessage(session, data)
         if (msg.type === 'frame') {
-          session.layout = msg.layout
-          session.tree = msg.tree
-          session.updateRevision++
-          invalidateSessionCaches(session)
           const connectTrace = session.connectTrace
           const firstFrame = connectTrace?.firstFrameMs === undefined
           if (connectTrace && connectTrace.firstFrameMs === undefined) {
@@ -1585,12 +1765,24 @@ export function connect(
               lateInitialFrame: session.connectTrace?.resolvedWithoutInitialFrame === true,
             })
           }
-        } else if (msg.type === 'patch' && session.layout) {
-          applyPatches(session.layout, msg.patches)
-          session.updateRevision++
+        } else if (msg.type === 'error' && !resolved) {
+          resolved = true
+          clearTimeout(timeout)
+          try { ws.close() } catch { /* ignore */ }
+          reject(new Error(typeof msg.message === 'string' ? msg.message : 'Geometra server error'))
+        }
+      } catch (err) {
+        try { ws.close(1002, 'Invalid protocol message') } catch { /* ignore */ }
+        if (!resolved) {
+          resolved = true
+          clearTimeout(timeout)
+          reject(err instanceof Error ? err : new Error(String(err)))
+        } else {
+          session.layout = null
+          session.tree = null
           invalidateSessionCaches(session)
         }
-      } catch { /* ignore malformed messages */ }
+      }
     })
 
     ws.on('error', (err) => {
@@ -1926,19 +2118,9 @@ function bindReconnectedSocket(session: Session, ws: WebSocket): void {
     noteSessionSocketActivity(session, ws)
     if (session.ws !== ws) return
     try {
-      const msg = JSON.parse(String(data))
-      if (msg.type === 'frame') {
-        session.layout = msg.layout
-        session.tree = msg.tree
-        session.updateRevision++
-        invalidateSessionCaches(session)
-      } else if (msg.type === 'patch' && session.layout) {
-        applyPatches(session.layout, msg.patches)
-        session.updateRevision++
-        invalidateSessionCaches(session)
-      }
+      applyInboundSessionMessage(session, data)
     } catch {
-      /* ignore malformed messages */
+      try { ws.close(1002, 'Invalid protocol message') } catch { /* ignore */ }
     }
   })
 
@@ -2023,7 +2205,12 @@ async function sendResizeAndWaitForUpdate(
 ): Promise<UpdateWaitResult> {
   await ensureSessionConnected(session)
   const startRevision = session.updateRevision
-  session.ws.send(JSON.stringify({ type: 'resize', width, height, protocolVersion: PROXY_PROTOCOL_VERSION }))
+  session.ws.send(JSON.stringify({
+    type: 'resize',
+    width,
+    height,
+    ...outboundProtocolMetadata(session),
+  }))
   return await waitForNextUpdate(session, timeoutMs, undefined, startRevision)
 }
 
@@ -2050,7 +2237,7 @@ export function sendType(session: Session, text: string, timeoutMs?: number): Pr
     for (const char of text) {
       const keyEvent = {
         type: 'key',
-        protocolVersion: PROXY_PROTOCOL_VERSION,
+        ...outboundProtocolMetadata(session),
         eventType: 'onKeyDown',
         key: char,
         code: `Key${char.toUpperCase()}`,
@@ -4573,15 +4760,27 @@ async function sendAndWaitForUpdate(
   await ensureSessionConnected(session)
   const requestId = `req-${++nextRequestSequence}`
   const startRevision = session.updateRevision
-  session.ws.send(JSON.stringify({ ...message, requestId, protocolVersion: PROXY_PROTOCOL_VERSION }))
   const requiresExactFieldIdentity = typeof message.fieldKey === 'string' || (
     message.type === 'fillFields' &&
     Array.isArray(message.fields) &&
     message.fields.some(field => typeof field === 'object' && field !== null && typeof (field as { fieldKey?: unknown }).fieldKey === 'string')
   )
+  if (requiresExactFieldIdentity && session.peerProxyActionProtocolVersion !== undefined && (
+    session.peerProxyActionProtocolVersion < PROXY_ACTION_PROTOCOL_VERSION ||
+    session.peerProtocolCapabilities?.exactFieldIdentity === false
+  )) {
+    throw new Error(
+      `Proxy protocol ${session.peerProxyActionProtocolVersion} cannot guarantee exact field identity; protocol ${PROXY_ACTION_PROTOCOL_VERSION}+ is required. Update and reconnect the Geometra proxy.`,
+    )
+  }
+  session.ws.send(JSON.stringify({
+    ...message,
+    requestId,
+    ...outboundProtocolMetadata(session),
+  }))
   return await waitForNextUpdate(session, timeoutMs, requestId, startRevision, {
     ...opts,
-    ...(requiresExactFieldIdentity ? { requiredProtocolVersion: PROXY_PROTOCOL_VERSION } : {}),
+    ...(requiresExactFieldIdentity ? { requiredProtocolVersion: PROXY_ACTION_PROTOCOL_VERSION } : {}),
   })
 }
 
@@ -4602,7 +4801,8 @@ function waitForNextUpdate(
 
     const onMessage = (data: WebSocket.Data) => {
       try {
-        const msg = JSON.parse(String(data))
+        const msg = parseInboundServerMessage(data)
+        updatePeerProtocol(session, msg)
         const messageRequestId = typeof msg.requestId === 'string' ? msg.requestId : undefined
 
         if (requestId) {
@@ -4621,7 +4821,11 @@ function waitForNextUpdate(
             return
           }
           if (msg.type === 'ack' && messageRequestId === requestId) {
-            const peerProtocolVersion = typeof msg.protocolVersion === 'number' ? msg.protocolVersion : undefined
+            const peerProtocolVersion = typeof msg.proxyActionProtocolVersion === 'number'
+              ? msg.proxyActionProtocolVersion
+              : typeof msg.protocolVersion === 'number'
+                ? msg.protocolVersion
+                : session.peerProxyActionProtocolVersion
             if (opts?.requiredProtocolVersion !== undefined && (
               peerProtocolVersion === undefined || peerProtocolVersion < opts.requiredProtocolVersion
             )) {
@@ -4664,7 +4868,10 @@ function waitForNextUpdate(
             ...(msg.result !== undefined ? { result: msg.result } : {}),
           })
         }
-      } catch { /* ignore */ }
+      } catch (err) {
+        cleanup()
+        reject(err instanceof Error ? err : new Error(String(err)))
+      }
     }
 
     // Expose timeout explicitly so action handlers can tell the user the result is ambiguous.

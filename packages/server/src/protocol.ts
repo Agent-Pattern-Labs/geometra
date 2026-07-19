@@ -1,8 +1,16 @@
 import type { ComputedLayout } from 'textura'
 import { isFinitePlainNumber, type UIElement } from '@geometra/core'
 
-/** Increment when the wire message shape changes in a non-backward-compatible way. */
-export const PROTOCOL_VERSION = 1
+/** Increment when the shared geometry frame/event wire changes incompatibly. */
+export const GEOMETRY_PROTOCOL_VERSION = 1
+
+/**
+ * Backward-compatible name for the geometry protocol version.
+ *
+ * Browser-only automation has its own version in `@geometra/proxy`; do not
+ * reuse this value for proxy actions.
+ */
+export const PROTOCOL_VERSION = GEOMETRY_PROTOCOL_VERSION
 
 /** WebSocket close code: connection rejected by onConnection hook. */
 export const CLOSE_AUTH_FAILED = 4001
@@ -36,8 +44,28 @@ export function isProtocolCompatible(
   return peerVersion <= currentVersion
 }
 
+export interface ProtocolCapabilities {
+  /** Which implementation owns this WebSocket endpoint. */
+  transport?: 'native' | 'proxy'
+  /** This peer can correlate action results with `requestId`. */
+  requestScopedAcks?: boolean
+  /** This peer implements browser-only automation messages. */
+  proxyActions?: boolean
+  /** Browser actions can resolve exact authored field identities. */
+  exactFieldIdentity?: boolean
+  /** This peer supports binary geometry frames after resize negotiation. */
+  binaryFraming?: boolean
+}
+
 interface VersionedMessage {
+  /** Legacy version field. For native messages this is the geometry version. */
   protocolVersion?: number
+  /** Explicit version of the shared geometry frame/event wire. */
+  geometryProtocolVersion?: number
+  /** Explicit version of the browser-only action wire, when supported. */
+  proxyActionProtocolVersion?: number
+  /** Explicitly advertised wire capabilities. */
+  protocolCapabilities?: ProtocolCapabilities
 }
 
 interface CorrelatedMessage {
@@ -91,7 +119,7 @@ export type ClientMessage =
       type: 'resize'
       width: number
       height: number
-      /** Optional capability negotiation (v1+). */
+      /** Optional transport capability negotiation (v1+). */
       capabilities?: { binaryFraming?: boolean }
     })
   /**

@@ -69,7 +69,7 @@ describe('protocol compatibility', () => {
         const msg = JSON.parse(String(raw)) as { type: string; message?: string }
         if (msg.type !== 'error') return
         clearTimeout(timeout)
-        expect(msg.message).toContain('newer than server protocol')
+        expect(msg.message).toContain('newer than server geometry protocol')
         ws.close()
         resolve()
       })
@@ -81,6 +81,53 @@ describe('protocol compatibility', () => {
     }).finally(() => {
       server.close()
     })
+  })
+
+  it('accepts the v1.64 MCP legacy v2 envelope for native input messages', async () => {
+    let clicked = false
+    const { server, port } = await createStandaloneTestServer(
+      () => box({
+        width: 40,
+        height: 20,
+        onClick: () => { clicked = true },
+      }, []),
+      { width: 200, height: 100 },
+    )
+
+    await new Promise<void>((resolve, reject) => {
+      const ws = new WebSocket(`ws://127.0.0.1:${port}`)
+      let sent = false
+      const timeout = setTimeout(() => reject(new Error('timed out waiting for compatibility ack')), 5000)
+
+      ws.on('message', raw => {
+        const msg = JSON.parse(String(raw)) as { type?: string; requestId?: string; message?: string }
+        if (msg.type === 'frame' && !sent) {
+          sent = true
+          ws.send(JSON.stringify({
+            type: 'event',
+            eventType: 'onClick',
+            x: 10,
+            y: 10,
+            requestId: 'legacy-v164-click',
+            protocolVersion: 2,
+          }))
+          return
+        }
+        if (msg.type === 'ack' && msg.requestId === 'legacy-v164-click') {
+          clearTimeout(timeout)
+          ws.close()
+          resolve()
+          return
+        }
+        if (msg.type === 'error') {
+          clearTimeout(timeout)
+          reject(new Error(msg.message ?? 'unexpected error'))
+        }
+      })
+      ws.on('error', reject)
+    }).finally(() => server.close())
+
+    expect(clicked).toBe(true)
   })
 
   it('sends request-scoped ack for handled no-op actions', async () => {

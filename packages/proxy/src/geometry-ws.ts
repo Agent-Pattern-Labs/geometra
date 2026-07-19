@@ -38,10 +38,32 @@ import {
   isSetCheckedMessage,
   isSelectOptionMessage,
   isWheelMessage,
+  GEOMETRY_PROTOCOL_VERSION,
+  PROXY_ACTION_PROTOCOL_VERSION,
   PROXY_PROTOCOL_VERSION,
 } from './types.js'
 
 const DOM_OBSERVER_BINDINGS = new WeakSet<Page>()
+const PROXY_PROTOCOL_CAPABILITIES = {
+  transport: 'proxy',
+  requestScopedAcks: true,
+  proxyActions: true,
+  exactFieldIdentity: true,
+} as const
+const PROXY_GEOMETRY_METADATA = {
+  protocolVersion: GEOMETRY_PROTOCOL_VERSION,
+  geometryProtocolVersion: GEOMETRY_PROTOCOL_VERSION,
+  proxyActionProtocolVersion: PROXY_ACTION_PROTOCOL_VERSION,
+  protocolCapabilities: PROXY_PROTOCOL_CAPABILITIES,
+} as const
+const PROXY_ACTION_METADATA = {
+  // Keep the legacy field at v2 so @geometra/mcp@1.64.x clients installed
+  // through their caret proxy dependency continue to accept exact-field acks.
+  protocolVersion: PROXY_PROTOCOL_VERSION,
+  geometryProtocolVersion: GEOMETRY_PROTOCOL_VERSION,
+  proxyActionProtocolVersion: PROXY_ACTION_PROTOCOL_VERSION,
+  protocolCapabilities: PROXY_PROTOCOL_CAPABILITIES,
+} as const
 
 async function bindDomObserverBridge(page: Page, scheduleExtract: () => void): Promise<void> {
   if (DOM_OBSERVER_BINDINGS.has(page)) return
@@ -99,6 +121,27 @@ function isProtocolCompatible(peerVersion: number | undefined): boolean {
   if (peerVersion === undefined) return true
   if (typeof peerVersion !== 'number' || !Number.isFinite(peerVersion)) return false
   return peerVersion <= PROXY_PROTOCOL_VERSION
+}
+
+function protocolCompatibilityError(msg: ParsedClientMessage): string | null {
+  const record = msg as {
+    protocolVersion?: unknown
+    geometryProtocolVersion?: unknown
+    proxyActionProtocolVersion?: unknown
+  }
+  const geometryVersion = record.geometryProtocolVersion
+  if (geometryVersion !== undefined && (
+    typeof geometryVersion !== 'number' ||
+    !Number.isFinite(geometryVersion) ||
+    geometryVersion > GEOMETRY_PROTOCOL_VERSION
+  )) {
+    return `Client geometry protocol ${String(geometryVersion)} is newer than proxy geometry protocol ${GEOMETRY_PROTOCOL_VERSION}`
+  }
+  const actionVersion = record.proxyActionProtocolVersion ?? record.protocolVersion
+  if (!isProtocolCompatible(actionVersion as number | undefined)) {
+    return `Client proxy-action protocol ${String(actionVersion)} is newer than proxy action protocol ${PROXY_ACTION_PROTOCOL_VERSION}`
+  }
+  return null
 }
 
 function cloneLayout(layout: LayoutSnapshot): LayoutSnapshot {
@@ -160,7 +203,7 @@ export async function handleClientMessage(
       type: 'error',
       message,
       ...(requestId ? { requestId } : {}),
-      protocolVersion: PROXY_PROTOCOL_VERSION,
+      ...PROXY_ACTION_METADATA,
     }))
   }
 
@@ -180,9 +223,9 @@ export async function handleClientMessage(
     return
   }
   const msg = parsed as ParsedClientMessage
-  const pv = 'protocolVersion' in msg ? msg.protocolVersion : undefined
-  if (!isProtocolCompatible(pv)) {
-    sendWireError(`Client protocol ${String(pv)} is newer than proxy protocol ${PROXY_PROTOCOL_VERSION}`, requestId)
+  const compatibilityError = protocolCompatibilityError(msg)
+  if (compatibilityError) {
+    sendWireError(compatibilityError, requestId)
     return
   }
 
@@ -625,7 +668,7 @@ export function startGeometryWebSocket(options: {
           type: 'ack',
           ...(requestId ? { requestId } : {}),
           ...(result !== undefined ? { result } : {}),
-          protocolVersion: PROXY_PROTOCOL_VERSION,
+          ...PROXY_ACTION_METADATA,
         }))
       }
     }
@@ -633,7 +676,7 @@ export function startGeometryWebSocket(options: {
 
   function sendPendingInputErrors(message: string) {
     if (pendingInputAcks.length === 0) {
-      const errText = JSON.stringify({ type: 'error', message, protocolVersion: PROXY_PROTOCOL_VERSION })
+      const errText = JSON.stringify({ type: 'error', message, ...PROXY_ACTION_METADATA })
       for (const ws of clients) {
         if (ws.readyState === ws.OPEN) ws.send(errText)
       }
@@ -648,7 +691,7 @@ export function startGeometryWebSocket(options: {
           type: 'error',
           message,
           ...(requestId ? { requestId } : {}),
-          protocolVersion: PROXY_PROTOCOL_VERSION,
+          ...PROXY_ACTION_METADATA,
         }))
       }
     }
@@ -658,15 +701,15 @@ export function startGeometryWebSocket(options: {
     const treeChanged = prevTreeJson !== snap.treeJson
 
     let outbound:
-      | { type: 'frame'; layout: LayoutSnapshot; tree: GeometrySnapshot['tree']; protocolVersion: number }
-      | { type: 'patch'; patches: ReturnType<typeof diffLayout>; protocolVersion: number }
+      | ({ type: 'frame'; layout: LayoutSnapshot; tree: GeometrySnapshot['tree'] } & typeof PROXY_GEOMETRY_METADATA)
+      | ({ type: 'patch'; patches: ReturnType<typeof diffLayout> } & typeof PROXY_GEOMETRY_METADATA)
 
     if (!prevLayout || treeChanged) {
       outbound = {
         type: 'frame',
         layout: snap.layout,
         tree: snap.tree,
-        protocolVersion: PROXY_PROTOCOL_VERSION,
+        ...PROXY_GEOMETRY_METADATA,
       }
       prevLayout = cloneLayout(snap.layout)
       prevTreeJson = snap.treeJson
@@ -681,10 +724,10 @@ export function startGeometryWebSocket(options: {
           type: 'frame',
           layout: snap.layout,
           tree: snap.tree,
-          protocolVersion: PROXY_PROTOCOL_VERSION,
+          ...PROXY_GEOMETRY_METADATA,
         }
       } else {
-        outbound = { type: 'patch', patches, protocolVersion: PROXY_PROTOCOL_VERSION }
+        outbound = { type: 'patch', patches, ...PROXY_GEOMETRY_METADATA }
       }
       prevLayout = cloneLayout(snap.layout)
       prevTreeJson = snap.treeJson
@@ -799,7 +842,7 @@ export function startGeometryWebSocket(options: {
         type: 'frame',
         layout: snap.layout,
         tree: snap.tree,
-        protocolVersion: PROXY_PROTOCOL_VERSION,
+        ...PROXY_GEOMETRY_METADATA,
       })
       if (ws.readyState === ws.OPEN) ws.send(text)
     }

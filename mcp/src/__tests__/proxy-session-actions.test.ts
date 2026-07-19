@@ -375,4 +375,101 @@ describe('proxy-backed MCP actions', () => {
       await new Promise<void>((resolve, reject) => wss.close(err => (err ? reject(err) : resolve())))
     }
   })
+
+  it('rejects a server frame from a newer unnegotiated protocol', async () => {
+    const wss = new WebSocketServer({ port: 0 })
+    wss.on('connection', ws => {
+      ws.send(JSON.stringify({
+        type: 'frame',
+        protocolVersion: 999,
+        layout: { x: 0, y: 0, width: 10, height: 10, children: [] },
+        tree: { kind: 'box', props: {}, children: [] },
+      }))
+    })
+    const port = await new Promise<number>((resolve, reject) => {
+      wss.once('listening', () => {
+        const address = wss.address()
+        if (typeof address === 'object' && address) resolve(address.port)
+        else reject(new Error('Failed to resolve ephemeral WebSocket port'))
+      })
+      wss.once('error', reject)
+    })
+
+    try {
+      await expect(connect(`ws://127.0.0.1:${port}`)).rejects.toThrow(
+        "Server protocol 999 is newer than MCP's supported geometry/proxy protocols",
+      )
+    } finally {
+      disconnect()
+      await new Promise<void>((resolve, reject) => wss.close(err => (err ? reject(err) : resolve())))
+    }
+  })
+
+  it('surfaces an initial wire error instead of timing out', async () => {
+    const wss = new WebSocketServer({ port: 0 })
+    wss.on('connection', ws => {
+      ws.send(JSON.stringify({
+        type: 'error',
+        message: 'explicit compatibility failure',
+        protocolVersion: 1,
+      }))
+    })
+    const port = await new Promise<number>((resolve, reject) => {
+      wss.once('listening', () => {
+        const address = wss.address()
+        if (typeof address === 'object' && address) resolve(address.port)
+        else reject(new Error('Failed to resolve ephemeral WebSocket port'))
+      })
+      wss.once('error', reject)
+    })
+
+    try {
+      await expect(connect(`ws://127.0.0.1:${port}`)).rejects.toThrow('explicit compatibility failure')
+    } finally {
+      disconnect()
+      await new Promise<void>((resolve, reject) => wss.close(err => (err ? reject(err) : resolve())))
+    }
+  })
+
+  it('closes a connected peer that later sends an incompatible frame', async () => {
+    const wss = new WebSocketServer({ port: 0 })
+    wss.on('connection', ws => {
+      ws.on('message', raw => {
+        const msg = JSON.parse(String(raw)) as { type?: string }
+        if (msg.type !== 'resize') return
+        ws.send(JSON.stringify({
+          type: 'frame',
+          protocolVersion: 1,
+          layout: { x: 0, y: 0, width: 10, height: 10, children: [] },
+          tree: { kind: 'box', props: {}, children: [] },
+        }))
+        setTimeout(() => {
+          ws.send(JSON.stringify({
+            type: 'frame',
+            protocolVersion: 999,
+            layout: { x: 0, y: 0, width: 999, height: 10, children: [] },
+            tree: { kind: 'box', props: {}, children: [] },
+          }))
+        }, 10)
+      })
+    })
+    const port = await new Promise<number>((resolve, reject) => {
+      wss.once('listening', () => {
+        const address = wss.address()
+        if (typeof address === 'object' && address) resolve(address.port)
+        else reject(new Error('Failed to resolve ephemeral WebSocket port'))
+      })
+      wss.once('error', reject)
+    })
+
+    try {
+      const session = await connect(`ws://127.0.0.1:${port}`)
+      await new Promise<void>(resolve => session.ws.once('close', () => resolve()))
+      expect(session.layout).toBeNull()
+      expect(session.tree).toBeNull()
+    } finally {
+      disconnect()
+      await new Promise<void>((resolve, reject) => wss.close(err => (err ? reject(err) : resolve())))
+    }
+  })
 })

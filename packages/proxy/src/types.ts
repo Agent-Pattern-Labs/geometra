@@ -24,7 +24,19 @@ export interface GeometrySnapshot {
   treeJson: string
 }
 
-export const PROXY_PROTOCOL_VERSION = 2 as const
+/** Shared geometry frame/event wire version. */
+export const GEOMETRY_PROTOCOL_VERSION = 1 as const
+/** Browser-only semantic action wire version. */
+export const PROXY_ACTION_PROTOCOL_VERSION = 2 as const
+/** Legacy name retained for older MCP clients. */
+export const PROXY_PROTOCOL_VERSION = PROXY_ACTION_PROTOCOL_VERSION
+
+export interface ProxyProtocolCapabilities {
+  transport: 'proxy'
+  requestScopedAcks: true
+  proxyActions: true
+  exactFieldIdentity: true
+}
 export type ClientChoiceType = 'select' | 'group' | 'listbox'
 
 /**
@@ -249,11 +261,22 @@ export type ParsedClientMessage =
   | ClientWheelMessage
   | ClientScreenshotMessage
   | ClientPdfGenerateMessage
-  | { type: string; protocolVersion?: number }
+  | {
+      type: string
+      protocolVersion?: number
+      geometryProtocolVersion?: number
+      proxyActionProtocolVersion?: number
+    }
 
 type UnknownRecord = Record<string, unknown>
 
-const COMMON_MESSAGE_KEYS = new Set(['type', 'requestId', 'protocolVersion'])
+const COMMON_MESSAGE_KEYS = new Set([
+  'type',
+  'requestId',
+  'protocolVersion',
+  'geometryProtocolVersion',
+  'proxyActionProtocolVersion',
+])
 const SET_CHECKED_MESSAGE_KEYS = new Set([
   ...COMMON_MESSAGE_KEYS,
   'label',
@@ -349,7 +372,10 @@ function hasOnlyKeys(record: UnknownRecord, allowed: ReadonlySet<string>): boole
 }
 
 function hasValidCommonFields(record: UnknownRecord): boolean {
-  return isOptionalTrimmedString(record.requestId) && isOptionalFiniteNumber(record.protocolVersion)
+  return isOptionalTrimmedString(record.requestId) &&
+    isOptionalFiniteNumber(record.protocolVersion) &&
+    isOptionalFiniteNumber(record.geometryProtocolVersion) &&
+    isOptionalFiniteNumber(record.proxyActionProtocolVersion)
 }
 
 function isClientFillField(value: unknown): value is ClientFillField {
