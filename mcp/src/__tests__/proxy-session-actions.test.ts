@@ -1,6 +1,6 @@
 import { afterAll, describe, expect, it } from 'vitest'
 import { WebSocketServer } from 'ws'
-import { connect, disconnect, sendClick, sendFillFields, sendListboxPick, sendNavigate } from '../session.js'
+import { connect, disconnect, sendClick, sendFileUpload, sendFillFields, sendListboxPick, sendNavigate } from '../session.js'
 
 describe('proxy-backed MCP actions', () => {
   afterAll(() => {
@@ -59,6 +59,69 @@ describe('proxy-backed MCP actions', () => {
           exact: true,
         }),
       ).rejects.toThrow('listboxPick: no visible option matching "Japan"')
+    } finally {
+      disconnect()
+      await new Promise<void>((resolve, reject) => wss.close(err => (err ? reject(err) : resolve())))
+    }
+  })
+
+  it('preserves semantic file-target constraints on the proxy wire', async () => {
+    const wss = new WebSocketServer({ port: 0 })
+    let seenFileMessage: Record<string, unknown> | undefined
+    wss.on('connection', ws => {
+      ws.on('message', raw => {
+        const msg = JSON.parse(String(raw)) as { type?: string; requestId?: string }
+        if (msg.type === 'resize') {
+          ws.send(JSON.stringify({
+            type: 'frame',
+            layout: { x: 0, y: 0, width: 1024, height: 768, children: [] },
+            tree: { kind: 'box', props: {}, semantic: { tag: 'body', role: 'group' }, children: [] },
+          }))
+          return
+        }
+        if (msg.type === 'file') {
+          seenFileMessage = msg as Record<string, unknown>
+          ws.send(JSON.stringify({
+            type: 'frame',
+            layout: { x: 0, y: 0, width: 1024, height: 768, children: [] },
+            tree: {
+              kind: 'box',
+              props: {},
+              semantic: { tag: 'body', role: 'group', ariaLabel: 'Resume attached' },
+              children: [],
+            },
+          }))
+          ws.send(JSON.stringify({ type: 'ack', requestId: msg.requestId }))
+        }
+      })
+    })
+    const port = await new Promise<number>((resolve, reject) => {
+      wss.once('listening', () => {
+        const address = wss.address()
+        if (typeof address === 'object' && address) resolve(address.port)
+        else reject(new Error('Failed to resolve ephemeral WebSocket port'))
+      })
+      wss.once('error', reject)
+    })
+
+    try {
+      const session = await connect(`ws://127.0.0.1:${port}`)
+      await expect(sendFileUpload(session, ['/tmp/resume.pdf'], {
+        fieldLabel: 'Resume',
+        exact: true,
+        strategy: 'hidden',
+        contextText: 'Upload your resume',
+        sectionText: 'Application documents',
+      }, 80)).resolves.toMatchObject({ status: 'updated', timeoutMs: 80 })
+      expect(seenFileMessage).toMatchObject({
+        type: 'file',
+        paths: ['/tmp/resume.pdf'],
+        fieldLabel: 'Resume',
+        exact: true,
+        strategy: 'hidden',
+        contextText: 'Upload your resume',
+        sectionText: 'Application documents',
+      })
     } finally {
       disconnect()
       await new Promise<void>((resolve, reject) => wss.close(err => (err ? reject(err) : resolve())))

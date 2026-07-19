@@ -342,6 +342,8 @@ export async function handleClientMessage(
         fieldId: msg.fieldId,
         fieldKey: msg.fieldKey,
         fieldLabel: msg.fieldLabel,
+        contextText: msg.contextText,
+        sectionText: msg.sectionText,
         exact: msg.exact,
         strategy: msg.strategy,
         dropX: msg.dropX,

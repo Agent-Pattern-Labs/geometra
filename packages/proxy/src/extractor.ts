@@ -224,7 +224,7 @@ function browserExtractGeometry(): { layout: LayoutSnapshot; tree: TreeSnapshot 
     if (ariaInvalid === 'false') return false
     if (el instanceof HTMLInputElement || el instanceof HTMLTextAreaElement || el instanceof HTMLSelectElement) {
       try {
-        if (el.willValidate) return !el.checkValidity()
+        if (el.willValidate) return !el.validity.valid
       } catch {
         return false
       }

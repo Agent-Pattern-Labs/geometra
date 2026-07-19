@@ -31,8 +31,9 @@ function node(
 const mockState = vi.hoisted(() => ({
   currentA11yRoot: node('group', undefined, {
     meta: { pageUrl: 'https://jobs.example.com/application', scrollX: 0, scrollY: 0 },
-  }),
+  }) as A11yNode | null,
   nodeContexts: new Map<string, Record<string, unknown>>(),
+  nodeContextReadHook: undefined as undefined | ((node: { path?: number[] }) => void),
   session: {
     tree: { kind: 'box' },
     layout: { x: 0, y: 0, width: 1280, height: 800, children: [] },
@@ -74,6 +75,7 @@ function resetMockSessionCaches() {
   mockState.session.cachedA11yRevision = undefined
   mockState.session.cachedFormSchemas = undefined
   mockState.nodeContexts.clear()
+  mockState.nodeContextReadHook = undefined
 }
 
 function bumpMockUiRevision() {
@@ -159,8 +161,10 @@ vi.mock('../session.js', () => ({
   summarizeCompactIndex: vi.fn(() => ''),
   summarizePageModel: vi.fn(() => ''),
   summarizeUiDelta: vi.fn(() => ''),
-  nodeContextForNode: vi.fn((_: unknown, node: { path?: number[] }) =>
-    mockState.nodeContexts.get((node.path ?? []).join('.'))),
+  nodeContextForNode: vi.fn((_: unknown, node: { path?: number[] }) => {
+    mockState.nodeContextReadHook?.(node)
+    return mockState.nodeContexts.get((node.path ?? []).join('.'))
+  }),
   parseSectionId: vi.fn((id: string) => {
     const [prefix, encoded] = id.split(':', 2)
     if (prefix !== 'fm' || !encoded) return null
@@ -293,6 +297,176 @@ describe('batch MCP result shaping', () => {
     )
   })
 
+  it('fails closed on unsafe upload targets and forwards semantic upload constraints', async () => {
+    const standaloneSchema = getToolInputSchema('geometra_upload_files')
+    const batchSchema = getToolInputSchema('geometra_run_actions')
+
+    for (const input of [
+      { paths: ['/tmp/resume.pdf'] },
+      { paths: ['/tmp/resume.pdf'], x: 20 },
+      { paths: ['/tmp/resume.pdf'], y: 30 },
+      { paths: ['/tmp/resume.pdf'], strategy: 'chooser' },
+      { paths: ['/tmp/resume.pdf'], strategy: 'drop', dropX: 20 },
+      { paths: ['/tmp/resume.pdf'], strategy: 'hidden' },
+      { paths: ['/tmp/resume.pdf'], contextText: 'Resume prompt' },
+    ]) {
+      expect(standaloneSchema.safeParse(input).success).toBe(false)
+      expect(batchSchema.safeParse({
+        actions: [{ type: 'upload_files', ...input }],
+      }).success).toBe(false)
+    }
+
+    expect(standaloneSchema.safeParse({
+      paths: ['/tmp/resume.pdf'],
+      x: 20,
+      y: 30,
+      strategy: 'chooser',
+    }).success).toBe(true)
+    expect(standaloneSchema.safeParse({
+      paths: ['/tmp/resume.pdf'],
+      dropX: 20,
+      dropY: 30,
+      strategy: 'drop',
+    }).success).toBe(true)
+
+    const parsed = standaloneSchema.safeParse({
+      paths: ['  /tmp/resume.pdf  '],
+      fieldLabel: '  Resume  ',
+      exact: true,
+      strategy: 'hidden',
+      contextText: '  Upload your resume  ',
+      sectionText: '  Application documents  ',
+    })
+    expect(parsed.success).toBe(true)
+    expect(parsed.data).toMatchObject({
+      paths: ['/tmp/resume.pdf'],
+      fieldLabel: 'Resume',
+      contextText: 'Upload your resume',
+      sectionText: 'Application documents',
+    })
+
+    await getToolHandler('geometra_upload_files')(parsed.data!)
+    expect(mockState.sendFileUpload).toHaveBeenLastCalledWith(
+      mockState.session,
+      ['/tmp/resume.pdf'],
+      {
+        click: undefined,
+        fieldLabel: 'Resume',
+        exact: true,
+        strategy: 'hidden',
+        drop: undefined,
+        contextText: 'Upload your resume',
+        sectionText: 'Application documents',
+      },
+      8000,
+    )
+
+    const parsedBatch = batchSchema.safeParse({
+      actions: [{
+        type: 'upload_files',
+        paths: ['/tmp/cover-letter.pdf'],
+        fieldLabel: 'Cover letter',
+        contextText: 'Optional supporting document',
+        sectionText: 'Application documents',
+      }],
+    })
+    expect(parsedBatch.success).toBe(true)
+    await getToolHandler('geometra_run_actions')(parsedBatch.data!)
+    expect(mockState.sendFileUpload).toHaveBeenLastCalledWith(
+      mockState.session,
+      ['/tmp/cover-letter.pdf'],
+      {
+        click: undefined,
+        fieldLabel: 'Cover letter',
+        exact: undefined,
+        strategy: undefined,
+        drop: undefined,
+        contextText: 'Optional supporting document',
+        sectionText: 'Application documents',
+      },
+      8000,
+    )
+  })
+
+  it('requires confirmable listbox identity and never accepts coordinate-only targeting', async () => {
+    const standaloneSchema = getToolInputSchema('geometra_pick_listbox_option')
+    const batchSchema = getToolInputSchema('geometra_run_actions')
+
+    for (const input of [
+      { label: 'New York' },
+      { label: 'New York', fieldId: 'ff:0.2' },
+      { label: 'New York', fieldKey: 'id:office' },
+      { label: 'New York', fieldLabel: 'Office', openX: 20, openY: 30 },
+      { label: 'New York', fieldLabel: 'Office', contextText: 'Work location' },
+      { label: 'New York', fieldLabel: 'Office', sectionText: 'Application' },
+    ]) {
+      expect(standaloneSchema.safeParse(input).success).toBe(false)
+      expect(batchSchema.safeParse({
+        actions: [{ type: 'pick_listbox_option', ...input }],
+      }).success).toBe(false)
+    }
+
+    const parsed = standaloneSchema.safeParse({
+      label: '  New York  ',
+      exact: true,
+      fieldId: '  ff:0.2  ',
+      fieldKey: '  id:office  ',
+      fieldLabel: '  Office  ',
+      query: 'New',
+    })
+    expect(parsed.success).toBe(true)
+    await getToolHandler('geometra_pick_listbox_option')(parsed.data!)
+    expect(mockState.sendListboxPick).toHaveBeenCalledWith(
+      mockState.session,
+      'New York',
+      {
+        exact: true,
+        fieldId: 'ff:0.2',
+        fieldKey: 'id:office',
+        fieldLabel: 'Office',
+        query: 'New',
+      },
+      undefined,
+    )
+  })
+
+  it('requires a native-select selector, rejects discarded context, and preserves conjunctive identity', async () => {
+    const standaloneSchema = getToolInputSchema('geometra_select_option')
+    const batchSchema = getToolInputSchema('geometra_run_actions')
+
+    expect(standaloneSchema.safeParse({ x: 20, y: 30 }).success).toBe(false)
+    expect(standaloneSchema.safeParse({ x: 20, value: 'nyc' }).success).toBe(false)
+    expect(standaloneSchema.safeParse({ x: 20, y: 30, value: 'nyc', contextText: 'Office' }).success).toBe(false)
+    expect(standaloneSchema.safeParse({ x: 20, y: 30, value: 'nyc', sectionText: 'Application' }).success).toBe(false)
+    expect(batchSchema.safeParse({
+      actions: [{ type: 'select_option', x: 20, y: 30 }],
+    }).success).toBe(false)
+    expect(batchSchema.safeParse({
+      actions: [{ type: 'select_option', x: 20, y: 30, value: 'nyc', contextText: 'Office' }],
+    }).success).toBe(false)
+
+    const parsed = standaloneSchema.safeParse({
+      x: 20,
+      y: 30,
+      value: 'nyc',
+      label: '  New York  ',
+      index: 2,
+    })
+    expect(parsed.success).toBe(true)
+    await getToolHandler('geometra_select_option')(parsed.data!)
+    expect(mockState.sendSelectOption).toHaveBeenCalledWith(
+      mockState.session,
+      20,
+      30,
+      { value: 'nyc', label: 'New York', index: 2 },
+      undefined,
+    )
+
+    expect(batchSchema.safeParse({
+      actions: [{ type: 'select_option', x: 20, y: 30, value: 'nyc', label: 'New York', index: 2 }],
+    }).success).toBe(true)
+  })
+
   it('forwards exact field identity through run_actions recovery primitives', async () => {
     const schema = getToolInputSchema('geometra_run_actions')
     const parsed = schema.safeParse({
@@ -322,7 +496,6 @@ describe('batch MCP result shaping', () => {
       'New York',
       {
         exact: undefined,
-        open: undefined,
         fieldId: 'id:office',
         fieldKey: 'id:office',
         fieldLabel: 'Office',
@@ -1806,11 +1979,16 @@ describe('submit_form tool', () => {
       bounds: { x: 0, y: 0, width: 1280, height: 800 },
       meta: { pageUrl: 'https://jobs.example.com/application', scrollX: 0, scrollY: 0 },
       children: [
-        node('textbox', 'Full name', { value: '', path: [0] }),
-        node('textbox', 'Email', { value: '', path: [1] }),
-        node('button', 'Submit application', {
-          bounds: { x: 60, y: 480, width: 180, height: 40 },
-          path: [2],
+        node('form', 'Application', {
+          path: [0],
+          children: [
+            node('textbox', 'Full name', { value: '', path: [0, 0] }),
+            node('textbox', 'Email', { value: '', path: [0, 1] }),
+            node('button', 'Submit application', {
+              bounds: { x: 60, y: 480, width: 180, height: 40 },
+              path: [0, 2],
+            }),
+          ],
         }),
       ],
     })
@@ -1865,6 +2043,418 @@ describe('submit_form tool', () => {
     })
     expect(mockState.sendFillFields).toHaveBeenCalledTimes(1)
     expect(mockState.sendClick).toHaveBeenCalledTimes(1)
+  })
+
+  it('preserves the resolved form scope in a soft-timeout resume hint after fill', async () => {
+    const handler = getToolHandler('geometra_submit_form')
+    mockState.currentA11yRoot = node('group', undefined, {
+      bounds: { x: 0, y: 0, width: 1280, height: 800 },
+      meta: { pageUrl: 'https://jobs.example.com/application', scrollX: 0, scrollY: 0 },
+      children: [
+        node('form', 'Application', {
+          path: [0],
+          children: [
+            node('textbox', 'Full name', { path: [0, 0] }),
+            node('button', 'Submit', {
+              bounds: { x: 60, y: 480, width: 100, height: 40 },
+              path: [0, 1],
+            }),
+          ],
+        }),
+      ],
+    })
+    mockState.formSchemas = [{
+      formId: 'fm:0',
+      name: 'Application',
+      fieldCount: 1,
+      requiredCount: 0,
+      invalidCount: 0,
+      fields: [{ id: 'ff:0.0', fieldKey: 'id:full-name', kind: 'text', label: 'Full name' }],
+    }]
+    mockState.sendFillFields.mockImplementationOnce(async () => {
+      await new Promise(resolve => setTimeout(resolve, 300))
+      return {
+        status: 'acknowledged' as const,
+        timeoutMs: 250,
+        result: { invalidCount: 0, alertCount: 0, dialogCount: 0, busyCount: 0 },
+      }
+    })
+
+    const result = await handler({
+      valuesByLabel: { 'Full name': 'Taylor Applicant' },
+      submit: { role: 'button', name: 'Submit' },
+      softTimeoutMs: 1_000,
+      detail: 'terse',
+    })
+
+    const payload = JSON.parse(result.content[0]!.text) as Record<string, unknown>
+    expect(result.isError).toBeUndefined()
+    expect(payload).toMatchObject({
+      paused: true,
+      phase: 'submit',
+      fill: { formId: 'fm:0', fieldCount: 1 },
+      resumeHint: {
+        tool: 'geometra_submit_form',
+        skipFill: true,
+        formId: 'fm:0',
+      },
+    })
+    expect(mockState.sendClick).not.toHaveBeenCalled()
+  })
+
+  it('does not leak formId into a strict geometra_wait_for resume hint', async () => {
+    const handler = getToolHandler('geometra_submit_form')
+    mockState.currentA11yRoot = node('group', undefined, {
+      bounds: { x: 0, y: 0, width: 1280, height: 800 },
+      meta: { pageUrl: 'https://jobs.example.com/application', scrollX: 0, scrollY: 0 },
+      children: [
+        node('form', 'Application', {
+          path: [0],
+          children: [
+            node('button', 'Submit', {
+              bounds: { x: 60, y: 480, width: 100, height: 40 },
+              path: [0, 0],
+            }),
+          ],
+        }),
+      ],
+    })
+    mockState.formSchemas = [{
+      formId: 'fm:0',
+      name: 'Application',
+      fieldCount: 0,
+      requiredCount: 0,
+      invalidCount: 0,
+      fields: [],
+    }]
+    mockState.sendClick.mockImplementationOnce(async () => {
+      await new Promise(resolve => setTimeout(resolve, 300))
+      return { status: 'acknowledged' as const, timeoutMs: 250 }
+    })
+
+    const result = await handler({
+      skipFill: true,
+      formId: 'fm:0',
+      submit: { role: 'button', name: 'Submit' },
+      waitFor: { role: 'dialog', name: 'Application submitted' },
+      softTimeoutMs: 1_000,
+      detail: 'terse',
+    })
+
+    const payload = JSON.parse(result.content[0]!.text) as {
+      paused?: boolean
+      phase?: string
+      resumeHint?: Record<string, unknown>
+    }
+    expect(payload).toMatchObject({
+      paused: true,
+      phase: 'wait_for',
+      resumeHint: {
+        tool: 'geometra_wait_for',
+        role: 'dialog',
+        name: 'Application submitted',
+        present: true,
+      },
+    })
+    expect(payload.resumeHint).not.toHaveProperty('formId')
+    const { tool, ...hintArgs } = payload.resumeHint ?? {}
+    expect(tool).toBe('geometra_wait_for')
+    expect(getToolInputSchema('geometra_wait_for').safeParse(hintArgs).success).toBe(true)
+  })
+
+  it('fails closed when fill replaces the selected form at the same path', async () => {
+    const handler = getToolHandler('geometra_submit_form')
+    mockState.currentA11yRoot = node('group', undefined, {
+      bounds: { x: 0, y: 0, width: 1280, height: 800 },
+      meta: { pageUrl: 'https://jobs.example.com/application', scrollX: 0, scrollY: 0 },
+      children: [
+        node('form', 'Application', {
+          path: [0],
+          children: [
+            node('textbox', 'Full name', { path: [0, 0] }),
+            node('button', 'Submit', {
+              bounds: { x: 60, y: 480, width: 100, height: 40 },
+              path: [0, 1],
+            }),
+          ],
+        }),
+      ],
+    })
+    mockState.formSchemas = [{
+      formId: 'fm:0',
+      name: 'Application',
+      fieldCount: 1,
+      requiredCount: 0,
+      invalidCount: 0,
+      fields: [{ id: 'ff:0.0', fieldKey: 'id:full-name', kind: 'text', label: 'Full name' }],
+    }]
+    mockState.sendFillFields.mockImplementationOnce(async () => {
+      mockState.currentA11yRoot = node('group', undefined, {
+        bounds: { x: 0, y: 0, width: 1280, height: 800 },
+        meta: { pageUrl: 'https://jobs.example.com/application', scrollX: 0, scrollY: 0 },
+        children: [
+          node('form', 'Newsletter', {
+            path: [0],
+            children: [
+              node('textbox', 'Email', { path: [0, 0] }),
+              node('button', 'Submit', {
+                bounds: { x: 60, y: 480, width: 100, height: 40 },
+                path: [0, 1],
+              }),
+            ],
+          }),
+        ],
+      })
+      mockState.formSchemas = [{
+        formId: 'fm:0',
+        name: 'Newsletter',
+        fieldCount: 1,
+        requiredCount: 0,
+        invalidCount: 0,
+        fields: [{ id: 'ff:0.0', fieldKey: 'id:email', kind: 'text', label: 'Email' }],
+      }]
+      bumpMockUiRevision()
+      return {
+        status: 'acknowledged' as const,
+        timeoutMs: 2_000,
+        result: { invalidCount: 0, alertCount: 0, dialogCount: 0, busyCount: 0 },
+      }
+    })
+
+    const result = await handler({
+      valuesByLabel: { 'Full name': 'Taylor Applicant' },
+      submit: { role: 'button', name: 'Submit' },
+      detail: 'terse',
+    })
+
+    expect(result.isError).toBe(true)
+    expect(result.content[0]!.text).toContain('replaced at the same path')
+    expect(mockState.sendClick).not.toHaveBeenCalled()
+  })
+
+  it('revalidates moved submit bounds and clicks the current visible center', async () => {
+    const handler = getToolHandler('geometra_submit_form')
+    mockState.currentA11yRoot = node('group', undefined, {
+      bounds: { x: 0, y: 0, width: 1280, height: 800 },
+      meta: { pageUrl: 'https://jobs.example.com/application', scrollX: 0, scrollY: 0 },
+      children: [
+        node('form', 'Application', {
+          path: [0],
+          children: [
+            node('textbox', 'Full name', { path: [0, 0] }),
+            node('button', 'Submit', {
+              bounds: { x: 60, y: 480, width: 100, height: 40 },
+              path: [0, 1],
+            }),
+          ],
+        }),
+      ],
+    })
+    mockState.formSchemas = [{
+      formId: 'fm:0',
+      name: 'Application',
+      fieldCount: 1,
+      requiredCount: 0,
+      invalidCount: 0,
+      fields: [{ id: 'ff:0.0', fieldKey: 'id:full-name', kind: 'text', label: 'Full name' }],
+    }]
+    mockState.nodeContexts.set('0.1', { section: 'Application actions' })
+    mockState.nodeContextReadHook = candidate => {
+      if ((candidate.path ?? []).join('.') !== '0.1') return
+      mockState.nodeContextReadHook = undefined
+      mockState.currentA11yRoot = node('group', undefined, {
+        bounds: { x: 0, y: 0, width: 1280, height: 800 },
+        meta: { pageUrl: 'https://jobs.example.com/application', scrollX: 0, scrollY: 0 },
+        children: [
+          node('form', 'Application', {
+            path: [0],
+            children: [
+              node('textbox', 'Full name', { path: [0, 0] }),
+              node('button', 'Submit', {
+                bounds: { x: 500, y: 300, width: 100, height: 40 },
+                path: [0, 1],
+              }),
+            ],
+          }),
+        ],
+      })
+      bumpMockUiRevision()
+    }
+
+    await handler({
+      skipFill: true,
+      formId: 'fm:0',
+      submit: { role: 'button', name: 'Submit', contextText: 'Application actions' },
+      detail: 'terse',
+    })
+
+    expect(mockState.sendClick).toHaveBeenCalledWith(
+      mockState.session,
+      550,
+      320,
+      expect.any(Number),
+    )
+  })
+
+  it('fails closed if the scoped UI tree disappears before submit click', async () => {
+    const handler = getToolHandler('geometra_submit_form')
+    mockState.currentA11yRoot = node('group', undefined, {
+      bounds: { x: 0, y: 0, width: 1280, height: 800 },
+      meta: { pageUrl: 'https://jobs.example.com/application', scrollX: 0, scrollY: 0 },
+      children: [
+        node('form', 'Application', {
+          path: [0],
+          children: [
+            node('textbox', 'Full name', { path: [0, 0] }),
+            node('button', 'Submit', {
+              bounds: { x: 60, y: 480, width: 100, height: 40 },
+              path: [0, 1],
+            }),
+          ],
+        }),
+      ],
+    })
+    mockState.formSchemas = [{
+      formId: 'fm:0',
+      name: 'Application',
+      fieldCount: 1,
+      requiredCount: 0,
+      invalidCount: 0,
+      fields: [{ id: 'ff:0.0', fieldKey: 'id:full-name', kind: 'text', label: 'Full name' }],
+    }]
+    mockState.nodeContexts.set('0.1', { section: 'Application actions' })
+    mockState.nodeContextReadHook = candidate => {
+      if ((candidate.path ?? []).join('.') !== '0.1') return
+      mockState.nodeContextReadHook = undefined
+      mockState.currentA11yRoot = null
+      bumpMockUiRevision()
+    }
+
+    const result = await handler({
+      skipFill: true,
+      formId: 'fm:0',
+      submit: { role: 'button', name: 'Submit', contextText: 'Application actions' },
+      detail: 'terse',
+    })
+
+    expect(result.isError).toBe(true)
+    expect(result.content[0]!.text).toContain('current UI tree is unavailable')
+    expect(mockState.sendClick).not.toHaveBeenCalled()
+  })
+
+  it('resolves submitIndex only among matching controls inside the selected form', async () => {
+    const handler = getToolHandler('geometra_submit_form')
+    mockState.currentA11yRoot = node('group', undefined, {
+      bounds: { x: 0, y: 0, width: 1280, height: 800 },
+      meta: { pageUrl: 'https://jobs.example.com/application', scrollX: 0, scrollY: 0 },
+      children: [
+        node('form', 'Newsletter', {
+          path: [0],
+          children: [
+            node('button', 'Submit', {
+              bounds: { x: 40, y: 100, width: 100, height: 40 },
+              path: [0, 0],
+            }),
+          ],
+        }),
+        node('region', 'Application', {
+          path: [1],
+          children: [
+            node('textbox', 'Full name', { path: [1, 0] }),
+            node('textbox', 'Email', { path: [1, 1] }),
+            node('button', 'Submit', {
+              bounds: { x: 400, y: 300, width: 100, height: 40 },
+              path: [1, 2],
+            }),
+            node('button', 'Submit', {
+              bounds: { x: 400, y: 400, width: 100, height: 40 },
+              path: [1, 3],
+            }),
+          ],
+        }),
+      ],
+    })
+    mockState.formSchemas = [
+      { formId: 'fm:0', name: 'Newsletter', fieldCount: 0, requiredCount: 0, invalidCount: 0, fields: [] },
+      { formId: 'fm:1', name: 'Application', fieldCount: 2, requiredCount: 0, invalidCount: 0, fields: [] },
+    ]
+    mockState.nodeContexts.set('0.0', { section: 'Shared submit context' })
+    mockState.nodeContexts.set('1.2', { section: 'Shared submit context' })
+    mockState.nodeContexts.set('1.3', { section: 'Shared submit context' })
+
+    const result = await handler({
+      skipFill: true,
+      formId: 'fm:1',
+      submit: { role: 'button', name: 'Submit', contextText: 'Shared submit context' },
+      submitIndex: 1,
+      detail: 'terse',
+    })
+
+    expect(result.isError).toBeUndefined()
+    expect(mockState.sendClick).toHaveBeenCalledTimes(1)
+    expect(mockState.sendClick).toHaveBeenCalledWith(
+      mockState.session,
+      450,
+      420,
+      expect.any(Number),
+    )
+  })
+
+  it('fails closed without clicking when the filled form path is stale before submit', async () => {
+    const handler = getToolHandler('geometra_submit_form')
+    mockState.currentA11yRoot = node('group', undefined, {
+      bounds: { x: 0, y: 0, width: 1280, height: 800 },
+      meta: { pageUrl: 'https://jobs.example.com/application', scrollX: 0, scrollY: 0 },
+      children: [
+        node('form', 'Application', {
+          path: [0],
+          children: [
+            node('textbox', 'Full name', { path: [0, 0] }),
+            node('button', 'Submit', {
+              bounds: { x: 60, y: 480, width: 100, height: 40 },
+              path: [0, 1],
+            }),
+          ],
+        }),
+      ],
+    })
+    mockState.formSchemas = [{
+      formId: 'fm:0',
+      name: 'Application',
+      fieldCount: 1,
+      requiredCount: 0,
+      invalidCount: 0,
+      fields: [{ id: 'ff:0.0', kind: 'text', label: 'Full name' }],
+    }]
+    mockState.sendFillFields.mockImplementationOnce(async () => {
+      mockState.currentA11yRoot = node('group', undefined, {
+        bounds: { x: 0, y: 0, width: 1280, height: 800 },
+        meta: { pageUrl: 'https://jobs.example.com/application', scrollX: 0, scrollY: 0 },
+        children: [
+          node('button', 'Submit', {
+            bounds: { x: 40, y: 100, width: 100, height: 40 },
+            path: [0],
+          }),
+        ],
+      })
+      mockState.formSchemas = []
+      bumpMockUiRevision()
+      return {
+        status: 'acknowledged' as const,
+        timeoutMs: 2000,
+        result: { invalidCount: 0, alertCount: 0, dialogCount: 0, busyCount: 0 },
+      }
+    })
+
+    const result = await handler({
+      valuesByLabel: { 'Full name': 'Taylor Applicant' },
+      submit: { role: 'button', name: 'Submit' },
+      detail: 'terse',
+    })
+
+    expect(result.isError).toBe(true)
+    expect(result.content[0]!.text).toContain('stale')
+    expect(mockState.sendClick).not.toHaveBeenCalled()
   })
 
   it('rejects missing values when skipFill is false', async () => {
@@ -2127,8 +2717,16 @@ describe('submit_form tool', () => {
       bounds: { x: 0, y: 0, width: 1280, height: 800 },
       meta: { pageUrl: 'https://jobs.example.com/application', scrollX: 0, scrollY: 0 },
       children: [
-        node('textbox', 'Full name', { path: [0] }),
-        node('button', 'Submit', { bounds: { x: 60, y: 480, width: 100, height: 40 }, path: [1] }),
+        node('form', 'Application', {
+          path: [0],
+          children: [
+            node('textbox', 'Full name', { path: [0, 0] }),
+            node('button', 'Submit', {
+              bounds: { x: 60, y: 480, width: 100, height: 40 },
+              path: [0, 1],
+            }),
+          ],
+        }),
       ],
     })
     mockState.formSchemas = [{
@@ -2139,7 +2737,17 @@ describe('submit_form tool', () => {
       mockState.currentA11yRoot = node('group', undefined, {
         bounds: { x: 0, y: 0, width: 1280, height: 800 },
         meta: { pageUrl: 'https://jobs.example.com/review', scrollX: 0, scrollY: 0 },
-        children: [node('button', 'Submit', { bounds: { x: 60, y: 480, width: 100, height: 40 }, path: [0] })],
+        children: [
+          node('form', 'Application', {
+            path: [0],
+            children: [
+              node('button', 'Submit', {
+                bounds: { x: 60, y: 480, width: 100, height: 40 },
+                path: [0, 0],
+              }),
+            ],
+          }),
+        ],
       })
       bumpMockUiRevision()
       return { status: 'acknowledged' as const, timeoutMs: 2000, result: { invalidCount: 0, alertCount: 0, dialogCount: 0, busyCount: 0 } }
@@ -2230,12 +2838,17 @@ describe('submit_form tool', () => {
       bounds: { x: 0, y: 0, width: 1280, height: 800 },
       meta: { pageUrl: 'https://jobs.example.com/application', scrollX: 0, scrollY: 0 },
       children: [
-        node('textbox', 'Full name', { value: '', path: [0] }),
-        node('button', 'Submit', {
-          // Fully offscreen so the fullyVisible resolve misses and the
-          // relaxed-visibility fallback picks it up — mirrors the click test above.
-          bounds: { x: 60, y: 780, width: 180, height: 60 },
-          path: [1],
+        node('form', 'Application', {
+          path: [0],
+          children: [
+            node('textbox', 'Full name', { value: '', path: [0, 0] }),
+            node('button', 'Submit', {
+              // Fully offscreen so the fullyVisible resolve misses and the
+              // relaxed-visibility fallback picks it up — mirrors the click test above.
+              bounds: { x: 60, y: 780, width: 180, height: 60 },
+              path: [0, 1],
+            }),
+          ],
         }),
       ],
     })

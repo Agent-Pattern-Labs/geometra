@@ -496,6 +496,109 @@ async function locatorIsEditable(locator: Locator): Promise<boolean> {
   }
 }
 
+type MutationIntent = 'text' | 'select' | 'toggle' | 'file' | 'action'
+
+/**
+ * Return the effective browser state that makes a control unsafe to mutate.
+ * This deliberately walks the composed tree: framework controls often put
+ * the clickable/editable node inside a shadow root while disabled/inert ARIA
+ * state lives on the host.
+ */
+function mutationBlockReasonInPage(target: Element, intent: string): string | null {
+  function composedParent(node: Element): Element | null {
+    if (node.parentElement) return node.parentElement
+    const root = node.getRootNode()
+    return root instanceof ShadowRoot ? root.host : null
+  }
+
+  function composedDescendantOf(node: Element, ancestor: Element): boolean {
+    let current: Element | null = node
+    while (current) {
+      if (current === ancestor) return true
+      current = composedParent(current)
+    }
+    return false
+  }
+
+  // Native :disabled includes the disabled-fieldset/first-legend rules for
+  // form controls in the light DOM. The explicit ancestor walk below extends
+  // the same fail-closed behavior to custom and shadow-root controls.
+  try {
+    if (target.matches(':disabled')) return 'disabled'
+  } catch { /* non-HTML namespaces may reject pseudo classes */ }
+
+  if (
+    (target instanceof HTMLInputElement || target instanceof HTMLTextAreaElement) &&
+    target.readOnly
+  ) {
+    return 'readonly'
+  }
+
+  let current: Element | null = target
+  while (current) {
+    if (current.hasAttribute('inert')) return 'inert'
+    if (current.getAttribute('aria-disabled')?.trim().toLowerCase() === 'true') return 'aria-disabled'
+    if (current.getAttribute('aria-readonly')?.trim().toLowerCase() === 'true') return 'aria-readonly'
+
+    if (current instanceof HTMLFieldSetElement && current.disabled) {
+      const firstLegend = Array.from(current.children).find(child => child instanceof HTMLLegendElement)
+      if (!(firstLegend instanceof HTMLLegendElement) || !composedDescendantOf(target, firstLegend)) {
+        return 'disabled fieldset'
+      }
+    }
+    current = composedParent(current)
+  }
+
+  // Keep the argument explicit for call-site readability and future
+  // intent-specific platform states even though every current intent shares
+  // the effective ARIA/inert/fieldset policy.
+  void intent
+  return null
+}
+
+async function locatorMutationBlockReason(locator: Locator, intent: MutationIntent): Promise<string | null> {
+  try {
+    return await locator.evaluate(mutationBlockReasonInPage, intent)
+  } catch {
+    return 'detached or unavailable'
+  }
+}
+
+async function assertLocatorMutable(locator: Locator, intent: MutationIntent, action: string): Promise<void> {
+  const reason = await locatorMutationBlockReason(locator, intent)
+  if (reason) throw new Error(`${action}: matched control is not mutable (${reason})`)
+}
+
+async function elementHandleAtPoint(page: Page, x: number, y: number): Promise<ElementHandle<Element> | null> {
+  const handle = await page.evaluateHandle(
+    ({ pointX, pointY }) => document.elementFromPoint(pointX, pointY),
+    { pointX: x, pointY: y },
+  )
+  const element = handle.asElement() as ElementHandle<Element> | null
+  if (element) return element
+  await handle.dispose()
+  return null
+}
+
+async function assertPointMutable(
+  page: Page,
+  x: number,
+  y: number,
+  intent: MutationIntent,
+  action: string,
+): Promise<void> {
+  const element = await elementHandleAtPoint(page, x, y)
+  if (!element) {
+    throw new Error(`${action}: no element at the supplied coordinates`)
+  }
+  try {
+    const reason = await element.evaluate(mutationBlockReasonInPage, intent)
+    if (reason) throw new Error(`${action}: matched control is not mutable (${reason})`)
+  } finally {
+    await element.dispose()
+  }
+}
+
 async function locatorAnchorY(locator: Locator): Promise<number | undefined> {
   const bounds = await locator.boundingBox()
   return bounds ? bounds.y + bounds.height / 2 : undefined
@@ -915,6 +1018,29 @@ async function findMenuTriggerByContainerLabel(
   return bestIndex >= 0 ? triggers.nth(bestIndex) : null
 }
 
+async function locatorMatchesControlLabel(locator: Locator, fieldLabel: string, exact: boolean): Promise<boolean> {
+  const accessibleName = await locator.evaluate((el) => {
+    function referencedText(ids: string | null): string {
+      if (!ids) return ''
+      return ids.split(/\s+/).map(id => document.getElementById(id)?.textContent?.trim() ?? '').filter(Boolean).join(' ')
+    }
+    const explicit = el.getAttribute('aria-label')?.trim() || referencedText(el.getAttribute('aria-labelledby'))
+    if (explicit) return explicit
+    if (el instanceof HTMLInputElement || el instanceof HTMLSelectElement || el instanceof HTMLTextAreaElement) {
+      const associated = Array.from(el.labels ?? []).map(label => label.textContent?.trim() ?? '').find(Boolean)
+      if (associated) return associated
+      const placeholder = el.getAttribute('placeholder')?.trim()
+      if (placeholder) return placeholder
+    }
+    if (el.parentElement instanceof HTMLLabelElement) return el.parentElement.textContent?.trim() || ''
+    return el.getAttribute('title')?.trim() || el.textContent?.trim() || ''
+  }).catch(() => '')
+  const candidate = normalizedOptionLabel(accessibleName)
+  const expected = normalizedOptionLabel(fieldLabel)
+  if (!candidate || !expected) return false
+  return exact ? candidate === expected : candidate === expected || candidate.includes(expected)
+}
+
 async function findLabeledControlInPage(
   page: Page,
   fieldLabel: string,
@@ -926,12 +1052,18 @@ async function findLabeledControlInPage(
     ? await readCachedLocator(opts?.cache, 'control', fieldLabel, exact, opts?.fieldId, opts?.fieldKey)
     : undefined
   if (cached !== undefined) {
+    if (cached && opts?.fieldKey && fieldLabel && !(await locatorMatchesControlLabel(cached, fieldLabel, exact))) {
+      throw new Error(`fieldKey "${opts.fieldKey}" did not match field label "${fieldLabel}"`)
+    }
     return cached
   }
 
   if (opts?.fieldKey) {
     const authored = await findAuthoredFieldByKeyInPage(page, opts.fieldKey, 'control')
     if (authored) {
+      if (fieldLabel && !(await locatorMatchesControlLabel(authored, fieldLabel, exact))) {
+        throw new Error(`fieldKey "${opts.fieldKey}" did not match field label "${fieldLabel}"`)
+      }
       if (cacheable) writeCachedLocator(opts?.cache, 'control', fieldLabel, exact, opts?.fieldId, opts.fieldKey, authored)
       return authored
     }
@@ -1015,6 +1147,7 @@ async function openDropdownControl(
 ): Promise<{ locator: Locator; handle: ElementHandle<Element> | null; editable: boolean; anchorX?: number; anchorY?: number }> {
   const locator = await findLabeledControlInPage(page, fieldLabel, exact, { cache, fieldId, fieldKey })
   if (locator) {
+    await assertLocatorMutable(locator, 'select', 'listboxPick')
     await locator.scrollIntoViewIfNeeded()
     const handle = await locator.elementHandle()
     const clickTarget = await resolveMeaningfulClickTarget(locator)
@@ -1793,6 +1926,7 @@ async function clickScopedOptionCandidate(
       return found ?? null
     }, hit.selector)).asElement() as ElementHandle<Element> | null
     if (!target) return null
+    if (await target.evaluate(mutationBlockReasonInPage, 'select')) return null
     try {
       await target.scrollIntoViewIfNeeded({ timeout: 500 })
     } catch {
@@ -1977,6 +2111,7 @@ async function clickVisibleOptionCandidate(
 
     if (bestIndex >= 0) {
       const candidate = candidates.nth(bestIndex)
+      if (await locatorMutationBlockReason(candidate, 'select')) return null
       const selectedText =
         (await candidate.evaluate(el => el.getAttribute('aria-label')?.trim() || el.textContent?.trim() || '').catch(() => '')) || null
       const clickTarget = await resolveMeaningfulOptionClickTarget(candidate)
@@ -2702,6 +2837,29 @@ async function confirmListboxSelection(
   return false
 }
 
+async function confirmListboxSelectionWithoutLabel(
+  page: Page,
+  label: string,
+  exact: boolean,
+  anchor?: AnchorPoint,
+  currentHandle?: ElementHandle<Element> | null,
+  selectedOptionText?: string,
+): Promise<boolean> {
+  const deadline = Date.now() + 800
+  while (Date.now() < deadline) {
+    if (currentHandle) {
+      const values = await elementHandleDisplayedValues(currentHandle)
+      const matches = values.some(value => displayedValueMatchesSelection(value, label, exact, selectedOptionText))
+      if (matches && !(await readAriaInvalid(currentHandle)) && !(await readTriggerShowsPlaceholder(currentHandle))) {
+        return true
+      }
+    }
+    if (await visibleOptionIsSelected(page, label, exact, anchor)) return true
+    await delay(80)
+  }
+  return false
+}
+
 const PLACEHOLDER_PATTERN = /^(select|choose|pick|--|—\s)/i
 
 /**
@@ -2735,7 +2893,7 @@ async function dismissAndReVerifySelection(
   }
   await delay(50)
 
-  if (!currentHandle) return true
+  if (!currentHandle) return false
 
   // Re-verify using the original element handle (immune to DOM reordering)
   const deadline = Date.now() + 800
@@ -2770,8 +2928,9 @@ async function dismissAndReVerifySelection(
         return false
       }
     } catch {
-      // Handle detached — trust the earlier confirmation
-      return true
+      // A detached trigger has no observable committed state. Fail closed;
+      // callers can re-resolve the live field and retry.
+      return false
     }
     await delay(100)
   }
@@ -2841,99 +3000,111 @@ export function resolveExistingFiles(rawPaths: unknown[], allowedRoots: string[]
   return paths
 }
 
-async function findLabeledFileInput(frame: Frame, fieldLabel: string, exact: boolean): Promise<Locator | null> {
-  // Try exact-match candidates first, even when the caller passed
-  // exact=false. Same Greenhouse-style failure mode as findLabeledControl:
-  // a substring match (e.g. file labeled "Resume" hijacked by another
-  // "Please attach your resume below" field) silently picks the wrong
-  // input. Trying exact first guarantees the literal label wins when
-  // present, and only falls through to substring matching otherwise.
-  const exactDirect = frame.getByLabel(fieldLabel, { exact: true })
-  const exactDirectCount = await exactDirect.count()
-  for (let i = 0; i < exactDirectCount; i++) {
-    const candidate = exactDirect.nth(i)
-    const isFileInput = await candidate.evaluate(el => el instanceof HTMLInputElement && el.type === 'file').catch(() => false)
-    if (isFileInput) return candidate
-  }
-
-  if (!exact) {
-    const direct = frame.getByLabel(fieldLabel, { exact: false })
-    const directCount = await direct.count()
-    for (let i = 0; i < directCount; i++) {
-      const candidate = direct.nth(i)
-      const isFileInput = await candidate.evaluate(el => el instanceof HTMLInputElement && el.type === 'file').catch(() => false)
-      if (isFileInput) return candidate
-    }
-  }
-
-  const loc = frame.locator('input[type="file"]')
-  const count = await loc.count()
-  if (count === 0) return null
-
-  const bestIndex = await loc.evaluateAll((elements, payload) => {
-    function normalize(value: string): string {
-      return value.replace(/\s+/g, ' ').trim().toLowerCase()
-    }
-
-    function matches(candidate: string | undefined): boolean {
-      if (!candidate) return false
-      const normalizedCandidate = normalize(candidate)
-      const normalizedExpected = normalize(payload.fieldLabel)
-      if (!normalizedCandidate || !normalizedExpected) return false
-      return payload.exact ? normalizedCandidate === normalizedExpected : normalizedCandidate.includes(normalizedExpected)
-    }
-
-    function referencedText(ids: string | null, visited?: Set<string>): string | undefined {
-      if (!ids) return undefined
-      const seen = visited ?? new Set<string>()
-      const text = ids
+async function fileInputLabel(locator: Locator): Promise<string> {
+  return await locator.evaluate((el) => {
+    function referencedText(ids: string | null): string {
+      if (!ids) return ''
+      return ids
         .split(/\s+/)
-        .map(id => {
-          if (seen.has(id)) return ''
-          seen.add(id)
-          const target = document.getElementById(id)
-          if (!target) return ''
-          const chained = target.getAttribute('aria-labelledby')
-          if (chained) return referencedText(chained, seen) ?? ''
-          return target.textContent?.trim() ?? ''
-        })
+        .map(id => document.getElementById(id)?.textContent?.trim() ?? '')
         .filter(Boolean)
         .join(' ')
         .trim()
-      return text || undefined
+    }
+    if (!(el instanceof HTMLInputElement) || el.type !== 'file') return ''
+    return el.getAttribute('aria-label')?.trim() ||
+      referencedText(el.getAttribute('aria-labelledby')) ||
+      Array.from(el.labels ?? []).map(label => label.textContent?.trim() ?? '').find(Boolean) ||
+      el.getAttribute('title')?.trim() ||
+      ''
+  }).catch(() => '')
+}
+
+async function locatorMatchesFileScope(
+  locator: Locator,
+  contextText?: string,
+  sectionText?: string,
+): Promise<boolean> {
+  if (!contextText && !sectionText) return true
+  return await locator.evaluate((el, payload) => {
+    function normalize(value: string | null | undefined): string {
+      return (value ?? '').replace(/\s+/g, ' ').trim().toLowerCase()
+    }
+    function referencedText(ids: string | null): string {
+      if (!ids) return ''
+      return ids
+        .split(/\s+/)
+        .map(id => document.getElementById(id)?.textContent?.trim() ?? '')
+        .filter(Boolean)
+        .join(' ')
+        .trim()
+    }
+    function labelText(input: Element): string {
+      if (!(input instanceof HTMLInputElement)) return ''
+      return input.getAttribute('aria-label')?.trim() ||
+        referencedText(input.getAttribute('aria-labelledby')) ||
+        Array.from(input.labels ?? []).map(label => label.textContent?.trim() ?? '').find(Boolean) ||
+        ''
     }
 
-    function explicitLabelText(el: Element): string | undefined {
-      const aria = el.getAttribute('aria-label')?.trim()
-      if (aria) return aria
-      const labelledBy = referencedText(el.getAttribute('aria-labelledby'))
-      if (labelledBy) return labelledBy
-      if (el instanceof HTMLInputElement && el.labels && el.labels.length > 0) {
-        return el.labels[0]?.textContent?.trim() || undefined
+    const contextNeedle = normalize(payload.contextText)
+    const sectionNeedle = normalize(payload.sectionText)
+    if (contextNeedle) {
+      const normalizedLabel = normalize(labelText(el))
+      let nearestContext = ''
+      let current = el.parentElement
+      for (let depth = 0; current && depth < 7; depth++, current = current.parentElement) {
+        if (current === document.body || current === document.documentElement) break
+        if (current instanceof HTMLFormElement) break
+        const text = current.innerText.replace(/\s+/g, ' ').trim()
+        if (text && normalize(text) !== normalizedLabel) {
+          nearestContext = text
+          break
+        }
+        if (current.matches('fieldset, section, [role="group"], [role="region"]')) break
       }
-      if (el instanceof HTMLElement && el.id) {
-        const label = document.querySelector(`label[for="${CSS.escape(el.id)}"]`)
-        const text = label?.textContent?.trim()
-        if (text) return text
-      }
-      if (el.parentElement?.tagName.toLowerCase() === 'label') {
-        const text = el.parentElement.textContent?.trim()
-        if (text) return text
-      }
-      const title = el.getAttribute('title')?.trim()
-      if (title) return title
-      return undefined
+      if (!normalize(nearestContext).includes(contextNeedle)) return false
     }
 
-    for (let i = 0; i < elements.length; i++) {
-      const el = elements[i]
-      if (!(el instanceof HTMLInputElement) || el.type !== 'file') continue
-      if (matches(explicitLabelText(el))) return i
+    if (sectionNeedle) {
+      const section = el.closest('fieldset, section, form, dialog, [role="group"], [role="region"], [role="dialog"]')
+      if (!section) return false
+      const explicit = section.getAttribute('aria-label')?.trim() ||
+        referencedText(section.getAttribute('aria-labelledby')) ||
+        section.querySelector('legend, h1, h2, h3, h4, h5, h6')?.textContent?.trim() ||
+        (section instanceof HTMLElement ? section.innerText : section.textContent || '')
+      if (!normalize(explicit).includes(sectionNeedle)) return false
     }
-    return -1
-  }, { fieldLabel, exact })
+    return true
+  }, { contextText: contextText ?? '', sectionText: sectionText ?? '' }).catch(() => false)
+}
 
-  return bestIndex >= 0 ? loc.nth(bestIndex) : null
+async function findScopedFileInputsInPage(
+  page: Page,
+  fieldLabel: string,
+  exact: boolean,
+  contextText?: string,
+  sectionText?: string,
+): Promise<Locator[]> {
+  const exactMatches: Locator[] = []
+  const fuzzyMatches: Locator[] = []
+  const expected = normalizedOptionLabel(fieldLabel)
+  for (const frame of page.frames()) {
+    const inputs = frame.locator('input[type="file"]')
+    const count = await inputs.count()
+    for (let index = 0; index < count; index++) {
+      const candidate = inputs.nth(index)
+      if (!(await locatorMatchesFileScope(candidate, contextText, sectionText))) continue
+      const label = normalizedOptionLabel(await fileInputLabel(candidate))
+      if (expected) {
+        if (label === expected) exactMatches.push(candidate)
+        else if (!exact && label.includes(expected)) fuzzyMatches.push(candidate)
+      } else {
+        fuzzyMatches.push(candidate)
+      }
+    }
+  }
+  return exactMatches.length > 0 ? exactMatches : fuzzyMatches
 }
 
 async function findLabeledFileInputInPage(
@@ -2943,23 +3114,60 @@ async function findLabeledFileInputInPage(
   cache?: FillLookupCache,
   fieldId?: string,
   fieldKey?: string,
+  contextText?: string,
+  sectionText?: string,
 ): Promise<Locator | null> {
-  const cached = await readCachedLocator(cache, 'file', fieldLabel, exact, fieldId, fieldKey)
-  if (cached !== undefined) return cached
+  const scoped = Boolean(contextText || sectionText)
+  const cached = scoped ? undefined : await readCachedLocator(cache, 'file', fieldLabel, exact, fieldId, fieldKey)
+  if (cached !== undefined) {
+    if (cached && fieldKey && fieldLabel) {
+      const resolvedLabel = normalizedOptionLabel(await fileInputLabel(cached))
+      const expectedLabel = normalizedOptionLabel(fieldLabel)
+      const matches = exact
+        ? resolvedLabel === expectedLabel
+        : resolvedLabel === expectedLabel || resolvedLabel.includes(expectedLabel)
+      if (!matches) throw new Error(`file: fieldKey "${fieldKey}" did not match field label "${fieldLabel}"`)
+    }
+    return cached
+  }
 
   if (fieldKey) {
     const authored = await findAuthoredFieldByKeyInPage(page, fieldKey, 'file')
     if (authored) {
-      writeCachedLocator(cache, 'file', fieldLabel, exact, fieldId, fieldKey, authored)
+      if (fieldLabel) {
+        const resolvedLabel = normalizedOptionLabel(await fileInputLabel(authored))
+        const expectedLabel = normalizedOptionLabel(fieldLabel)
+        const labelMatches = exact
+          ? resolvedLabel === expectedLabel
+          : resolvedLabel === expectedLabel || resolvedLabel.includes(expectedLabel)
+        if (!labelMatches) {
+          throw new Error(`file: fieldKey "${fieldKey}" did not match field label "${fieldLabel}"`)
+        }
+      }
+      if (!(await locatorMatchesFileScope(authored, contextText, sectionText))) {
+        throw new Error(`file: fieldKey "${fieldKey}" did not match the requested context/section`)
+      }
+      if (!scoped) writeCachedLocator(cache, 'file', fieldLabel, exact, fieldId, fieldKey, authored)
       return authored
     }
     throw new Error(`fieldKey "${fieldKey}" did not resolve to a file input; refresh geometra_form_schema`)
   }
 
+  if (scoped) {
+    const matches = await findScopedFileInputsInPage(page, fieldLabel, exact, contextText, sectionText)
+    if (matches.length > 1) {
+      throw new Error(`file: ambiguous scoped match for field "${fieldLabel || '<unlabeled>'}"; matched ${matches.length} file inputs`)
+    }
+    return matches[0] ?? null
+  }
+
   if (fieldLabel) {
-    for (const frame of page.frames()) {
-      const locator = await findLabeledFileInput(frame, fieldLabel, exact)
-      if (!locator) continue
+    const matches = await findScopedFileInputsInPage(page, fieldLabel, exact)
+    if (matches.length > 1) {
+      throw new Error(`file: ambiguous label "${fieldLabel}" matched ${matches.length} file inputs; provide fieldKey, contextText, or sectionText`)
+    }
+    const locator = matches[0]
+    if (locator) {
       writeCachedLocator(cache, 'file', fieldLabel, exact, fieldId, undefined, locator)
       return locator
     }
@@ -2969,12 +3177,48 @@ async function findLabeledFileInputInPage(
   return null
 }
 
+function expectedUploadNames(paths: string[]): string[] {
+  return paths.map(path => path.split(/[/\\\\]/).pop() ?? path)
+}
+
+function uploadedNamesMatch(actual: string[], expected: string[]): boolean {
+  return actual.length === expected.length && actual.every((name, index) => name === expected[index])
+}
+
+async function locatorRetainsUploadedFiles(locator: Locator, paths: string[]): Promise<boolean> {
+  await delay(40)
+  const actual = await locator.evaluate((el) =>
+    el instanceof HTMLInputElement && el.type === 'file'
+      ? Array.from(el.files ?? []).map(file => file.name)
+      : [],
+  ).catch(() => [] as string[])
+  return uploadedNamesMatch(actual, expectedUploadNames(paths))
+}
+
+async function handleRetainsUploadedFiles(handle: ElementHandle<Element>, paths: string[]): Promise<boolean> {
+  await delay(40)
+  const actual = await handle.evaluate((el) =>
+    el instanceof HTMLInputElement && el.type === 'file'
+      ? Array.from(el.files ?? []).map(file => file.name)
+      : [],
+  ).catch(() => [] as string[])
+  return uploadedNamesMatch(actual, expectedUploadNames(paths))
+}
+
 async function attachHiddenInAllFrames(
   page: Page,
   paths: string[],
-  opts?: { fieldLabel?: string; exact?: boolean; cache?: FillLookupCache; fieldId?: string; fieldKey?: string },
+  opts?: {
+    fieldLabel?: string
+    exact?: boolean
+    cache?: FillLookupCache
+    fieldId?: string
+    fieldKey?: string
+    contextText?: string
+    sectionText?: string
+  },
 ): Promise<boolean> {
-  if (opts?.fieldLabel || opts?.fieldKey) {
+  if (opts?.fieldLabel || opts?.fieldKey || opts?.contextText || opts?.sectionText) {
     const labeled = await findLabeledFileInputInPage(
       page,
       opts.fieldLabel ?? '',
@@ -2982,35 +3226,32 @@ async function attachHiddenInAllFrames(
       opts.cache,
       opts.fieldId,
       opts.fieldKey,
+      opts.contextText,
+      opts.sectionText,
     )
     if (labeled) {
+      await assertLocatorMutable(labeled, 'file', 'file')
       try {
         await labeled.setInputFiles(paths)
-        return true
       } catch {
-        /* fall through to uncached scan */
+        return false
       }
+      if (!(await locatorRetainsUploadedFiles(labeled, paths))) {
+        throw new Error('file: matched input rejected or cleared the supplied files')
+      }
+      return true
     }
+    return false
   }
 
   for (const frame of page.frames()) {
-    if (opts?.fieldLabel) {
-      const labeled = await findLabeledFileInput(frame, opts.fieldLabel, opts.exact ?? false)
-      if (!labeled) continue
-      try {
-        await labeled.setInputFiles(paths)
-        return true
-      } catch {
-        /* try next frame */
-      }
-      continue
-    }
     const loc = frame.locator('input[type="file"]')
     const n = await loc.count()
     for (let i = 0; i < n; i++) {
+      if (await locatorMutationBlockReason(loc.nth(i), 'file')) continue
       try {
         await loc.nth(i).setInputFiles(paths)
-        return true
+        if (await locatorRetainsUploadedFiles(loc.nth(i), paths)) return true
       } catch {
         /* try next */
       }
@@ -3020,11 +3261,18 @@ async function attachHiddenInAllFrames(
 }
 
 async function attachViaChooser(page: Page, paths: string[], clickX: number, clickY: number): Promise<void> {
+  await assertPointMutable(page, clickX, clickY, 'file', 'file')
   const [chooser] = await Promise.all([
     page.waitForEvent('filechooser', { timeout: 12_000 }),
     page.mouse.click(clickX, clickY),
   ])
+  const input = chooser.element() as ElementHandle<Element>
+  const blockReason = await input.evaluate(mutationBlockReasonInPage, 'file')
+  if (blockReason) throw new Error(`file: chooser input is not mutable (${blockReason})`)
   await chooser.setFiles(paths)
+  if (!(await handleRetainsUploadedFiles(input, paths))) {
+    throw new Error('file: chooser input rejected or cleared the supplied files')
+  }
 }
 
 /**
@@ -3072,8 +3320,40 @@ async function attachViaDropPlaywright(page: Page, paths: string[], dropX: numbe
   const names = paths.map(p => p.split(/[/\\\\]/).pop() ?? 'file')
   const mimes = paths.map(mimeTypeForPath)
   await page.mouse.move(dropX, dropY)
-  await page.mainFrame().evaluate(
-    ({ bufs, ns, ms, x, y }: { bufs: number[][]; ns: string[]; ms: string[]; x: number; y: number }) => {
+  const result = await page.mainFrame().evaluate(
+    async ({ bufs, ns, ms, x, y }: { bufs: number[][]; ns: string[]; ms: string[]; x: number; y: number }) => {
+      function blockReason(target: Element): string | null {
+        function parent(node: Element): Element | null {
+          if (node.parentElement) return node.parentElement
+          const root = node.getRootNode()
+          return root instanceof ShadowRoot ? root.host : null
+        }
+        function within(node: Element, ancestor: Element): boolean {
+          let current: Element | null = node
+          while (current) {
+            if (current === ancestor) return true
+            current = parent(current)
+          }
+          return false
+        }
+        try {
+          if (target.matches(':disabled')) return 'disabled'
+        } catch { /* ignore */ }
+        if ((target instanceof HTMLInputElement || target instanceof HTMLTextAreaElement) && target.readOnly) return 'readonly'
+        let current: Element | null = target
+        while (current) {
+          if (current.hasAttribute('inert')) return 'inert'
+          if (current.getAttribute('aria-disabled')?.trim().toLowerCase() === 'true') return 'aria-disabled'
+          if (current.getAttribute('aria-readonly')?.trim().toLowerCase() === 'true') return 'aria-readonly'
+          if (current instanceof HTMLFieldSetElement && current.disabled) {
+            const legend = Array.from(current.children).find(child => child instanceof HTMLLegendElement)
+            if (!(legend instanceof HTMLLegendElement) || !within(target, legend)) return 'disabled fieldset'
+          }
+          current = parent(current)
+        }
+        return null
+      }
+
       const makeDataTransfer = (): DataTransfer => {
         const dt = new DataTransfer()
         for (let i = 0; i < bufs.length; i++) {
@@ -3083,7 +3363,8 @@ async function attachViaDropPlaywright(page: Page, paths: string[], dropX: numbe
         }
         return dt
       }
-      const dispatchSequence = (target: Element): void => {
+      const dispatchSequence = (target: Element): boolean => {
+        let handled = false
         // Each event needs its own DataTransfer because some frameworks
         // consume the items list during dragenter/dragover inspection.
         for (const type of ['dragenter', 'dragover', 'drop'] as const) {
@@ -3096,23 +3377,22 @@ async function attachViaDropPlaywright(page: Page, paths: string[], dropX: numbe
             clientY: y,
             dataTransfer: dt,
           })
-          // Some browsers/frameworks freeze the dataTransfer getter; re-define
-          // it defensively so listeners read the files.
           try {
             Object.defineProperty(ev, 'dataTransfer', { value: dt, configurable: true })
           } catch { /* ignore */ }
-          target.dispatchEvent(ev)
+          const dispatched = target.dispatchEvent(ev)
+          if (!dispatched || ev.defaultPrevented) handled = true
         }
+        return handled
       }
+
       const deepest = document.elementFromPoint(x, y)
-      const targets: Element[] = []
-      if (deepest) targets.push(deepest)
-      // Walk up a few ancestors looking for anything that looks like a dropzone
-      // root (react-dropzone emits `data-rfd-*`; Greenhouse uses div.drop-zone;
-      // Ashby uses role="button" wrappers). We dispatch on the first dropzone-ish
-      // ancestor AND the deepest element, because we cannot tell statically
-      // which one has the real listener.
-      let p: Element | null = deepest?.parentElement ?? null
+      if (!deepest) return { accepted: false, blockReason: null }
+      const blocked = blockReason(deepest)
+      if (blocked) return { accepted: false, blockReason: blocked }
+
+      const targets: Element[] = [deepest]
+      let p: Element | null = deepest.parentElement
       for (let depth = 0; depth < 12 && p; depth++) {
         const tag = p.tagName.toLowerCase()
         const attrs = p.getAttributeNames()
@@ -3124,21 +3404,28 @@ async function attachViaDropPlaywright(page: Page, paths: string[], dropX: numbe
         if (looksLikeDropzone && !targets.includes(p)) targets.push(p)
         p = p.parentElement
       }
-      if (targets.length === 0) targets.push(document.body)
-      for (const t of targets) dispatchSequence(t)
-      // As a final fallback, if there is a hidden input[type=file] scoped to
-      // the nearest form/section, set its `files` via DataTransfer and dispatch
-      // the React-friendly native input value setter so react-hook-form notices.
-      const host = deepest?.closest('form, [role="form"], fieldset, section, div') ?? document.body
+
+      const host = deepest.closest('form, [role="form"], fieldset, section, div') ?? document.body
       const fileInput = host.querySelector('input[type="file"]') as HTMLInputElement | null
-      if (fileInput) {
+      const beforeFileNames = Array.from(fileInput?.files ?? []).map(file => file.name)
+      const beforeRenderedText = [host, ...targets]
+        .map(node => node.textContent ?? '')
+        .join(' ')
+        .toLowerCase()
+
+      let handled = false
+      for (const target of targets) {
+        if (!blockReason(target)) handled = dispatchSequence(target) || handled
+      }
+
+      // A scoped file input can provide strong acceptance evidence, but only
+      // after application handlers have had a chance to reject/clear it.
+      if (fileInput && !blockReason(fileInput)) {
         const dt = makeDataTransfer()
         try {
           Object.defineProperty(fileInput, 'files', { value: dt.files, configurable: true })
         } catch { /* ignore */ }
         try {
-          // React overrides the input value setter; we need the native prototype
-          // setter so React sees the change.
           const proto = Object.getPrototypeOf(fileInput)
           const descriptor = Object.getOwnPropertyDescriptor(proto, 'value')
           descriptor?.set?.call(fileInput, '')
@@ -3146,9 +3433,39 @@ async function attachViaDropPlaywright(page: Page, paths: string[], dropX: numbe
         fileInput.dispatchEvent(new Event('input', { bubbles: true }))
         fileInput.dispatchEvent(new Event('change', { bubbles: true }))
       }
+
+      // Framework drop handlers commonly commit on a microtask or animation
+      // frame. Only report success after observable page state contains every
+      // submitted filename; canceling dragover alone is not acceptance.
+      await Promise.resolve()
+      await new Promise<void>(resolveTimer => setTimeout(resolveTimer, 32))
+      const settledFileNames = Array.from(fileInput?.files ?? []).map(file => file.name)
+      const fileInputAccepted =
+        Boolean(fileInput && !blockReason(fileInput)) &&
+        ns.every(name => settledFileNames.includes(name)) &&
+        (settledFileNames.length !== beforeFileNames.length || settledFileNames.some((name, index) => name !== beforeFileNames[index]))
+      const renderedText = [host, ...targets]
+        .map(node => node.textContent ?? '')
+        .join(' ')
+        .toLowerCase()
+      const renderedAcceptance =
+        renderedText !== beforeRenderedText &&
+        ns.every(name => renderedText.includes(name.toLowerCase()))
+
+      return {
+        accepted: fileInputAccepted || (handled && renderedAcceptance),
+        blockReason: null,
+      }
     },
     { bufs: buffers.map(b => Array.from(b)), ns: names, ms: mimes, x: dropX, y: dropY },
   )
+
+  if (result.blockReason) {
+    throw new Error(`file: drop target is not mutable (${result.blockReason})`)
+  }
+  if (!result.accepted) {
+    throw new Error('file: drop target did not accept the supplied files')
+  }
 }
 
 /**
@@ -3164,7 +3481,13 @@ const ATTACH_BUTTON_PATTERN = /attach|upload|add.file|choose.file|browse/i
  * Find an Attach/Upload button near a field label (e.g. Greenhouse's "Attach" button
  * inside a "Resume/CV" section). Returns the button Locator or null.
  */
-async function findAttachButtonNearLabel(page: Page, fieldLabel: string): Promise<Locator | null> {
+async function findAttachButtonNearLabel(
+  page: Page,
+  fieldLabel: string,
+  contextText?: string,
+  sectionText?: string,
+): Promise<Locator | null> {
+  const matches: Locator[] = []
   for (const frame of page.frames()) {
     // Find all buttons/links whose text matches attach-like patterns
     const buttons = frame.locator('button, a, [role="button"]')
@@ -3188,11 +3511,14 @@ async function findAttachButtonNearLabel(page: Page, fieldLabel: string): Promis
           },
           fieldLabel,
         )
-        if (nearLabel) return btn
+        if (nearLabel && await locatorMatchesFileScope(btn, contextText, sectionText)) matches.push(btn)
       } catch { continue }
     }
   }
-  return null
+  if (matches.length > 1) {
+    throw new Error(`file: ambiguous Attach/Upload control for field "${fieldLabel}"; provide a more specific contextText or sectionText`)
+  }
+  return matches[0] ?? null
 }
 
 export async function attachFiles(
@@ -3208,6 +3534,8 @@ export async function attachFiles(
     strategy?: FileAttachStrategy
     dropX?: number
     dropY?: number
+    contextText?: string
+    sectionText?: string
     cache?: FillLookupCache
   },
 ): Promise<void> {
@@ -3218,6 +3546,40 @@ export async function attachFiles(
   const exact = opts?.exact ?? false
   const dropX = opts?.dropX
   const dropY = opts?.dropY
+  const hasClickX = clickX !== undefined
+  const hasClickY = clickY !== undefined
+  const hasDropX = dropX !== undefined
+  const hasDropY = dropY !== undefined
+  const hasClick = hasClickX && hasClickY
+  const hasDrop = hasDropX && hasDropY
+  const hasFieldLabel = Boolean(fieldLabel?.trim())
+  const hasFieldKey = Boolean(opts?.fieldKey)
+  const hasSemanticTarget = hasFieldLabel || hasFieldKey
+  const hasSemanticExtras = Boolean(opts?.fieldId || opts?.fieldKey || fieldLabel || opts?.contextText || opts?.sectionText || opts?.exact !== undefined)
+
+  if (hasClickX !== hasClickY) throw new Error('file: clickX and clickY must be provided together')
+  if (hasDropX !== hasDropY) throw new Error('file: dropX and dropY must be provided together')
+  if ((opts?.contextText || opts?.sectionText || opts?.exact !== undefined) && !hasFieldLabel) {
+    throw new Error('file: contextText, sectionText, and exact require fieldLabel')
+  }
+  if (opts?.fieldId && !hasSemanticTarget) {
+    throw new Error('file: fieldId requires fieldLabel or fieldKey')
+  }
+  if (strategy === 'chooser') {
+    if (!hasClick) throw new Error('file: chooser strategy requires x,y click coordinates')
+    if (hasDrop || hasSemanticExtras) throw new Error('file: chooser strategy accepts only a coordinate target')
+  } else if (strategy === 'drop') {
+    if (!hasDrop) throw new Error('file: drop strategy requires dropX, dropY')
+    if (hasClick || hasSemanticExtras) throw new Error('file: drop strategy accepts only a drop coordinate target')
+  } else if (strategy === 'hidden') {
+    if (!hasSemanticTarget) throw new Error('file: hidden strategy requires fieldLabel or fieldKey')
+    if (hasClick || hasDrop) throw new Error('file: hidden strategy does not accept coordinates')
+  } else {
+    if (hasDrop) throw new Error('file: dropX/dropY require strategy "drop"')
+    if (hasClick === hasSemanticTarget) {
+      throw new Error('file: auto strategy requires exactly one explicit target: click coordinates, fieldLabel, or fieldKey')
+    }
+  }
 
   if (strategy === 'chooser' || (strategy === 'auto' && clickX !== undefined && clickY !== undefined)) {
     if (clickX === undefined || clickY === undefined) {
@@ -3233,6 +3595,8 @@ export async function attachFiles(
       fieldKey: opts?.fieldKey,
       fieldLabel,
       exact,
+      contextText: opts?.contextText,
+      sectionText: opts?.sectionText,
       cache: opts?.cache,
     })) return
     if (strategy === 'hidden') {
@@ -3243,9 +3607,10 @@ export async function attachFiles(
     }
     // Fallback: look for an Attach/Upload button near the field label and use the file chooser
     if (fieldLabel && strategy === 'auto') {
-      const attachBtn = await findAttachButtonNearLabel(page, fieldLabel)
+      const attachBtn = await findAttachButtonNearLabel(page, fieldLabel, opts?.contextText, opts?.sectionText)
       if (attachBtn) {
         try {
+          await assertLocatorMutable(attachBtn, 'file', 'file')
           await attachBtn.scrollIntoViewIfNeeded()
           const box = await attachBtn.boundingBox()
           if (box) {
@@ -3258,6 +3623,12 @@ export async function attachFiles(
     if (fieldLabel) {
       throw new Error(`file: no input[type=file] matching field "${fieldLabel}"`)
     }
+    if (opts?.fieldKey) {
+      throw new Error(`file: no input[type=file] matching fieldKey "${opts.fieldKey}"`)
+    }
+    if (opts?.contextText || opts?.sectionText) {
+      throw new Error('file: no input[type=file] matched the requested context/section')
+    }
   }
 
   if (strategy === 'drop' || (strategy === 'auto' && dropX !== undefined && dropY !== undefined)) {
@@ -3268,17 +3639,7 @@ export async function attachFiles(
     return
   }
 
-  for (const frame of page.frames()) {
-    const loc = frame.locator('input[type="file"]')
-    const n = await loc.count()
-    if (n > 0) {
-      await loc.first().setInputFiles(paths)
-      return
-    }
-  }
-  throw new Error(
-    'file: no input[type=file] in any frame; pass x,y (chooser), dropX/dropY (drop), or strategy hidden',
-  )
+  throw new Error('file: explicit upload target did not accept the supplied files')
 }
 
 async function findLabeledEditableField(
@@ -3418,7 +3779,7 @@ function fieldValueMatches(actual: string | null | undefined, expected: string):
   const normalizedActual = normalizedFieldValue(actual)
   const normalizedExpected = normalizedFieldValue(expected)
   if (!normalizedActual || !normalizedExpected) return false
-  return normalizedActual === normalizedExpected || normalizedActual.includes(normalizedExpected)
+  return normalizedActual === normalizedExpected
 }
 
 async function setLocatorTextValue(
@@ -3426,6 +3787,7 @@ async function setLocatorTextValue(
   value: string,
   opts?: { imeFriendly?: boolean },
 ): Promise<boolean> {
+  if (await locatorMutationBlockReason(locator, 'text')) return false
   try {
     return await locator.evaluate((el, payload: { value: string; imeFriendly: boolean }) => {
       const nextValue = payload.value
@@ -3642,6 +4004,43 @@ async function attemptNativeBatchFill(page: Page, fields: FormFieldFill[]): Prom
         return style.display !== 'none' && style.visibility !== 'hidden'
       }
 
+      function mutationBlockReason(target: Element): string | null {
+        function composedParent(node: Element): Element | null {
+          if (node.parentElement) return node.parentElement
+          const root = node.getRootNode()
+          return root instanceof ShadowRoot ? root.host : null
+        }
+        function composedDescendantOf(node: Element, ancestor: Element): boolean {
+          let current: Element | null = node
+          while (current) {
+            if (current === ancestor) return true
+            current = composedParent(current)
+          }
+          return false
+        }
+        try {
+          if (target.matches(':disabled')) return 'disabled'
+        } catch { /* ignore */ }
+        if (
+          (target instanceof HTMLInputElement || target instanceof HTMLTextAreaElement) &&
+          target.readOnly
+        ) return 'readonly'
+        let current: Element | null = target
+        while (current) {
+          if (current.hasAttribute('inert')) return 'inert'
+          if (current.getAttribute('aria-disabled')?.trim().toLowerCase() === 'true') return 'aria-disabled'
+          if (current.getAttribute('aria-readonly')?.trim().toLowerCase() === 'true') return 'aria-readonly'
+          if (current instanceof HTMLFieldSetElement && current.disabled) {
+            const firstLegend = Array.from(current.children).find(child => child instanceof HTMLLegendElement)
+            if (!(firstLegend instanceof HTMLLegendElement) || !composedDescendantOf(target, firstLegend)) {
+              return 'disabled fieldset'
+            }
+          }
+          current = composedParent(current)
+        }
+        return null
+      }
+
       function referencedText(ids: string | null, visited?: Set<string>): string | undefined {
         if (!ids) return undefined
         const seen = visited ?? new Set<string>()
@@ -3725,6 +4124,7 @@ async function attemptNativeBatchFill(page: Page, fields: FormFieldFill[]): Prom
       }
 
       function setInputCheckedReactAware(target: HTMLInputElement, next: boolean): boolean {
+        if (mutationBlockReason(target)) return false
         const hadReactTracker = clearReactTracker(target, next)
         if (!hadReactTracker && target.checked === next) return true
         const descriptor = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'checked')
@@ -3873,6 +4273,7 @@ async function attemptNativeBatchFill(page: Page, fields: FormFieldFill[]): Prom
             continue
           }
           if (!matches(explicitLabelText(control), fieldLabel, exact)) continue
+          if (mutationBlockReason(control)) return false
           if (control instanceof HTMLInputElement || control instanceof HTMLTextAreaElement) {
             const inputType = control instanceof HTMLInputElement ? control.type : 'textarea'
             const v = canonicalizeHtmlInputValueInPage(inputType, value)
@@ -3880,7 +4281,7 @@ async function attemptNativeBatchFill(page: Page, fields: FormFieldFill[]): Prom
             clearReactTracker(control)
             setInputLikeValue(control, v)
             dispatch(control)
-            return matches(currentValue(control), v, false)
+            return normalize(currentValue(control)) === normalize(v)
           }
           if (control instanceof HTMLElement && control.isContentEditable) {
             if (!isPlainContentEditableBatch(control)) return false
@@ -3888,7 +4289,7 @@ async function attemptNativeBatchFill(page: Page, fields: FormFieldFill[]): Prom
             clearReactTracker(control)
             control.textContent = value
             dispatch(control)
-            return matches(currentValue(control), value, false)
+            return normalize(currentValue(control)) === normalize(value)
           }
         }
         return false
@@ -3899,8 +4300,10 @@ async function attemptNativeBatchFill(page: Page, fields: FormFieldFill[]): Prom
         for (const control of controls) {
           if (!(control instanceof HTMLSelectElement) || !visible(control)) continue
           if (!matches(explicitLabelText(control), fieldLabel, exact)) continue
+          if (mutationBlockReason(control)) return false
           const expected = normalize(value)
           const option = Array.from(control.options).find((candidate) => {
+            if (candidate.disabled || (candidate.parentElement instanceof HTMLOptGroupElement && candidate.parentElement.disabled)) return false
             const label = normalize(candidate.textContent)
             const rawValue = normalize(candidate.value)
             return exact ? label === expected || rawValue === expected : label.includes(expected) || rawValue.includes(expected)
@@ -3908,7 +4311,7 @@ async function attemptNativeBatchFill(page: Page, fields: FormFieldFill[]): Prom
           if (!option) return false
           control.value = option.value
           dispatch(control)
-          return matches(currentValue(control), value, false) || normalize(control.value) === expected
+          return control.selectedIndex === option.index
         }
         return false
       }
@@ -3968,13 +4371,15 @@ async function attemptNativeBatchFill(page: Page, fields: FormFieldFill[]): Prom
             if (option instanceof HTMLLabelElement) {
               const control = option.control
               if (control instanceof HTMLInputElement) return setInputCheckedReactAware(control, true)
+              if (mutationBlockReason(option)) return false
               option.click()
-              return true
+              return false
             }
             // role=radio / role=checkbox: click and verify aria-checked
             // / aria-selected. The native batch fill used to silently return
             // true here, which masked Pinecone's commit-on-rerender bug.
             if (option.getAttribute('role') === 'radio' || option.getAttribute('role') === 'checkbox') {
+              if (mutationBlockReason(option)) return false
               option.click()
               return (
                 option.getAttribute('aria-checked') === 'true' ||
@@ -3993,6 +4398,7 @@ async function attemptNativeBatchFill(page: Page, fields: FormFieldFill[]): Prom
             // JobForge round-2 marathon — Pinecone Sr SWE Database Team
             // #320 and LangChain SE Manager #325.
             const beforeSig = selectionSignature(options)
+            if (mutationBlockReason(option)) return false
             option.click()
             const afterSig = selectionSignature(options)
             if (beforeSig === afterSig) return false
@@ -4008,6 +4414,7 @@ async function attemptNativeBatchFill(page: Page, fields: FormFieldFill[]): Prom
           if (!(input instanceof HTMLInputElement) || !visible(input)) continue
           if (controlType && input.type !== controlType) continue
           if (!matches(explicitLabelText(input), label, exact)) continue
+          if (mutationBlockReason(input)) return false
           if (!setInputCheckedReactAware(input, checked)) return false
           return input.checked === checked
         }
@@ -4019,6 +4426,7 @@ async function attemptNativeBatchFill(page: Page, fields: FormFieldFill[]): Prom
           const control = labelEl.control
           if (!(control instanceof HTMLInputElement)) continue
           if (controlType && control.type !== controlType) continue
+          if (mutationBlockReason(control)) return false
           if (!setInputCheckedReactAware(control, checked)) return false
           return control.checked === checked
         }
@@ -4328,6 +4736,10 @@ export async function fillOtp(
     )
   }
 
+  for (let index = 0; index < liveCount; index++) {
+    await assertLocatorMutable(group.boxes.nth(index), 'text', `fillOtp: OTP cell ${index + 1}`)
+  }
+
   // Click the leftmost box via its center point. We use a low-level
   // bounding-box click because a semantic "click the first input" path
   // resolves to whichever input paints topmost in the stacking order,
@@ -4565,6 +4977,7 @@ export async function setFieldText(
     throw new Error(`setFieldText: no visible editable field matching "${fieldLabel}"`)
   }
 
+  await assertLocatorMutable(locator, 'text', 'setFieldText')
   await locator.scrollIntoViewIfNeeded()
   const inputType = await locator.evaluate(el => {
     if (el instanceof HTMLInputElement) return el.type
@@ -4574,6 +4987,7 @@ export async function setFieldText(
   const normalized = canonicalizeHtmlInputValue(inputType, value)
   const applied = await setLocatorTextValue(locator, normalized, { imeFriendly: opts?.imeFriendly })
   if (!applied) {
+    await assertLocatorMutable(locator, 'text', 'setFieldText')
     try {
       await locator.fill(normalized)
     } catch {
@@ -4584,6 +4998,7 @@ export async function setFieldText(
     }
   }
 
+  await delay(40)
   const current = await locatorCurrentValue(locator)
   if (fieldValueMatches(current, normalized)) return
 
@@ -4599,8 +5014,9 @@ async function setNativeSelectByLabel(
   exact: boolean,
   optionIndex?: number,
 ): Promise<boolean> {
+  if (await locatorMutationBlockReason(locator, 'select')) return false
   try {
-    return await locator.evaluate((el, payload) => {
+    return await locator.evaluate(async (el, payload) => {
       if (!(el instanceof HTMLSelectElement)) return false
       const normalize = (input: string | undefined | null) => input?.replace(/\s+/g, ' ').trim().toLowerCase() ?? ''
       const expected = normalize(payload.value)
@@ -4629,7 +5045,8 @@ async function setNativeSelectByLabel(
       el.selectedIndex = option.index
       el.dispatchEvent(new Event('input', { bubbles: true }))
       el.dispatchEvent(new Event('change', { bubbles: true }))
-      return true
+      await new Promise<void>(resolveTimer => setTimeout(resolveTimer, 40))
+      return el.selectedIndex === option.index && el.selectedOptions[0] === option
     }, { value, exact, optionIndex })
   } catch {
     return false
@@ -4654,6 +5071,38 @@ async function chooseValueFromLabeledGroup(
         if (rect.width <= 0 || rect.height <= 0) return false
         const style = getComputedStyle(el)
         return style.display !== 'none' && style.visibility !== 'hidden'
+      }
+
+      function blocked(target: Element): boolean {
+        function parent(node: Element): Element | null {
+          if (node.parentElement) return node.parentElement
+          const root = node.getRootNode()
+          return root instanceof ShadowRoot ? root.host : null
+        }
+        function within(node: Element, ancestor: Element): boolean {
+          let current: Element | null = node
+          while (current) {
+            if (current === ancestor) return true
+            current = parent(current)
+          }
+          return false
+        }
+        try {
+          if (target.matches(':disabled')) return true
+        } catch { /* ignore */ }
+        if ((target instanceof HTMLInputElement || target instanceof HTMLTextAreaElement) && target.readOnly) return true
+        let current: Element | null = target
+        while (current) {
+          if (current.hasAttribute('inert')) return true
+          if (current.getAttribute('aria-disabled')?.trim().toLowerCase() === 'true') return true
+          if (current.getAttribute('aria-readonly')?.trim().toLowerCase() === 'true') return true
+          if (current instanceof HTMLFieldSetElement && current.disabled) {
+            const legend = Array.from(current.children).find(child => child instanceof HTMLLegendElement)
+            if (!(legend instanceof HTMLLegendElement) || !within(target, legend)) return true
+          }
+          current = parent(current)
+        }
+        return false
       }
 
       function matches(candidate: string | undefined | null): boolean {
@@ -4808,6 +5257,7 @@ async function chooseValueFromLabeledGroup(
       }
 
       function setInputCheckedReactAware(target: HTMLInputElement, next: boolean): boolean {
+        if (blocked(target)) return false
         const hadReactTracker = clearReactTracker(target, next)
         if (!hadReactTracker && target.checked === next) return true
         const descriptor = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'checked')
@@ -4833,6 +5283,7 @@ async function chooseValueFromLabeledGroup(
             const labelBeforeSig = selectionSignature(options)
             const control = option.control
             if (control instanceof HTMLInputElement) return setInputCheckedReactAware(control, true)
+            if (blocked(option)) return false
             option.click()
             // No backing input — verify via group signature change so we don't
             // silently no-op on label wrappers whose target is unparented.
@@ -4840,6 +5291,7 @@ async function chooseValueFromLabeledGroup(
             return labelBeforeSig !== labelAfterSig
           }
           if (option.getAttribute('role') === 'radio' || option.getAttribute('role') === 'checkbox') {
+            if (blocked(option)) return false
             option.click()
             return option.getAttribute('aria-checked') === 'true' || option.getAttribute('aria-selected') === 'true'
           }
@@ -4850,6 +5302,7 @@ async function chooseValueFromLabeledGroup(
           // was a no-op — return false so the caller can try the next strategy
           // (pickListboxOption fallback, etc) instead of silently succeeding.
           const beforeSig = selectionSignature(options)
+          if (blocked(option)) return false
           option.click()
           const afterSig = selectionSignature(options)
           if (beforeSig === afterSig) {
@@ -4983,6 +5436,7 @@ export async function setFieldChoice(
     fieldKey: opts?.fieldKey,
   })
   if (locator) {
+    await assertLocatorMutable(locator, 'select', 'setFieldChoice')
     await locator.scrollIntoViewIfNeeded()
     const isNativeSelect = await locator.evaluate(el => el instanceof HTMLSelectElement)
     if (await setNativeSelectByLabel(locator, value, exact, opts?.optionIndex)) {
@@ -5128,6 +5582,8 @@ export async function fillFields(page: Page, fields: FormFieldFill[], cache = cr
           fieldId: field.fieldId,
           fieldKey: field.fieldKey,
           fieldLabel: field.fieldLabel,
+          contextText: field.contextText,
+          sectionText: field.sectionText,
           exact: field.exact,
           cache,
         })
@@ -5170,64 +5626,42 @@ export async function selectNativeOption(page: Page, x: number, y: number, opt: 
   if (opt.value === undefined && opt.label === undefined && opt.index === undefined) {
     throw new Error('selectOption: provide at least one of value, label, or index')
   }
+  if (opt.index !== undefined && (!Number.isFinite(opt.index) || !Number.isInteger(opt.index) || opt.index < 0)) {
+    throw new Error('selectOption: index must be a non-negative integer')
+  }
+  await assertPointMutable(page, x, y, 'select', 'selectOption')
   await page.mouse.click(x, y)
   await delay(40)
   for (const frame of page.frames()) {
     const applied = await frame.evaluate(
-      (payload: { value: string | null; label: string | null; index: number | undefined }) => {
+      async (payload: { value: string | null; label: string | null; index: number | undefined }) => {
         const normalize = (input: string | undefined | null) => input?.replace(/\s+/g, ' ').trim().toLowerCase() ?? ''
-        const optionMatchesExpected = (
-          o: HTMLOptionElement,
-          expected: string,
-        ): boolean => {
+        const enabled = (o: HTMLOptionElement): boolean =>
+          !o.disabled && !(o.parentElement instanceof HTMLOptGroupElement && o.parentElement.disabled)
+        const optionMatchesPayload = (o: HTMLOptionElement): boolean => {
           if (o.disabled || (o.parentElement instanceof HTMLOptGroupElement && o.parentElement.disabled)) return false
-          const label = normalize(o.textContent)
-          const rawValue = normalize(o.value)
-          return label === expected || rawValue === expected || label.includes(expected) || rawValue.includes(expected)
+          if (payload.value !== null && normalize(o.value) !== normalize(payload.value)) return false
+          if (payload.label !== null && normalize(o.textContent) !== normalize(payload.label)) return false
+          if (payload.index !== undefined && o.index !== payload.index) return false
+          return true
         }
 
         const a = document.activeElement
         if (!a || a.tagName !== 'SELECT') return false
         const sel = a as HTMLSelectElement
-        if (typeof payload.index === 'number' && Number.isFinite(payload.index)) {
-          const i = Math.trunc(payload.index)
-          if (i < 0 || i >= sel.options.length) return false
-          const indexed = sel.options[i]!
-          if (indexed.disabled || (indexed.parentElement instanceof HTMLOptGroupElement && indexed.parentElement.disabled)) return false
-          if (payload.value !== null && normalize(indexed.value) !== normalize(payload.value)) return false
-          if (payload.label !== null && !normalize(indexed.textContent).includes(normalize(payload.label))) return false
-          sel.selectedIndex = i
-        } else if (payload.value !== null && payload.value !== undefined) {
-          const raw = String(payload.value)
-          sel.value = raw
-          const expected = normalize(raw)
-          if (!expected) return false
-          const selected = sel.selectedOptions[0]
-          const ok =
-            selected &&
-            !selected.disabled &&
-            !(selected.parentElement instanceof HTMLOptGroupElement && selected.parentElement.disabled) &&
-            (normalize(selected.value) === expected ||
-              normalize(selected.textContent) === expected ||
-              normalize(selected.value).includes(expected) ||
-              normalize(selected.textContent).includes(expected))
-          if (!ok) {
-            const found = Array.from(sel.options).find(o => optionMatchesExpected(o, expected))
-            if (!found) return false
-            sel.selectedIndex = found.index
-          }
-        } else if (payload.label !== null && payload.label !== undefined) {
-          const expected = normalize(payload.label)
-          if (!expected) return false
-          const optEl = Array.from(sel.options).find(o => optionMatchesExpected(o, expected))
-          if (!optEl) return false
-          sel.selectedIndex = optEl.index
-        } else {
-          return false
-        }
+        if (sel.matches(':disabled') || sel.getAttribute('aria-disabled') === 'true' || sel.getAttribute('aria-readonly') === 'true') return false
+        if (sel.closest('[inert], [aria-disabled="true"], [aria-readonly="true"]')) return false
+        const candidate = payload.index !== undefined
+          ? sel.options.item(payload.index)
+          : Array.from(sel.options).find(optionMatchesPayload) ?? null
+        if (!candidate || !enabled(candidate) || !optionMatchesPayload(candidate)) return false
+
+        sel.selectedIndex = candidate.index
         sel.dispatchEvent(new Event('input', { bubbles: true }))
         sel.dispatchEvent(new Event('change', { bubbles: true }))
-        return true
+        await new Promise<void>(resolveTimer => setTimeout(resolveTimer, 40))
+        const selected = sel.selectedOptions[0]
+        return sel.selectedIndex === candidate.index && selected === candidate && optionMatchesPayload(selected)
       },
       {
         value: opt.value ?? null,
@@ -5252,6 +5686,23 @@ export async function pickListboxOption(
 ): Promise<void> {
   let anchor: AnchorPoint | undefined
   const exact = opts?.exact ?? false
+  const hasOpenX = opts?.openX !== undefined
+  const hasOpenY = opts?.openY !== undefined
+  if (hasOpenX !== hasOpenY) {
+    throw new Error('listboxPick: openX and openY must be provided together')
+  }
+  if ((hasOpenX || hasOpenY) && (opts?.fieldLabel || opts?.fieldId || opts?.fieldKey)) {
+    throw new Error('listboxPick: coordinate opening cannot be combined with fieldLabel, fieldId, or fieldKey')
+  }
+  if (hasOpenX && opts?.query !== undefined) {
+    throw new Error('listboxPick: query cannot be combined with coordinate opening')
+  }
+  if (opts?.fieldId && !opts.fieldLabel && !opts.fieldKey) {
+    throw new Error('listboxPick: fieldId requires fieldLabel or fieldKey and cannot be used as an unscoped hint')
+  }
+  if (!opts?.fieldLabel && !opts?.fieldKey && !hasOpenX) {
+    throw new Error('listboxPick: provide fieldLabel, fieldKey, or a complete openX/openY target before selecting an option')
+  }
   let attemptedSelection = false
   let selectedOptionText: string | undefined
   let openedHandle: ElementHandle<Element> | null | undefined
@@ -5275,15 +5726,15 @@ export async function pickListboxOption(
     popupScope = await resolveOwnedPopupHandle(openedHandle)
   }
 
-  if (opts?.fieldLabel) {
+  if (opts?.fieldLabel || opts?.fieldKey) {
     let opened
     try {
-      opened = await openDropdownControl(page, opts.fieldLabel, exact, opts.cache, opts.fieldId, opts.fieldKey)
+      opened = await openDropdownControl(page, opts.fieldLabel ?? '', exact, opts.cache, opts.fieldId, opts.fieldKey)
     } catch {
       throw new Error(listboxErrorMessage({
         reason: 'field_not_found',
         requestedLabel: label,
-        fieldLabel: opts.fieldLabel,
+        fieldLabel: opts.fieldLabel ?? opts.fieldKey,
         query: opts?.query,
         exact,
       }))
@@ -5301,6 +5752,9 @@ export async function pickListboxOption(
     }
     await refreshPopupScope()
   } else if (opts?.openX !== undefined && opts?.openY !== undefined) {
+    await assertPointMutable(page, opts.openX, opts.openY, 'select', 'listboxPick')
+    openedHandle = await elementHandleAtPoint(page, opts.openX, opts.openY)
+    if (!openedHandle) throw new Error('listboxPick: no control at openX/openY')
     await page.mouse.click(opts.openX, opts.openY)
     anchor = { x: opts.openX, y: opts.openY }
     await delay(120)
@@ -5317,22 +5771,20 @@ export async function pickListboxOption(
     // popup. If the pointer click did not commit, the keyboard fallback
     // below deliberately reopens this exact control and selects by Enter.
     await dispatchListboxCommitEvents(openedHandle)
-    if (
-      !opts?.fieldLabel ||
-      await confirmListboxSelection(page, opts.fieldLabel, label, exact, anchor, openedHandle, selectedOptionText, {
+    if (opts?.fieldLabel) {
+      if (await confirmListboxSelection(page, opts.fieldLabel, label, exact, anchor, openedHandle, selectedOptionText, {
         editable: openedEditable,
-      })
-    ) {
-      return true
+      })) return true
+      return false
     }
-    return false
+    return await confirmListboxSelectionWithoutLabel(page, label, exact, anchor, openedHandle, selectedOptionText)
   }
 
   const dismissAfterSelection = async (): Promise<boolean> => {
     if (!opts?.fieldLabel) {
       await page.keyboard.press('Tab')
       await delay(50)
-      return true
+      return await confirmListboxSelectionWithoutLabel(page, label, exact, anchor, openedHandle, selectedOptionText)
     }
     if (await dismissAndReVerifySelection(page, label, exact, openedHandle, selectedOptionText)) {
       return true
@@ -5427,12 +5879,12 @@ export async function pickListboxOption(
       selectedOptionText = keyboardSelection
       attemptedSelection = true
       await dispatchListboxCommitEvents(openedHandle)
-      if (
-        !opts?.fieldLabel ||
-        await confirmListboxSelection(page, opts.fieldLabel, label, exact, anchor, openedHandle, selectedOptionText, {
+      const keyboardConfirmed = opts?.fieldLabel
+        ? await confirmListboxSelection(page, opts.fieldLabel, label, exact, anchor, openedHandle, selectedOptionText, {
           editable: openedEditable,
         })
-      ) {
+        : await confirmListboxSelectionWithoutLabel(page, label, exact, anchor, openedHandle, selectedOptionText)
+      if (keyboardConfirmed) {
         if (await dismissAfterSelection() && await postCommitVerify()) return
       }
     }
@@ -5704,8 +6156,15 @@ export async function setCheckedControl(page: Page, label: string, opts?: SetChe
     target = matches[0]!.locator
   }
 
+  await assertLocatorMutable(target, 'toggle', 'setChecked')
   const result = await applyToggleState(target, desiredChecked)
-  if (result.success) return
+  if (result.success) {
+    await delay(40)
+    const persisted = await target.evaluate((el, desired) =>
+      (el instanceof HTMLInputElement ? el.checked : el.getAttribute('aria-checked') === 'true') === desired,
+    desiredChecked).catch(() => false)
+    if (persisted) return
+  }
   if (result.reason === 'radio-uncheck') {
     throw new Error(`setChecked: radio "${result.name}" cannot be unchecked directly; choose a different option instead`)
   }

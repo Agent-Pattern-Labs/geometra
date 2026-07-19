@@ -113,6 +113,43 @@ describe('extractGeometry', () => {
     await page.close()
   })
 
+  it('reports native invalid state without dispatching invalid events', async () => {
+    const page = await browser.newPage({ viewport: { width: 800, height: 600 } })
+    await page.setContent(`
+      <form>
+        <label for="email-input">Email</label>
+        <input
+          id="email-input"
+          type="email"
+          required
+          value="not-an-email"
+          aria-describedby="email-error"
+        />
+        <p id="email-error">Enter a valid email address.</p>
+      </form>
+      <script>
+        window.invalidEventCount = 0
+        document.getElementById('email-input').addEventListener('invalid', () => {
+          window.invalidEventCount += 1
+        })
+      </script>
+    `)
+
+    const snapshot = await extractGeometry(page)
+    const nodes = flattenSnapshot(snapshot.tree, snapshot.layout)
+    const input = nodes.find(node =>
+      node.tree.semantic?.role === 'textbox' &&
+      node.tree.semantic?.ariaLabel === 'Email',
+    )
+
+    expect(input).toBeDefined()
+    expect(input?.tree.semantic?.ariaInvalid).toBe(true)
+    expect(input?.tree.semantic?.validationError).toBe('Enter a valid email address.')
+    expect(await page.evaluate(() => (window as unknown as { invalidEventCount: number }).invalidEventCount)).toBe(0)
+
+    await page.close()
+  })
+
   it('uses button-like input values as accessible button labels', async () => {
     const page = await browser.newPage({ viewport: { width: 800, height: 600 } })
     await page.setContent(`

@@ -2366,7 +2366,9 @@ export function sendKey(
 
 /**
  * Attach local file(s). Paths must exist on the machine running `@geometra/proxy` (not the MCP host).
- * Optional `x`,`y` click opens a file chooser; omit to use the first `input[type=file]` in any frame.
+ * Optional `x`,`y` click opens a file chooser. Callers must provide an explicit
+ * coordinate or semantic target; MCP never intentionally requests a global
+ * first-file-input fallback.
  */
 export function sendFileUpload(
   session: Session,
@@ -2379,6 +2381,8 @@ export function sendFileUpload(
     exact?: boolean
     strategy?: 'auto' | 'chooser' | 'hidden' | 'drop'
     drop?: { x: number; y: number }
+    contextText?: string
+    sectionText?: string
   },
   timeoutMs?: number,
 ): Promise<UpdateWaitResult> {
@@ -2396,6 +2400,8 @@ export function sendFileUpload(
     payload.dropX = opts.drop.x
     payload.dropY = opts.drop.y
   }
+  if (opts?.contextText !== undefined) payload.contextText = opts.contextText
+  if (opts?.sectionText !== undefined) payload.sectionText = opts.sectionText
   return sendAndWaitForUpdate(session, payload, timeoutMs)
 }
 
@@ -2478,15 +2484,11 @@ export function sendFillOtp(
 export function sendListboxPick(
   session: Session,
   label: string,
-  opts?: { exact?: boolean; open?: { x: number; y: number }; fieldLabel?: string; query?: string; fieldId?: string; fieldKey?: string },
+  opts?: { exact?: boolean; fieldLabel?: string; query?: string; fieldId?: string; fieldKey?: string },
   timeoutMs = LISTBOX_UPDATE_TIMEOUT_MS,
 ): Promise<UpdateWaitResult> {
   const payload: Record<string, unknown> = { type: 'listboxPick', label }
   if (opts?.exact !== undefined) payload.exact = opts.exact
-  if (opts?.open) {
-    payload.openX = opts.open.x
-    payload.openY = opts.open.y
-  }
   if (opts?.fieldLabel) payload.fieldLabel = opts.fieldLabel
   if (opts?.query) payload.query = opts.query
   if (opts?.fieldId) payload.fieldId = opts.fieldId

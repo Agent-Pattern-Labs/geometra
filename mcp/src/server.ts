@@ -143,6 +143,18 @@ interface ResolvedClickLocation {
   revealAttempts?: number
 }
 
+interface FormClickScope {
+  formId: string
+  path: number[]
+  identity: FormScopeIdentity
+}
+
+interface FormScopeIdentity {
+  role: string
+  name: string
+  fieldAnchors: string[]
+}
+
 interface WaitConditionResult {
   filter: NodeFilter
   present: boolean
@@ -497,6 +509,107 @@ const nonEmptyFieldIdSchema = z.string().trim().min(1, 'fieldId must not be empt
 const nonEmptyFieldLabelSchema = z.string().trim().min(1, 'fieldLabel must not be empty')
 const nonEmptyToggleLabelSchema = z.string().trim().min(1, 'toggle label must not be empty')
 
+type FileUploadStrategy = 'auto' | 'chooser' | 'hidden' | 'drop'
+
+interface FileUploadContractInput {
+  x?: number
+  y?: number
+  fieldLabel?: string
+  exact?: boolean
+  strategy?: FileUploadStrategy
+  dropX?: number
+  dropY?: number
+  contextText?: string
+  sectionText?: string
+}
+
+interface ListboxPickContractInput {
+  fieldId?: string
+  fieldKey?: string
+  fieldLabel?: string
+}
+
+interface SelectOptionContractInput {
+  x?: number
+  y?: number
+  value?: string
+  label?: string
+  index?: number
+}
+
+function incompleteCoordinatePairError(
+  input: Record<string, unknown>,
+  first: string,
+  second: string,
+): string | undefined {
+  const hasFirst = input[first] !== undefined
+  const hasSecond = input[second] !== undefined
+  return hasFirst === hasSecond
+    ? undefined
+    : `${first} and ${second} must be provided together`
+}
+
+function fileUploadContractError(input: FileUploadContractInput): string | undefined {
+  const clickPairError = incompleteCoordinatePairError(input as Record<string, unknown>, 'x', 'y')
+  if (clickPairError) return clickPairError
+  const dropPairError = incompleteCoordinatePairError(input as Record<string, unknown>, 'dropX', 'dropY')
+  if (dropPairError) return dropPairError
+
+  const hasClick = input.x !== undefined && input.y !== undefined
+  const hasDrop = input.dropX !== undefined && input.dropY !== undefined
+  const hasFieldLabel = typeof input.fieldLabel === 'string' && input.fieldLabel.trim().length > 0
+  const hasSemanticConstraint = hasFieldLabel || input.contextText !== undefined || input.sectionText !== undefined || input.exact !== undefined
+  const strategy = input.strategy ?? 'auto'
+
+  if ((input.contextText !== undefined || input.sectionText !== undefined || input.exact !== undefined) && !hasFieldLabel) {
+    return 'contextText, sectionText, and exact require fieldLabel'
+  }
+
+  if (strategy === 'chooser') {
+    if (!hasClick) return 'chooser strategy requires x and y'
+    if (hasDrop || hasSemanticConstraint) return 'chooser strategy accepts only an x,y target; semantic and drop targets cannot be combined'
+    return undefined
+  }
+
+  if (strategy === 'drop') {
+    if (!hasDrop) return 'drop strategy requires dropX and dropY'
+    if (hasClick || hasSemanticConstraint) return 'drop strategy accepts only a dropX,dropY target; chooser and semantic targets cannot be combined'
+    return undefined
+  }
+
+  if (strategy === 'hidden') {
+    if (!hasFieldLabel) return 'hidden strategy requires fieldLabel to prevent a global first-input fallback'
+    if (hasClick || hasDrop) return 'hidden strategy does not accept chooser or drop coordinates'
+    return undefined
+  }
+
+  if (hasDrop) return 'dropX and dropY require strategy="drop"'
+  if (hasClick && hasFieldLabel) return 'auto strategy requires exactly one target: either x,y or fieldLabel'
+  if (!hasClick && !hasFieldLabel) return 'upload_files requires an explicit target: fieldLabel, x and y, or strategy="drop" with dropX and dropY'
+  return undefined
+}
+
+function listboxPickContractError(input: ListboxPickContractInput): string | undefined {
+  if (typeof input.fieldLabel !== 'string' || input.fieldLabel.trim().length === 0) {
+    return 'pick_listbox_option requires fieldLabel so the committed field can be confirmed'
+  }
+  return undefined
+}
+
+function selectOptionContractError(input: SelectOptionContractInput): string | undefined {
+  const coordinateError = incompleteCoordinatePairError(input as Record<string, unknown>, 'x', 'y')
+  if (coordinateError) return coordinateError
+  if (input.x === undefined || input.y === undefined) return 'select_option requires x and y'
+  const selectorCount = Number(input.value !== undefined) + Number(input.label !== undefined) + Number(input.index !== undefined)
+  if (selectorCount === 0) return 'select_option requires at least one of value, label, or index'
+  return undefined
+}
+
+function addActionContractIssue(ctx: z.RefinementCtx, message: string | undefined): void {
+  if (!message) return
+  ctx.addIssue({ code: z.ZodIssueCode.custom, message })
+}
+
 const fillFieldSchema = z.union([
   z.object({
     kind: z.literal('text'),
@@ -685,25 +798,25 @@ const batchActionSchema = z.discriminatedUnion('type', [
   }).strict(),
   z.object({
     type: z.literal('upload_files'),
-    paths: z.array(z.string()).min(1),
+    paths: z.array(z.string().trim().min(1)).min(1),
     x: z.number().optional(),
     y: z.number().optional(),
-    fieldLabel: z.string().optional(),
+    fieldLabel: z.string().trim().min(1).optional(),
     exact: z.boolean().optional(),
     strategy: z.enum(['auto', 'chooser', 'hidden', 'drop']).optional(),
     dropX: z.number().optional(),
     dropY: z.number().optional(),
+    contextText: z.string().trim().min(1).optional(),
+    sectionText: z.string().trim().min(1).optional(),
     timeoutMs: timeoutMsInput,
   }).strict(),
   z.object({
     type: z.literal('pick_listbox_option'),
-    label: z.string(),
+    label: z.string().trim().min(1),
     exact: z.boolean().optional(),
-    openX: z.number().optional(),
-    openY: z.number().optional(),
     fieldId: z.string().trim().min(1).optional(),
     fieldKey: z.string().trim().min(1).optional(),
-    fieldLabel: z.string().optional(),
+    fieldLabel: z.string().trim().min(1),
     query: z.string().optional(),
     timeoutMs: timeoutMsInput,
   }).strict(),
@@ -712,7 +825,7 @@ const batchActionSchema = z.discriminatedUnion('type', [
     x: z.number(),
     y: z.number(),
     value: z.string().optional(),
-    label: z.string().optional(),
+    label: z.string().trim().min(1).optional(),
     index: z.number().int().min(0).optional(),
     timeoutMs: timeoutMsInput,
   }).strict(),
@@ -766,7 +879,15 @@ const batchActionSchema = z.discriminatedUnion('type', [
     maxTextPreview: z.number().int().min(0).max(20).optional(),
     includeBounds: z.boolean().optional(),
   }).strict(),
-])
+]).superRefine((action, ctx) => {
+  if (action.type === 'upload_files') {
+    addActionContractIssue(ctx, fileUploadContractError(action))
+  } else if (action.type === 'pick_listbox_option') {
+    addActionContractIssue(ctx, listboxPickContractError(action))
+  } else if (action.type === 'select_option') {
+    addActionContractIssue(ctx, selectOptionContractError(action))
+  }
+})
 
 type BatchAction = z.infer<typeof batchActionSchema>
 
@@ -1786,22 +1907,30 @@ Pass \`pageUrl\`/\`url\` to auto-connect in the same call — use \`isolated: tr
       const session = resolved.session
       const connection = autoConnectionPayload(resolved)
       let targetFormId = formId
+      let targetFormIdentity: FormScopeIdentity | undefined
       let fillSummary: Record<string, unknown> | undefined
       let fillFallback: { attempted: true; used: true; reason: 'batched-threw'; attempts: number } | undefined
-      const pausedPayload = (phase: string, resumeHint?: Record<string, unknown>, extra?: Record<string, unknown>): Record<string, unknown> => ({
-        ...connection,
-        completed: false,
-        outcome: 'unconfirmed',
-        paused: true,
-        phase,
-        pauseReason: 'soft-timeout',
-        softTimeoutMs: effectiveSoftTimeoutMs,
-        elapsedMs: Number((performance.now() - toolStartedAt).toFixed(1)),
-        ...(resumeHint ? { resumeHint } : {}),
-        ...(fillSummary ? { fill: fillSummary } : {}),
-        ...(fillFallback ? { fill_fallback: fillFallback } : {}),
-        ...(extra ?? {}),
-      })
+      const pausedPayload = (phase: string, resumeHint?: Record<string, unknown>, extra?: Record<string, unknown>): Record<string, unknown> => {
+        const resumesSubmitForm = resumeHint?.tool === 'geometra_submit_form'
+        const scopedResumeHint = {
+          ...(resumeHint ?? {}),
+          ...(resumesSubmitForm && targetFormId ? { formId: targetFormId } : {}),
+        }
+        return {
+          ...connection,
+          completed: false,
+          outcome: 'unconfirmed',
+          paused: true,
+          phase,
+          pauseReason: 'soft-timeout',
+          softTimeoutMs: effectiveSoftTimeoutMs,
+          elapsedMs: Number((performance.now() - toolStartedAt).toFixed(1)),
+          ...(Object.keys(scopedResumeHint).length > 0 ? { resumeHint: scopedResumeHint } : {}),
+          ...(fillSummary ? { fill: fillSummary } : {}),
+          ...(fillFallback ? { fill_fallback: fillFallback } : {}),
+          ...(extra ?? {}),
+        }
+      }
 
       if (!session.tree || !session.layout) {
         await waitForUiCondition(
@@ -1829,6 +1958,16 @@ Pass \`pageUrl\`/\`url\` to auto-connect in the same call — use \`isolated: tr
         if (!resolution.ok) return err(resolution.error)
         const schema = resolution.schema
         targetFormId = schema.formId
+        const initialFormPath = parseSectionId(schema.formId)
+        const initialFormNode = initialFormPath?.kind === 'form'
+          ? formScopeNodeAtPath(entryA11y, initialFormPath.path)
+          : undefined
+        if (!initialFormNode) {
+          return err(`Target form ${schema.formId} does not resolve to a maintainable form scope before fill`)
+        }
+        const capturedIdentity = captureFormScopeIdentity(initialFormNode, schema)
+        if (!capturedIdentity.ok) return err(capturedIdentity.error)
+        targetFormIdentity = capturedIdentity.identity
 
         const planned = planFormFill(schema, { valuesById, valuesByLabel }, schemas)
         if (!planned.ok) return err(planned.error)
@@ -1929,30 +2068,120 @@ Pass \`pageUrl\`/\`url\` to auto-connect in the same call — use \`isolated: tr
       }
 
       const submitFilter: NodeFilter = submit ?? { role: 'button', name: 'Submit' }
+      const submitTargetFailurePayload = (
+        error: string,
+        fallback?: ResolveClickFallbackFailure,
+      ): Record<string, unknown> => ({
+        ...connection,
+        completed: false,
+        outcome: 'unconfirmed',
+        ...(fillSummary ? { fill: fillSummary } : {}),
+        ...(fillFallback ? { fill_fallback: fillFallback } : {}),
+        submit: { ok: false, error: `Submit target not found: ${error}` },
+        ...(fallback ? { submit_fallback: fallback } : {}),
+      })
+
+      let submitFormNode: A11yNode | undefined
+      let submitFormPath: number[] | undefined
+      let formScope: FormClickScope | undefined
+      if (targetFormId) {
+        const currentA11y = sessionA11y(session)
+        const parsedForm = parseSectionId(targetFormId)
+        const currentSchema = currentA11y
+          ? getSessionFormSchemas(session, { includeOptions: false, includeContext: 'auto' })
+            .find(schema => schema.formId === targetFormId)
+          : undefined
+        const currentForm = currentA11y && parsedForm?.kind === 'form'
+          ? formScopeNodeAtPath(currentA11y, parsedForm.path)
+          : undefined
+        if (!currentA11y || parsedForm?.kind !== 'form' || !currentSchema || !currentForm) {
+          return err(JSON.stringify(
+            submitTargetFailurePayload(`Target form ${targetFormId} has an invalid or stale form path`),
+            null,
+            detail === 'verbose' ? 2 : undefined,
+          ))
+        }
+        if (!targetFormIdentity) {
+          const capturedIdentity = captureFormScopeIdentity(currentForm, currentSchema)
+          if (!capturedIdentity.ok) {
+            return err(JSON.stringify(
+              submitTargetFailurePayload(capturedIdentity.error),
+              null,
+              detail === 'verbose' ? 2 : undefined,
+            ))
+          }
+          targetFormIdentity = capturedIdentity.identity
+        }
+        submitFormPath = [...parsedForm.path]
+        formScope = { formId: targetFormId, path: submitFormPath, identity: targetFormIdentity }
+        const scoped = currentFormScope(session, currentA11y, formScope)
+        if (!scoped.ok) {
+          return err(JSON.stringify(
+            submitTargetFailurePayload(scoped.error),
+            null,
+            detail === 'verbose' ? 2 : undefined,
+          ))
+        }
+        submitFormNode = scoped.node
+      }
+
       const resolvedClick = await resolveClickLocationWithFallback(session, {
         filter: submitFilter,
         index: submitIndex,
         fullyVisible: true,
+        formScope,
         revealTimeoutMs: capTimeoutMs(2_500, timeoutCapFromDeadline(deadlineAt), 2_500),
       })
       if (!resolvedClick.ok) {
-        const payload = {
-          ...connection,
-          completed: false,
-          outcome: 'unconfirmed',
-          ...(fillSummary ? { fill: fillSummary } : {}),
-          ...(fillFallback ? { fill_fallback: fillFallback } : {}),
-          submit: { ok: false, error: `Submit target not found: ${resolvedClick.error}` },
-          ...(resolvedClick.fallback ? { submit_fallback: resolvedClick.fallback } : {}),
-        }
+        const payload = submitTargetFailurePayload(resolvedClick.error, resolvedClick.fallback)
         return err(JSON.stringify(payload, null, detail === 'verbose' ? 2 : undefined))
       }
 
       const preSubmitA11y = sessionA11y(session)
-      const submitFormNode = preSubmitA11y
-        ? resolveSubmitFormNode(preSubmitA11y, targetFormId, resolvedClick.value.target?.path)
-        : undefined
-      const submitFormPath = submitFormNode?.path
+      let submitPoint = { x: resolvedClick.value.x, y: resolvedClick.value.y }
+      if (formScope) {
+        if (!preSubmitA11y) {
+          return err(JSON.stringify(
+            submitTargetFailurePayload(`Target form ${formScope.formId} cannot be revalidated because the current UI tree is unavailable`),
+            null,
+            detail === 'verbose' ? 2 : undefined,
+          ))
+        }
+        const scoped = currentFormScope(session, preSubmitA11y, formScope)
+        const targetPath = resolvedClick.value.target?.path
+        const currentTarget = targetPath ? findNodeByPath(preSubmitA11y, targetPath) : undefined
+        const targetContext = currentTarget ? nodeContextForNode(preSubmitA11y, currentTarget) : undefined
+        if (
+          !scoped.ok ||
+          !currentTarget ||
+          !targetPath ||
+          !pathIsStrictDescendant(targetPath, formScope.path) ||
+          !nodeMatchesFilter(currentTarget, submitFilter, targetContext)
+        ) {
+          return err(JSON.stringify(
+            submitTargetFailurePayload(
+              `Target form ${formScope.formId} or its selected submit control became stale before click`,
+            ),
+            null,
+            detail === 'verbose' ? 2 : undefined,
+          ))
+        }
+        const currentCenter = currentVisibleClickCenter(preSubmitA11y, currentTarget)
+        if (!currentCenter) {
+          return err(JSON.stringify(
+            submitTargetFailurePayload(
+              `Target form ${formScope.formId} submit control is no longer visible at a usable click point`,
+            ),
+            null,
+            detail === 'verbose' ? 2 : undefined,
+          ))
+        }
+        submitPoint = currentCenter
+        submitFormNode = scoped.node
+      } else if (preSubmitA11y) {
+        submitFormNode = resolveSubmitFormNode(preSubmitA11y, undefined, resolvedClick.value.target?.path)
+        submitFormPath = submitFormNode?.path
+      }
       const preSubmitSignals = preSubmitA11y
         ? scopeSessionSignalsToForm(preSubmitA11y, submitFormNode)
         : undefined
@@ -2003,8 +2232,8 @@ Pass \`pageUrl\`/\`url\` to auto-connect in the same call — use \`isolated: tr
         : undefined
       const clickWait = await sendClick(
         session,
-        resolvedClick.value.x,
-        resolvedClick.value.y,
+        submitPoint.x,
+        submitPoint.y,
         capTimeoutMs(submitTimeoutMs, timeoutCapFromDeadline(deadlineAt), 15_000),
       )
 
@@ -2014,11 +2243,12 @@ Pass \`pageUrl\`/\`url\` to auto-connect in the same call — use \`isolated: tr
         if (!hasSoftBudget(deadlineAt)) {
           return ok(JSON.stringify(pausedPayload('wait_for', {
             tool: 'geometra_wait_for',
-            filter: compactFilterPayload(waitFilter),
+            ...compactFilterPayload(waitFilter),
             present: waitFor.present ?? true,
+            ...(waitFor.timeoutMs !== undefined ? { timeoutMs: waitFor.timeoutMs } : {}),
           }, {
             submit: {
-              at: { x: resolvedClick.value.x, y: resolvedClick.value.y },
+              at: submitPoint,
               ...(resolvedClick.value.target ? { target: compactNodeReference(resolvedClick.value.target) } : {}),
               ...waitStatusPayload(clickWait),
             },
@@ -2040,7 +2270,7 @@ Pass \`pageUrl\`/\`url\` to auto-connect in the same call — use \`isolated: tr
       const signals = after
         ? scopeSessionSignalsToForm(
             after,
-            submitFormPath ? formNodeAtPath(after, submitFormPath) : undefined,
+            submitFormPath ? formScopeNodeAtPath(after, submitFormPath) : undefined,
             submitFormPath !== undefined,
           )
         : undefined
@@ -2097,7 +2327,7 @@ Pass \`pageUrl\`/\`url\` to auto-connect in the same call — use \`isolated: tr
         outcome,
         ...(fillSummary ? { fill: fillSummary } : {}),
         submit: {
-          at: { x: resolvedClick.value.x, y: resolvedClick.value.y },
+          at: submitPoint,
           ...(resolvedClick.value.target ? { target: compactNodeReference(resolvedClick.value.target), revealSteps: resolvedClick.value.revealAttempts ?? 0 } : {}),
           ...waitStatusPayload(clickWait),
         },
@@ -2842,36 +3072,42 @@ Detection is fully generic (no site branding). It refuses to run if the detected
   )
 
   // ── upload files (proxy) ───────────────────────────────────────
-  server.tool(
+  server.registerTool(
     'geometra_upload_files',
-    `Attach local files to a file input. Requires \`@geometra/proxy\` (paths exist on the proxy host).
-
-Strategies: **auto** (default) tries chooser click if x,y given, else a labeled file input when \`fieldLabel\` is provided, else hidden \`input[type=file]\`, else first visible file input. **hidden** targets hidden inputs directly. **drop** needs dropX,dropY for drag-target zones. **chooser** requires x,y.`,
     {
-      paths: z.array(z.string()).min(1).describe('Absolute paths on the proxy machine, e.g. /Users/you/resume.pdf'),
-      x: z.number().optional().describe('Click X to trigger native file chooser'),
-      y: z.number().optional().describe('Click Y to trigger native file chooser'),
-      fieldLabel: z.string().optional().describe('Prefer a specific labeled file field (for example "Resume" or "Cover letter")'),
-      exact: z.boolean().optional().describe('Exact match when using fieldLabel'),
-      strategy: z
-        .enum(['auto', 'chooser', 'hidden', 'drop'])
-        .optional()
-        .describe('Upload strategy (default auto)'),
-      dropX: z.number().optional().describe('Drop target X (viewport) for strategy drop'),
-      dropY: z.number().optional().describe('Drop target Y (viewport) for strategy drop'),
-      contextText: z.string().optional().describe('Ancestor / prompt text to disambiguate repeated file inputs'),
-      sectionText: z.string().optional().describe('Containing section text to disambiguate repeated file inputs'),
-      timeoutMs: z
-        .number()
-        .int()
-        .min(50)
-        .max(60_000)
-        .optional()
-        .describe('Optional action wait timeout (resume parsing / SPA upload flows often need longer than a normal click)'),
-      detail: detailInput(),
-      sessionId: sessionIdInput,
+      description: `Attach local files to a file input. Requires \`@geometra/proxy\` (paths exist on the proxy host).
+
+Every upload must name one explicit target. **auto** (default) accepts either a complete x,y chooser target or a labeled field. **hidden** requires fieldLabel. **chooser** requires x,y. **drop** requires dropX,dropY. Geometra rejects incomplete, conflicting, and global-first-input targets.`,
+      inputSchema: z.object({
+        paths: z.array(z.string().trim().min(1)).min(1).describe('Absolute paths on the proxy machine, e.g. /Users/you/resume.pdf'),
+        x: z.number().optional().describe('Click X to trigger native file chooser; must be paired with y'),
+        y: z.number().optional().describe('Click Y to trigger native file chooser; must be paired with x'),
+        fieldLabel: z.string().trim().min(1).optional().describe('Specific labeled file field (for example "Resume" or "Cover letter")'),
+        exact: z.boolean().optional().describe('Exact match when using fieldLabel'),
+        strategy: z
+          .enum(['auto', 'chooser', 'hidden', 'drop'])
+          .optional()
+          .describe('Upload strategy (default auto)'),
+        dropX: z.number().optional().describe('Drop target X (viewport) for strategy drop; must be paired with dropY'),
+        dropY: z.number().optional().describe('Drop target Y (viewport) for strategy drop; must be paired with dropX'),
+        contextText: z.string().trim().min(1).optional().describe('Ancestor / prompt text to disambiguate repeated file inputs; requires fieldLabel'),
+        sectionText: z.string().trim().min(1).optional().describe('Containing section text to disambiguate repeated file inputs; requires fieldLabel'),
+        timeoutMs: z
+          .number()
+          .int()
+          .min(50)
+          .max(60_000)
+          .optional()
+          .describe('Optional action wait timeout (resume parsing / SPA upload flows often need longer than a normal click)'),
+        detail: detailInput(),
+        sessionId: sessionIdInput,
+      }).strict().superRefine((input, ctx) => {
+        addActionContractIssue(ctx, fileUploadContractError(input))
+      }),
     },
-    async ({ paths, x, y, fieldLabel, exact, strategy, dropX, dropY, contextText: _contextText, sectionText: _sectionText, timeoutMs, detail, sessionId }) => {
+    async ({ paths, x, y, fieldLabel, exact, strategy, dropX, dropY, contextText, sectionText, timeoutMs, detail, sessionId }) => {
+      const contractError = fileUploadContractError({ x, y, fieldLabel, exact, strategy, dropX, dropY, contextText, sectionText })
+      if (contractError) return err(contractError)
       const sessionResult = resolveToolSession(sessionId)
       if ('error' in sessionResult) return sessionResult.error
       const session = sessionResult.session
@@ -2883,12 +3119,16 @@ Strategies: **auto** (default) tries chooser click if x,y given, else a labeled 
           exact,
           strategy,
           drop: dropX !== undefined && dropY !== undefined ? { x: dropX, y: dropY } : undefined,
+          contextText,
+          sectionText,
         }, timeoutMs ?? 8_000)
         const summary = postActionSummary(session, before, wait, detail)
         return actionWaitResponse(wait, `Uploaded ${paths.length} file(s).\n${summary}`, {
           fileCount: paths.length,
           ...(fieldLabel ? { fieldLabel } : {}),
           ...(strategy ? { strategy } : {}),
+          ...(contextText ? { contextText } : {}),
+          ...(sectionText ? { sectionText } : {}),
           ...waitStatusPayload(wait),
           ...(fieldLabel ? { readback: fieldStatePayload(session, fieldLabel) } : {}),
         }, detail)
@@ -2898,44 +3138,42 @@ Strategies: **auto** (default) tries chooser click if x,y given, else a labeled 
     }
   )
 
-  server.tool(
+  server.registerTool(
     'geometra_pick_listbox_option',
-    `Pick an option from a custom dropdown / listbox / searchable combobox (Headless UI, React Select, Radix, Ashby-style custom selects, etc.). Requires \`@geometra/proxy\`.
-
-Pass \`fieldLabel\` to open a labeled dropdown semantically instead of relying on coordinates. If the opened control is editable, MCP types \`query\` (or the option label by default) before selecting. Uses fuzzy-ish substring/alias matching unless exact=true, prefers the popup nearest the opened field, can fall back to keyboard navigation for searchable comboboxes, and returns capped \`visibleOptions\` in failure payloads so agents can retry with a real label.`,
     {
-      label: z.string().describe('Accessible name of the option (visible text or aria-label)'),
-      exact: z.boolean().optional().describe('Exact name match'),
-      openX: z.number().optional().describe('Click to open dropdown'),
-      openY: z.number().optional().describe('Click to open dropdown'),
-      fieldId: z.string().trim().min(1).optional().describe('Stable field id from geometra_form_schema'),
-      fieldKey: z.string().trim().min(1).optional().describe('Authored field key from geometra_form_schema for exact resolution'),
-      fieldLabel: z.string().optional().describe('Field label of the dropdown/combobox to open semantically (e.g. "Location")'),
-      contextText: z.string().optional().describe('Ancestor / prompt text to disambiguate repeated dropdowns with the same label'),
-      sectionText: z.string().optional().describe('Containing section text to disambiguate repeated dropdowns'),
-      query: z.string().optional().describe('Optional text to type into a searchable combobox before selecting'),
-      timeoutMs: z
-        .number()
-        .int()
-        .min(50)
-        .max(60_000)
-        .optional()
-        .describe('Optional action wait timeout for slow dropdowns / remote search results'),
-      detail: detailInput(),
-      sessionId: sessionIdInput,
+      description: `Pick an option from a custom dropdown / listbox / searchable combobox (Headless UI, React Select, Radix, Ashby-style custom selects, etc.). Requires \`@geometra/proxy\`.
+
+fieldLabel is required so Geometra can confirm which control committed the selection. fieldId/fieldKey are supplemental exact identity and are only meaningful alongside fieldLabel. Coordinate-only opening is intentionally unsupported because it cannot provide field readback. If the opened control is editable, MCP types query (or the option label by default) before selecting.`,
+      inputSchema: z.object({
+        label: z.string().trim().min(1).describe('Accessible name of the option (visible text or aria-label)'),
+        exact: z.boolean().optional().describe('Exact name match'),
+        fieldId: z.string().trim().min(1).optional().describe('Stable field id from geometra_form_schema; used with fieldLabel'),
+        fieldKey: z.string().trim().min(1).optional().describe('Authored field key from geometra_form_schema for exact resolution; used with fieldLabel'),
+        fieldLabel: z.string().trim().min(1).describe('Field label of the dropdown/combobox to open and verify (e.g. "Location")'),
+        query: z.string().optional().describe('Optional text to type into a searchable combobox before selecting'),
+        timeoutMs: z
+          .number()
+          .int()
+          .min(50)
+          .max(60_000)
+          .optional()
+          .describe('Optional action wait timeout for slow dropdowns / remote search results'),
+        detail: detailInput(),
+        sessionId: sessionIdInput,
+      }).strict().superRefine((input, ctx) => {
+        addActionContractIssue(ctx, listboxPickContractError(input))
+      }),
     },
-    async ({ label, exact, openX, openY, fieldId, fieldKey, fieldLabel, contextText, sectionText, query, timeoutMs, detail, sessionId }) => {
+    async ({ label, exact, fieldId, fieldKey, fieldLabel, query, timeoutMs, detail, sessionId }) => {
+      const contractError = listboxPickContractError({ fieldId, fieldKey, fieldLabel })
+      if (contractError) return err(contractError)
       const sessionResult = resolveToolSession(sessionId)
       if ('error' in sessionResult) return sessionResult.error
       const session = sessionResult.session
       const before = sessionA11y(session)
-      if (contextText || sectionText) {
-        return err('contextText/sectionText are not supported for listbox resolution; pass fieldKey from geometra_form_schema instead.')
-      }
       try {
         const wait = await sendListboxPick(session, label, {
           exact,
-          open: openX !== undefined && openY !== undefined ? { x: openX, y: openY } : undefined,
           fieldId,
           fieldKey,
           fieldLabel,
@@ -2963,36 +3201,37 @@ Pass \`fieldLabel\` to open a labeled dropdown semantically instead of relying o
   )
 
   // ── select option (proxy, native <select>) ─────────────────────
-  server.tool(
+  server.registerTool(
     'geometra_select_option',
-    `Set a native HTML \`<select>\` after clicking its center (x,y from geometra_query). Requires \`@geometra/proxy\`.
-
-Custom React/Vue dropdowns are not supported here — use \`geometra_pick_listbox_option\` for custom dropdowns / searchable comboboxes.`,
     {
-      x: z.number().describe('X coordinate (e.g. center of the select from geometra_query)'),
-      y: z.number().describe('Y coordinate'),
-      value: z.string().optional().describe('Option value= attribute'),
-      label: z.string().optional().describe('Visible option label (substring match)'),
-      index: z.number().int().min(0).optional().describe('Zero-based option index'),
-      contextText: z.string().optional().describe('Ancestor / prompt text to disambiguate repeated selects'),
-      sectionText: z.string().optional().describe('Containing section text to disambiguate repeated selects'),
-      timeoutMs: z
-        .number()
-        .int()
-        .min(50)
-        .max(60_000)
-        .optional()
-        .describe('Optional action wait timeout'),
-      detail: detailInput(),
-      sessionId: sessionIdInput,
+      description: `Set a native HTML \`<select>\` after clicking its center (x,y from geometra_query). Requires \`@geometra/proxy\`.
+
+Provide one or more of value, label, and index. Every supplied selector is conjunctive identity and must describe the same enabled option. Custom React/Vue dropdowns are not supported here — use \`geometra_pick_listbox_option\` for custom dropdowns / searchable comboboxes.`,
+      inputSchema: z.object({
+        x: z.number().describe('X coordinate (e.g. center of the select from geometra_query)'),
+        y: z.number().describe('Y coordinate'),
+        value: z.string().optional().describe('Exact option value= attribute'),
+        label: z.string().trim().min(1).optional().describe('Exact normalized visible option label'),
+        index: z.number().int().min(0).optional().describe('Zero-based option index'),
+        timeoutMs: z
+          .number()
+          .int()
+          .min(50)
+          .max(60_000)
+          .optional()
+          .describe('Optional action wait timeout'),
+        detail: detailInput(),
+        sessionId: sessionIdInput,
+      }).strict().superRefine((input, ctx) => {
+        addActionContractIssue(ctx, selectOptionContractError(input))
+      }),
     },
-    async ({ x, y, value, label, index, contextText: _contextText, sectionText: _sectionText, timeoutMs, detail, sessionId }) => {
+    async ({ x, y, value, label, index, timeoutMs, detail, sessionId }) => {
+      const contractError = selectOptionContractError({ x, y, value, label, index })
+      if (contractError) return err(contractError)
       const sessionResult = resolveToolSession(sessionId)
       if ('error' in sessionResult) return sessionResult.error
       const session = sessionResult.session
-      if (value === undefined && label === undefined && index === undefined) {
-        return err('Provide at least one of value, label, or index')
-      }
       const before = sessionA11y(session)
       try {
         const wait = await sendSelectOption(session, x, y, { value, label, index }, timeoutMs)
@@ -3884,9 +4123,111 @@ interface SessionSignals {
   }>
 }
 
+function pathIsStrictDescendant(path: number[], ancestorPath: number[]): boolean {
+  return path.length > ancestorPath.length && ancestorPath.every((segment, index) => path[index] === segment)
+}
+
 function formNodeAtPath(root: A11yNode, path: number[]): A11yNode | undefined {
   const node = findNodeByPath(root, path)
   return node?.role === 'form' ? node : undefined
+}
+
+function formScopeNodeAtPath(root: A11yNode, path: number[]): A11yNode | undefined {
+  const node = findNodeByPath(root, path)
+  return node && (node.role === 'form' || node.role === 'group' || node.role === 'region')
+    ? node
+    : undefined
+}
+
+function formScopeFieldAnchor(field: FormSchemaField): string {
+  if (field.fieldKey) return `key:${field.fieldKey}`
+  return [
+    'field',
+    field.kind,
+    normalizeLookupKey(field.label),
+    field.controlType ?? '',
+    field.choiceType ?? '',
+    field.booleanChoice ? 'boolean' : '',
+  ].join(':')
+}
+
+function captureFormScopeIdentity(
+  node: A11yNode,
+  schema: FormSchemaModel,
+): { ok: true; identity: FormScopeIdentity } | { ok: false; error: string } {
+  const fieldAnchors = schema.fields.map(formScopeFieldAnchor).sort()
+  const name = normalizeLookupKey(node.name || schema.name || '')
+  if (fieldAnchors.length === 0 && !name) {
+    return {
+      ok: false,
+      error: `Target form ${schema.formId} has no stable semantic or field identity; refusing to submit without a maintainable form scope`,
+    }
+  }
+  return {
+    ok: true,
+    identity: {
+      role: node.role,
+      name,
+      fieldAnchors,
+    },
+  }
+}
+
+function containsFormFieldAnchors(current: string[], expected: string[]): boolean {
+  const counts = new Map<string, number>()
+  for (const anchor of current) counts.set(anchor, (counts.get(anchor) ?? 0) + 1)
+  for (const anchor of expected) {
+    const count = counts.get(anchor) ?? 0
+    if (count === 0) return false
+    counts.set(anchor, count - 1)
+  }
+  return true
+}
+
+function currentFormScope(
+  session: Session,
+  root: A11yNode,
+  scope: FormClickScope,
+): { ok: true; node: A11yNode; schema: FormSchemaModel } | { ok: false; error: string } {
+  const node = formScopeNodeAtPath(root, scope.path)
+  const schema = getSessionFormSchemas(session, {
+    includeOptions: false,
+    includeContext: 'auto',
+  }).find(candidate => candidate.formId === scope.formId)
+  if (!node || !schema) {
+    return { ok: false, error: `Target form ${scope.formId} is stale or no longer resolves to a form in the current UI` }
+  }
+
+  const currentName = normalizeLookupKey(node.name || schema.name || '')
+  const currentAnchors = schema.fields.map(formScopeFieldAnchor).sort()
+  if (
+    node.role !== scope.identity.role ||
+    currentName !== scope.identity.name ||
+    !containsFormFieldAnchors(currentAnchors, scope.identity.fieldAnchors)
+  ) {
+    return {
+      ok: false,
+      error: `Target form ${scope.formId} was replaced at the same path; its semantic/schema identity no longer matches`,
+    }
+  }
+  return { ok: true, node, schema }
+}
+
+function currentVisibleClickCenter(root: A11yNode, target: A11yNode): { x: number; y: number } | undefined {
+  const { x, y, width, height } = target.bounds
+  const viewport = root.bounds
+  if (![x, y, width, height, viewport.x, viewport.y, viewport.width, viewport.height].every(Number.isFinite)) return undefined
+  if (width <= 0 || height <= 0 || viewport.width <= 0 || viewport.height <= 0) return undefined
+
+  const visibleLeft = Math.max(x, viewport.x)
+  const visibleTop = Math.max(y, viewport.y)
+  const visibleRight = Math.min(x + width, viewport.x + viewport.width)
+  const visibleBottom = Math.min(y + height, viewport.y + viewport.height)
+  if (visibleRight <= visibleLeft || visibleBottom <= visibleTop) return undefined
+  return {
+    x: visibleLeft + (visibleRight - visibleLeft) / 2,
+    y: visibleTop + (visibleBottom - visibleTop) / 2,
+  }
 }
 
 function resolveSubmitFormNode(
@@ -4265,10 +4606,14 @@ async function revealSemanticTarget(
     filter: NodeFilter
     index: number
     fullyVisible: boolean
+    formScope?: FormClickScope
     maxSteps?: number
     timeoutMs: number
   },
-): Promise<{ ok: true; value: RevealTargetResult } | { ok: false; error: string }> {
+): Promise<
+  | { ok: true; value: RevealTargetResult }
+  | { ok: false; error: string; staleFormScope?: true }
+> {
   const revealStartedAt = performance.now()
   const revealDeadlineAt = revealStartedAt + HOST_SAFE_REVEAL_TIMEOUT_MS
   const initialTreeReady = await ensureSessionUiTree(
@@ -4291,9 +4636,24 @@ async function revealSemanticTarget(
     const a11y = sessionA11y(session)
     if (!a11y) return { ok: false, error: 'No UI tree available to reveal from' }
 
-    const matches = sortA11yNodes(findNodes(a11y, options.filter))
+    if (options.formScope) {
+      const scoped = currentFormScope(session, a11y, options.formScope)
+      if (!scoped.ok) {
+        return { ok: false, error: scoped.error, staleFormScope: true }
+      }
+    }
+
+    // Match against the page root first so prompt/section/item context from
+    // ancestors outside the form remains available, then constrain the
+    // actionable candidates to descendants of the selected current form.
+    const matches = sortA11yNodes(
+      findNodes(a11y, options.filter).filter(node =>
+        !options.formScope || pathIsStrictDescendant(node.path, options.formScope.path),
+      ),
+    )
     if (matches.length === 0) {
-      return { ok: false, error: `No elements found matching ${JSON.stringify(options.filter)}` }
+      const scopeSuffix = options.formScope ? ` within form ${options.formScope.formId}` : ''
+      return { ok: false, error: `No elements found matching ${JSON.stringify(options.filter)}${scopeSuffix}` }
     }
     if (options.index >= matches.length) {
       return {
@@ -4360,10 +4720,14 @@ async function resolveClickLocation(
     filter: NodeFilter
     index?: number
     fullyVisible?: boolean
+    formScope?: FormClickScope
     maxRevealSteps?: number
     revealTimeoutMs?: number
   },
-): Promise<{ ok: true; value: ResolvedClickLocation } | { ok: false; error: string }> {
+): Promise<
+  | { ok: true; value: ResolvedClickLocation }
+  | { ok: false; error: string; staleFormScope?: true }
+> {
   const hasExplicitCoordinates = options.x !== undefined || options.y !== undefined
   if (hasExplicitCoordinates) {
     if (options.x === undefined || options.y === undefined) {
@@ -4389,6 +4753,7 @@ async function resolveClickLocation(
     filter: options.filter,
     index: options.index ?? 0,
     fullyVisible: options.fullyVisible ?? true,
+    formScope: options.formScope,
     maxSteps: options.maxRevealSteps,
     timeoutMs: options.revealTimeoutMs ?? 2_500,
   })
@@ -4446,15 +4811,17 @@ async function resolveClickLocationWithFallback(
     filter: NodeFilter
     index?: number
     fullyVisible?: boolean
+    formScope?: FormClickScope
     maxRevealSteps?: number
     revealTimeoutMs?: number
   },
 ): Promise<
   | { ok: true; value: ResolvedClickLocation; fallback?: ResolveClickFallbackSuccess }
-  | { ok: false; error: string; fallback?: ResolveClickFallbackFailure }
+  | { ok: false; error: string; fallback?: ResolveClickFallbackFailure; staleFormScope?: true }
 > {
   const first = await resolveClickLocation(session, options)
   if (first.ok) return first
+  if (first.staleFormScope) return first
 
   // Fallback only applies to semantic resolves. Explicit coordinates never enter
   // the reveal path, so there is nothing to retry.
@@ -4482,6 +4849,7 @@ async function resolveClickLocationWithFallback(
         fallback: { attempted: true, used: true, reason: 'revision-retry', attempts },
       }
     }
+    if (retry.staleFormScope) return retry
   }
 
   if (options.fullyVisible !== false) {
@@ -4499,6 +4867,7 @@ async function resolveClickLocationWithFallback(
         fallback: { attempted: true, used: true, reason: 'relaxed-visibility', attempts },
       }
     }
+    if (relaxed.staleFormScope) return relaxed
   }
 
   // All fallback phases tried and none recovered. Carry the trace of what we
@@ -5353,6 +5722,8 @@ async function executeBatchAction(
       }
     }
     case 'upload_files': {
+      const contractError = fileUploadContractError(action)
+      if (contractError) throw new Error(contractError)
       const before = sessionA11y(session)
       const wait = await sendFileUpload(session, action.paths, {
         click: action.x !== undefined && action.y !== undefined ? { x: action.x, y: action.y } : undefined,
@@ -5360,6 +5731,8 @@ async function executeBatchAction(
         exact: action.exact,
         strategy: action.strategy,
         drop: action.dropX !== undefined && action.dropY !== undefined ? { x: action.dropX, y: action.dropY } : undefined,
+        contextText: action.contextText,
+        sectionText: action.sectionText,
       }, action.timeoutMs ?? 8_000)
       assertBatchActionConfirmed(action.type, wait)
       return {
@@ -5368,16 +5741,19 @@ async function executeBatchAction(
           fileCount: action.paths.length,
           ...(action.fieldLabel ? { fieldLabel: action.fieldLabel } : {}),
           ...(action.strategy ? { strategy: action.strategy } : {}),
+          ...(action.contextText ? { contextText: action.contextText } : {}),
+          ...(action.sectionText ? { sectionText: action.sectionText } : {}),
           ...waitStatusPayload(wait),
           ...(action.fieldLabel ? { readback: fieldStatePayload(session, action.fieldLabel) } : {}),
         },
       }
     }
     case 'pick_listbox_option': {
+      const contractError = listboxPickContractError(action)
+      if (contractError) throw new Error(contractError)
       const before = sessionA11y(session)
       const wait = await sendListboxPick(session, action.label, {
         exact: action.exact,
-        open: action.openX !== undefined && action.openY !== undefined ? { x: action.openX, y: action.openY } : undefined,
         fieldId: action.fieldId,
         fieldKey: action.fieldKey,
         fieldLabel: action.fieldLabel,
@@ -5401,9 +5777,8 @@ async function executeBatchAction(
       }
     }
     case 'select_option': {
-      if (action.value === undefined && action.label === undefined && action.index === undefined) {
-        throw new Error('select_option step requires at least one of value, label, or index')
-      }
+      const contractError = selectOptionContractError(action)
+      if (contractError) throw new Error(contractError)
       const before = sessionA11y(session)
       const wait = await sendSelectOption(session, action.x, action.y, {
         value: action.value,

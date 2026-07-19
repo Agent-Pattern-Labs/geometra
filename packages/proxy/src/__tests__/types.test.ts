@@ -61,4 +61,72 @@ describe('proxy client action validation', () => {
       optionIndex: -1,
     })).toBe('Invalid client message "setFieldChoice": payload does not match the proxy protocol')
   })
+
+  it('preserves scoped file targeting on standalone and batched actions', () => {
+    expect(validationError({
+      type: 'file',
+      paths: ['/tmp/resume.pdf'],
+      fieldLabel: 'Document',
+      contextText: 'Candidate resume',
+      sectionText: 'Application materials',
+    })).toBeNull()
+    expect(validationError({
+      type: 'fillFields',
+      fields: [{
+        kind: 'file',
+        fieldLabel: 'Document',
+        paths: ['/tmp/cover.pdf'],
+        contextText: 'Cover letter',
+        sectionText: 'Application materials',
+      }],
+    })).toBeNull()
+
+    expect(validationError({
+      type: 'file',
+      paths: ['/tmp/resume.pdf'],
+      contextText: '   ',
+    })).toMatch(/^Invalid client message "file":/)
+    expect(validationError({
+      type: 'fillFields',
+      fields: [{ kind: 'file', fieldLabel: 'Document', paths: ['/tmp/resume.pdf'], sectionText: '' }],
+    })).toMatch(/^Invalid client message "fillFields":/)
+  })
+
+  it('requires an explicit, non-conflicting file target', () => {
+    expect(validationError({ type: 'file', paths: ['/tmp/resume.pdf'] })).toMatch(/^Invalid client message "file":/)
+    expect(validationError({
+      type: 'file',
+      paths: ['/tmp/resume.pdf'],
+      contextText: 'Candidate resume',
+    })).toMatch(/^Invalid client message "file":/)
+    expect(validationError({
+      type: 'file',
+      paths: ['/tmp/resume.pdf'],
+      strategy: 'chooser',
+      x: 10,
+      y: 20,
+      fieldLabel: 'Resume',
+    })).toMatch(/^Invalid client message "file":/)
+    expect(validationError({
+      type: 'file',
+      paths: ['/tmp/resume.pdf'],
+      strategy: 'hidden',
+      fieldKey: 'id:resume-input',
+    })).toBeNull()
+  })
+
+  it('requires one explicit listbox target and rejects ignored coordinates', () => {
+    expect(validationError({ type: 'listboxPick', label: 'Berlin' })).toMatch(/^Invalid client message "listboxPick":/)
+    expect(validationError({ type: 'listboxPick', label: 'Berlin', fieldId: 'office' })).toMatch(/^Invalid client message "listboxPick":/)
+    expect(validationError({
+      type: 'listboxPick',
+      label: 'Berlin',
+      fieldLabel: 'Office',
+      openX: 10,
+      openY: 20,
+    })).toMatch(/^Invalid client message "listboxPick":/)
+    expect(validationError({ type: 'listboxPick', label: 'Berlin', fieldKey: 'id:office' })).toBeNull()
+    expect(validationError({ type: 'listboxPick', label: 'Berlin', openX: 10, openY: 20 })).toBeNull()
+    expect(validationError({ type: 'listboxPick', label: 'Berlin', openX: 10, openY: 20, query: 'Ber' })).toMatch(/^Invalid client message "listboxPick":/)
+  })
 })

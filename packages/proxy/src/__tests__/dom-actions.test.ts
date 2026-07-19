@@ -16,6 +16,98 @@ describe('pickListboxOption', () => {
     await browser.close()
   })
 
+  it('does not open disabled listbox triggers through label or coordinate entry points', async () => {
+    const page = await browser.newPage({ viewport: { width: 900, height: 700 } })
+    await page.setContent(`
+      <label id="office-label">Office</label>
+      <button id="office" role="combobox" aria-labelledby="office-label" aria-haspopup="listbox" aria-disabled="true">Choose</button>
+      <div id="options" role="listbox" hidden><button role="option">Berlin</button></div>
+      <script>
+        window.openCount = 0
+        office.addEventListener('click', () => {
+          window.openCount++
+          options.hidden = false
+        })
+      </script>
+    `)
+
+    await expect(pickListboxOption(page, 'Berlin', { fieldLabel: 'Office', exact: true })).rejects.toThrow()
+    const box = await page.locator('#office').boundingBox()
+    if (!box) throw new Error('expected listbox trigger bounds')
+    await expect(pickListboxOption(page, 'Berlin', {
+      openX: box.x + box.width / 2,
+      openY: box.y + box.height / 2,
+      exact: true,
+    })).rejects.toThrow('not mutable')
+    expect(await page.evaluate(() => (window as unknown as { openCount: number }).openCount)).toBe(0)
+    expect(await page.locator('#options').isHidden()).toBe(true)
+    await page.close()
+  })
+
+  it('uses authored listbox identity without a label and rejects ignored or unconfirmable hints', async () => {
+    const page = await browser.newPage({ viewport: { width: 900, height: 700 } })
+    await page.setContent(`
+      <button id="office" role="combobox" aria-label="Office" aria-haspopup="listbox">Choose office</button>
+      <div id="menu" role="listbox" hidden><button id="berlin" role="option">Berlin</button></div>
+      <button id="orphan" role="option">Orphan option</button>
+      <script>
+        window.orphanClicks = 0
+        const trigger = document.getElementById('office')
+        const menu = document.getElementById('menu')
+        trigger.addEventListener('click', () => { menu.hidden = false })
+        document.getElementById('berlin').addEventListener('click', () => {
+          trigger.textContent = 'Berlin'
+          menu.hidden = true
+        })
+        document.getElementById('orphan').addEventListener('click', () => { window.orphanClicks++ })
+      </script>
+    `)
+
+    await expect(pickListboxOption(page, 'Orphan option', { fieldId: 'schema-office' })).rejects.toThrow('fieldId requires')
+    expect(await page.evaluate(() => (window as unknown as { orphanClicks: number }).orphanClicks)).toBe(0)
+
+    await expect(pickListboxOption(page, 'Berlin', {
+      fieldKey: 'id:office',
+      fieldLabel: 'Department',
+      exact: true,
+    })).rejects.toThrow()
+    expect(await page.locator('#office').textContent()).toBe('Choose office')
+
+    const cache = createFillLookupCache()
+    await pickListboxOption(page, 'Berlin', { fieldKey: 'id:office', exact: true, cache })
+    expect(await page.locator('#office').textContent()).toBe('Berlin')
+
+    await expect(pickListboxOption(page, 'Berlin', {
+      fieldKey: 'id:office',
+      fieldLabel: 'Department',
+      exact: true,
+      cache,
+    })).rejects.toThrow()
+    expect(await page.locator('#office').textContent()).toBe('Berlin')
+
+    await expect(pickListboxOption(page, 'Orphan option', { exact: true })).rejects.toThrow()
+    expect(await page.evaluate(() => (window as unknown as { orphanClicks: number }).orphanClicks)).toBe(0)
+    await page.close()
+  })
+
+  it('rejects listbox calls that combine semantic identity with ignored open coordinates', async () => {
+    const page = await browser.newPage({ viewport: { width: 900, height: 700 } })
+    await page.setContent('<button id="office" role="combobox" aria-label="Office">Choose</button>')
+    const box = await page.locator('#office').boundingBox()
+    if (!box) throw new Error('expected trigger bounds')
+    await expect(pickListboxOption(page, 'Berlin', {
+      fieldLabel: 'Office',
+      openX: box.x + box.width / 2,
+      openY: box.y + box.height / 2,
+    })).rejects.toThrow('cannot be combined')
+    await expect(pickListboxOption(page, 'Berlin', {
+      openX: box.x + box.width / 2,
+      openY: box.y + box.height / 2,
+      query: 'Ber',
+    })).rejects.toThrow('query cannot be combined')
+    await page.close()
+  })
+
   it('opens a labeled custom dropdown and clicks a visible button option fallback', async () => {
     const page = await browser.newPage({ viewport: { width: 900, height: 700 } })
     await page.setContent(`
@@ -1459,6 +1551,234 @@ describe('attachFiles', () => {
       await page.close()
     }
   })
+
+  it('jointly validates keyed file labels and never falls back globally when a key is stale', async () => {
+    const page = await browser.newPage({ viewport: { width: 900, height: 700 } })
+    const tempFile = join(tmpdir(), `geometra-upload-key-truth-${Date.now()}.txt`)
+    await writeFile(tempFile, 'resume')
+    await page.setContent(`
+      <label for="resume-input">Resume</label><input id="resume-input" type="file" />
+      <label for="cover-input">Cover Letter</label><input id="cover-input" type="file" />
+    `)
+
+    try {
+      const cache = createFillLookupCache()
+      await attachFiles(page, [tempFile], {
+        fieldLabel: 'Cover Letter',
+        fieldKey: 'id:cover-input',
+        cache,
+      })
+      expect(await page.locator('#cover-input').evaluate((el: HTMLInputElement) => el.files?.length ?? 0)).toBe(1)
+      await page.locator('#cover-input').evaluate((el: HTMLInputElement) => { el.value = '' })
+      await expect(attachFiles(page, [tempFile], {
+        fieldLabel: 'Resume',
+        fieldKey: 'id:cover-input',
+        cache,
+      })).rejects.toThrow('did not match field label')
+      await expect(attachFiles(page, [tempFile], {
+        fieldKey: 'id:missing-upload',
+      })).rejects.toThrow('did not resolve')
+      expect(await page.locator('#resume-input').evaluate((el: HTMLInputElement) => el.files?.length ?? 0)).toBe(0)
+      expect(await page.locator('#cover-input').evaluate((el: HTMLInputElement) => el.files?.length ?? 0)).toBe(0)
+
+      await page.setContent(`
+        <label>Resume <input id="resume-a" type="file" /></label>
+        <label>Resume <input id="resume-b" type="file" /></label>
+      `)
+      await expect(attachFiles(page, [tempFile], { fieldLabel: 'Resume' })).rejects.toThrow('ambiguous label')
+      expect(await page.locator('#resume-a').evaluate((el: HTMLInputElement) => el.files?.length ?? 0)).toBe(0)
+      expect(await page.locator('#resume-b').evaluate((el: HTMLInputElement) => el.files?.length ?? 0)).toBe(0)
+    } finally {
+      await rm(tempFile, { force: true })
+      await page.close()
+    }
+  })
+
+  it('refuses disabled file inputs and requires synthetic drops to show acceptance', async () => {
+    const page = await browser.newPage({ viewport: { width: 900, height: 700 } })
+    const tempFile = join(tmpdir(), `geometra-upload-truth-${Date.now()}.txt`)
+    await writeFile(tempFile, 'resume')
+    await page.setContent(`
+      <style>
+        .drop { width: 260px; height: 80px; margin: 16px; border: 1px solid #aaa; }
+      </style>
+      <label for="disabled-upload">Resume</label>
+      <input id="disabled-upload" type="file" disabled />
+      <div id="plain-drop" class="drop">Plain drop target</div>
+      <div id="blocked-drop" class="drop" data-dropzone aria-disabled="true">Blocked drop target</div>
+      <div id="cleared-drop" class="drop" data-dropzone>Cleared drop target<input id="cleared-drop-input" type="file" hidden /></div>
+      <div id="accepted-drop" class="drop" data-dropzone>Accepted drop target</div>
+      <script>
+        const blocked = document.getElementById('blocked-drop')
+        blocked.addEventListener('dragover', event => event.preventDefault())
+        blocked.addEventListener('drop', event => {
+          event.preventDefault()
+          blocked.textContent = 'should not run'
+        })
+        const cleared = document.getElementById('cleared-drop')
+        const clearedInput = document.getElementById('cleared-drop-input')
+        cleared.addEventListener('dragover', event => event.preventDefault())
+        cleared.addEventListener('drop', event => event.preventDefault())
+        clearedInput.addEventListener('change', () => setTimeout(() => {
+          Object.defineProperty(clearedInput, 'files', { value: new DataTransfer().files, configurable: true })
+        }, 0))
+        const accepted = document.getElementById('accepted-drop')
+        accepted.addEventListener('dragover', event => event.preventDefault())
+        accepted.addEventListener('drop', event => {
+          event.preventDefault()
+          accepted.textContent = Array.from(event.dataTransfer.files).map(file => file.name).join(', ')
+        })
+      </script>
+    `)
+
+    try {
+      await expect(attachFiles(page, [tempFile], {
+        fieldLabel: 'Resume',
+        strategy: 'hidden',
+      })).rejects.toThrow('file:')
+      expect(await page.locator('#disabled-upload').evaluate((el: HTMLInputElement) => el.files?.length ?? 0)).toBe(0)
+
+      const plain = await page.locator('#plain-drop').boundingBox()
+      if (!plain) throw new Error('expected plain drop bounds')
+      await expect(attachFiles(page, [tempFile], {
+        strategy: 'drop',
+        dropX: plain.x + plain.width / 2,
+        dropY: plain.y + plain.height / 2,
+      })).rejects.toThrow('did not accept')
+
+      const blocked = await page.locator('#blocked-drop').boundingBox()
+      if (!blocked) throw new Error('expected blocked drop bounds')
+      await expect(attachFiles(page, [tempFile], {
+        strategy: 'drop',
+        dropX: blocked.x + blocked.width / 2,
+        dropY: blocked.y + blocked.height / 2,
+      })).rejects.toThrow('not mutable')
+      expect(await page.locator('#blocked-drop').textContent()).toBe('Blocked drop target')
+
+      const cleared = await page.locator('#cleared-drop').boundingBox()
+      if (!cleared) throw new Error('expected cleared drop bounds')
+      await expect(attachFiles(page, [tempFile], {
+        strategy: 'drop',
+        dropX: cleared.x + cleared.width / 2,
+        dropY: cleared.y + cleared.height / 2,
+      })).rejects.toThrow('did not accept')
+
+      const accepted = await page.locator('#accepted-drop').boundingBox()
+      if (!accepted) throw new Error('expected accepted drop bounds')
+      await attachFiles(page, [tempFile], {
+        strategy: 'drop',
+        dropX: accepted.x + accepted.width / 2,
+        dropY: accepted.y + accepted.height / 2,
+      })
+      expect(await page.locator('#accepted-drop').textContent()).toContain(tempFile.split('/').pop())
+    } finally {
+      await rm(tempFile, { force: true })
+      await page.close()
+    }
+  })
+
+  it('verifies hidden and chooser uploads survive application handlers', async () => {
+    const page = await browser.newPage({ viewport: { width: 900, height: 700 } })
+    const tempFile = join(tmpdir(), `geometra-upload-retain-${Date.now()}.txt`)
+    await writeFile(tempFile, 'resume')
+    try {
+      await page.setContent(`
+        <label for="resume">Resume</label><input id="resume" type="file" />
+        <script>
+          resume.addEventListener('change', () => setTimeout(() => { resume.value = '' }, 0))
+        </script>
+      `)
+      await expect(attachFiles(page, [tempFile], {
+        fieldLabel: 'Resume',
+        strategy: 'hidden',
+      })).rejects.toThrow('rejected or cleared')
+      expect(await page.locator('#resume').evaluate((el: HTMLInputElement) => el.files?.length ?? 0)).toBe(0)
+
+      await page.setContent(`
+        <button id="upload" type="button">Upload resume</button>
+        <input id="chooser-input" type="file" hidden />
+        <script>
+          const uploadButton = document.getElementById('upload')
+          const chooserInput = document.getElementById('chooser-input')
+          uploadButton.addEventListener('click', () => chooserInput.click())
+          chooserInput.addEventListener('change', () => setTimeout(() => { chooserInput.value = '' }, 0))
+        </script>
+      `)
+      const box = await page.locator('#upload').boundingBox()
+      if (!box) throw new Error('expected chooser button bounds')
+      await expect(attachFiles(page, [tempFile], {
+        strategy: 'chooser',
+        clickX: box.x + box.width / 2,
+        clickY: box.y + box.height / 2,
+      })).rejects.toThrow('rejected or cleared')
+      expect(await page.locator('#chooser-input').evaluate((el: HTMLInputElement) => el.files?.length ?? 0)).toBe(0)
+
+      await page.setContent(`
+        <button id="blocked-upload" type="button">Upload blocked resume</button>
+        <input id="blocked-chooser-input" type="file" aria-disabled="true" hidden />
+        <script>
+          const blockedButton = document.getElementById('blocked-upload')
+          const blockedInput = document.getElementById('blocked-chooser-input')
+          blockedButton.addEventListener('click', () => blockedInput.click())
+        </script>
+      `)
+      const blockedBox = await page.locator('#blocked-upload').boundingBox()
+      if (!blockedBox) throw new Error('expected blocked chooser button bounds')
+      await expect(attachFiles(page, [tempFile], {
+        strategy: 'chooser',
+        clickX: blockedBox.x + blockedBox.width / 2,
+        clickY: blockedBox.y + blockedBox.height / 2,
+      })).rejects.toThrow('chooser input is not mutable')
+      expect(await page.locator('#blocked-chooser-input').evaluate((el: HTMLInputElement) => el.files?.length ?? 0)).toBe(0)
+    } finally {
+      await rm(tempFile, { force: true })
+      await page.close()
+    }
+  })
+
+  it('enforces file context and section constraints for standalone and batch fills', async () => {
+    const page = await browser.newPage({ viewport: { width: 900, height: 700 } })
+    const tempFile = join(tmpdir(), `geometra-upload-scope-${Date.now()}.txt`)
+    await writeFile(tempFile, 'document')
+    await page.setContent(`
+      <section aria-label="Application materials">
+        <div id="resume-card"><h3>Candidate resume</h3><label>Document <input id="resume-doc" type="file" /></label></div>
+        <div id="cover-card"><h3>Cover letter</h3><label>Document <input id="cover-doc" type="file" /></label></div>
+      </section>
+    `)
+
+    try {
+      await attachFiles(page, [tempFile], {
+        fieldLabel: 'Document',
+        contextText: 'Candidate resume',
+        sectionText: 'Application materials',
+      })
+      expect(await page.locator('#resume-doc').evaluate((el: HTMLInputElement) => el.files?.length ?? 0)).toBe(1)
+      expect(await page.locator('#cover-doc').evaluate((el: HTMLInputElement) => el.files?.length ?? 0)).toBe(0)
+
+      await fillFields(page, [{
+        kind: 'file',
+        fieldLabel: 'Document',
+        paths: [tempFile],
+        contextText: 'Cover letter',
+        sectionText: 'Application materials',
+      }])
+      expect(await page.locator('#cover-doc').evaluate((el: HTMLInputElement) => el.files?.length ?? 0)).toBe(1)
+
+      await page.locator('#resume-card').evaluate(card => {
+        card.insertAdjacentHTML('beforeend', '<label>Document <input id="resume-duplicate" type="file" /></label>')
+      })
+      await expect(attachFiles(page, [tempFile], {
+        fieldLabel: 'Document',
+        contextText: 'Candidate resume',
+        sectionText: 'Application materials',
+      })).rejects.toThrow('ambiguous scoped match')
+      expect(await page.locator('#resume-duplicate').evaluate((el: HTMLInputElement) => el.files?.length ?? 0)).toBe(0)
+    } finally {
+      await rm(tempFile, { force: true })
+      await page.close()
+    }
+  })
 })
 
 describe('setFieldText', () => {
@@ -1558,6 +1878,51 @@ describe('setFieldText', () => {
     await setFieldText(page, 'Email', 'second@example.com', { cache })
 
     expect(await page.locator('#email').inputValue()).toBe('second@example.com')
+    await page.close()
+  })
+
+  it('refuses native and effective read-only text controls without mutating them', async () => {
+    const page = await browser.newPage({ viewport: { width: 900, height: 700 } })
+    await page.setContent(`
+      <label>Disabled name <input id="disabled-name" disabled /></label>
+      <label>Read only name <input id="readonly-name" readonly /></label>
+      <div aria-disabled="true">
+        <div id="aria-name" role="textbox" contenteditable="true" aria-label="ARIA name">original</div>
+      </div>
+      <div id="aria-readonly-name" role="textbox" contenteditable="true" aria-label="ARIA readonly name" aria-readonly="true">original</div>
+      <div inert><label>Inert name <input id="inert-name" /></label></div>
+      <fieldset disabled><label>Fieldset name <input id="fieldset-name" /></label></fieldset>
+      <fieldset disabled><legend><label>Legend name <input id="legend-name" /></label></legend></fieldset>
+    `)
+
+    for (const label of ['Disabled name', 'Read only name', 'ARIA name', 'ARIA readonly name', 'Inert name', 'Fieldset name']) {
+      await expect(setFieldText(page, label, 'Alice', { exact: true })).rejects.toThrow('not mutable')
+    }
+    await setFieldText(page, 'Legend name', 'Allowed', { exact: true })
+
+    expect(await page.locator('#disabled-name').inputValue()).toBe('')
+    expect(await page.locator('#readonly-name').inputValue()).toBe('')
+    expect(await page.locator('#aria-name').textContent()).toBe('original')
+    expect(await page.locator('#aria-readonly-name').textContent()).toBe('original')
+    expect(await page.locator('#inert-name').inputValue()).toBe('')
+    expect(await page.locator('#fieldset-name').inputValue()).toBe('')
+    expect(await page.locator('#legend-name').inputValue()).toBe('Allowed')
+    await page.close()
+  })
+
+  it('does not accept substring-only text readback as success', async () => {
+    const page = await browser.newPage({ viewport: { width: 900, height: 700 } })
+    await page.setContent(`
+      <label for="name">Name</label><input id="name" />
+      <script>
+        const input = document.getElementById('name')
+        const setter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value').set
+        input.addEventListener('input', () => setter.call(input, 'WRONG:' + input.value), { once: true })
+      </script>
+    `)
+
+    await expect(setFieldText(page, 'Name', 'Alice', { exact: true })).rejects.toThrow('could not confirm value')
+    expect(await page.locator('#name').inputValue()).toBe('WRONG:Alice')
     await page.close()
   })
 })
@@ -1727,6 +2092,38 @@ describe('setFieldChoice', () => {
     await page.close()
   })
 
+  it('jointly enforces native option identity and detects handler reverts', async () => {
+    const page = await browser.newPage({ viewport: { width: 900, height: 700 } })
+    await page.setContent(`
+      <select id="country" style="margin:24px;width:240px;height:40px">
+        <option value="ca">Canada</option>
+        <option value="de">Germany</option>
+        <option value="us">United States</option>
+      </select>
+    `)
+    const box = await page.locator('#country').boundingBox()
+    if (!box) throw new Error('expected select bounds')
+    const x = box.x + box.width / 2
+    const y = box.y + box.height / 2
+
+    await expect(selectNativeOption(page, x, y, {
+      index: 1,
+      value: 'de',
+      label: 'United States',
+    })).rejects.toThrow('selectOption:')
+    expect(await page.locator('#country').inputValue()).toBe('ca')
+
+    await selectNativeOption(page, x, y, { index: 1, value: 'de', label: 'Germany' })
+    expect(await page.locator('#country').inputValue()).toBe('de')
+    await page.locator('#country').selectOption('ca')
+    await page.locator('#country').evaluate(select => {
+      select.addEventListener('change', () => setTimeout(() => { (select as HTMLSelectElement).selectedIndex = 0 }, 0), { once: true })
+    })
+    await expect(selectNativeOption(page, x, y, { index: 1, value: 'de', label: 'Germany' })).rejects.toThrow('selectOption:')
+    expect(await page.locator('#country').inputValue()).toBe('ca')
+    await page.close()
+  })
+
   it('does not reuse a keyed cache entry after DOM reorder or fall back when the key is stale', async () => {
     const page = await browser.newPage({ viewport: { width: 900, height: 700 } })
     const cache = createFillLookupCache()
@@ -1781,6 +2178,32 @@ describe('setFieldChoice', () => {
       exact: true,
     })).rejects.toThrow('no enabled <option>')
     expect(await page.locator('#region').inputValue()).toBe('open')
+    await page.close()
+  })
+
+  it('refuses disabled native and ARIA-disabled custom choice controls', async () => {
+    const page = await browser.newPage({ viewport: { width: 900, height: 700 } })
+    await page.setContent(`
+      <label for="country">Country</label>
+      <select id="country" disabled><option>Canada</option><option>Germany</option></select>
+      <label id="office-label">Office</label>
+      <button id="office" role="combobox" aria-labelledby="office-label" aria-haspopup="listbox" aria-disabled="true">Choose</button>
+      <div id="office-options" role="listbox" hidden><button role="option">Berlin</button></div>
+      <script>
+        office.addEventListener('click', () => { officeOptions.hidden = false })
+      </script>
+    `)
+
+    await expect(setFieldChoice(page, 'Country', 'Germany', { exact: true })).rejects.toThrow('not mutable')
+    expect(await page.locator('#country').inputValue()).toBe('Canada')
+    const countryBox = await page.locator('#country').boundingBox()
+    if (!countryBox) throw new Error('expected disabled select bounds')
+    await expect(selectNativeOption(page, countryBox.x + countryBox.width / 2, countryBox.y + countryBox.height / 2, {
+      label: 'Germany',
+    })).rejects.toThrow('not mutable')
+    expect(await page.locator('#country').inputValue()).toBe('Canada')
+    await expect(setFieldChoice(page, 'Office', 'Berlin', { exact: true })).rejects.toThrow('not mutable')
+    expect(await page.locator('#office-options').isHidden()).toBe(true)
     await page.close()
   })
 })
@@ -1859,6 +2282,29 @@ describe('fillFields auto', () => {
 
   afterAll(async () => {
     await browser.close()
+  })
+
+  it('does not let the native batch path bypass disabled or readonly states', async () => {
+    const page = await browser.newPage({ viewport: { width: 900, height: 700 } })
+    await page.setContent(`
+      <label>Full name <input id="full-name" disabled /></label>
+      <label>Email <input id="email" readonly /></label>
+      <label>Country <select id="country" disabled><option>Canada</option><option>Germany</option></select></label>
+      <label>Consent <input id="consent" type="checkbox" disabled /></label>
+    `)
+
+    await expect(fillFields(page, [
+      { kind: 'auto', fieldLabel: 'Full name', value: 'Alice' },
+      { kind: 'auto', fieldLabel: 'Email', value: 'alice@example.com' },
+      { kind: 'auto', fieldLabel: 'Country', value: 'Germany' },
+      { kind: 'auto', fieldLabel: 'Consent', value: true },
+    ])).rejects.toThrow('partial batch failure')
+
+    expect(await page.locator('#full-name').inputValue()).toBe('')
+    expect(await page.locator('#email').inputValue()).toBe('')
+    expect(await page.locator('#country').inputValue()).toBe('Canada')
+    expect(await page.locator('#consent').isChecked()).toBe(false)
+    await page.close()
   })
 
   it('fills native text, select, checkbox, and grouped radio fields from labels without prior schema hints', async () => {
@@ -2061,6 +2507,31 @@ describe('fillFields auto', () => {
 
     expect(await page.locator('#share-profile').isChecked()).toBe(true)
     expect(await page.locator('#state').textContent()).toBe('on')
+    await page.close()
+  })
+
+  it('refuses disabled and effectively disabled toggles without firing handlers', async () => {
+    const page = await browser.newPage({ viewport: { width: 900, height: 700 } })
+    await page.setContent(`
+      <label><input id="native-disabled" type="checkbox" disabled /> Native disabled</label>
+      <div aria-disabled="true">
+        <div id="aria-disabled" role="checkbox" aria-checked="false" aria-label="ARIA disabled" tabindex="0" style="width:24px;height:24px"></div>
+      </div>
+      <script>
+        window.toggleClicks = 0
+        const custom = document.getElementById('aria-disabled')
+        custom.addEventListener('click', () => {
+          window.toggleClicks++
+          custom.setAttribute('aria-checked', 'true')
+        })
+      </script>
+    `)
+
+    await expect(setCheckedControl(page, 'Native disabled', { exact: true })).rejects.toThrow('not mutable')
+    await expect(setCheckedControl(page, 'ARIA disabled', { exact: true })).rejects.toThrow('not mutable')
+    expect(await page.locator('#native-disabled').isChecked()).toBe(false)
+    expect(await page.locator('#aria-disabled').getAttribute('aria-checked')).toBe('false')
+    expect(await page.evaluate(() => (window as unknown as { toggleClicks: number }).toggleClicks)).toBe(0)
     await page.close()
   })
 
@@ -2406,6 +2877,24 @@ describe('fillOtp', () => {
       })
     </script>
   `
+
+  it('guards every OTP cell before the setFieldText fast path clears or types', async () => {
+    const page = await browser.newPage({ viewport: { width: 900, height: 700 } })
+    await page.setContent(`
+      <style>.otp { display:flex; gap:8px }.otp input { width:40px; height:48px }</style>
+      <label for="guard-cell-0">Security code</label>
+      <div class="otp" data-otp>
+        <input id="guard-cell-0" maxlength="1" value="A" />
+        <input id="guard-cell-1" maxlength="1" value="B" readonly />
+        <input id="guard-cell-2" maxlength="1" value="C" />
+        <input id="guard-cell-3" maxlength="1" value="D" />
+      </div>
+    `)
+
+    await expect(setFieldText(page, 'Security code', '1234')).rejects.toThrow('OTP cell 2: matched control is not mutable')
+    expect(await page.locator('.otp input').evaluateAll(inputs => inputs.map(input => (input as HTMLInputElement).value))).toEqual(['A', 'B', 'C', 'D'])
+    await page.close()
+  })
 
   it('auto-detects an 8-cell OTP group and types char-by-char with focus auto-advance', async () => {
     const page = await browser.newPage({ viewport: { width: 900, height: 700 } })

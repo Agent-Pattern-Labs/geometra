@@ -105,6 +105,8 @@ export type ClientFileMessage = {
   x?: number
   y?: number
   fieldLabel?: string
+  contextText?: string
+  sectionText?: string
   exact?: boolean
   strategy?: 'auto' | 'chooser' | 'hidden' | 'drop'
   dropX?: number
@@ -156,7 +158,16 @@ export type ClientFillField =
     }
   | { kind: 'choice'; fieldId?: string; fieldKey?: ClientFieldKey; fieldLabel: string; value: string; optionIndex?: number; query?: string; exact?: boolean; choiceType?: ClientChoiceType }
   | { kind: 'toggle'; fieldId?: string; fieldKey?: ClientFieldKey; label: string; checked?: boolean; exact?: boolean; controlType?: 'checkbox' | 'radio'; contextText?: string; sectionText?: string }
-  | { kind: 'file'; fieldId?: string; fieldKey?: ClientFieldKey; fieldLabel: string; paths: string[]; exact?: boolean }
+  | {
+      kind: 'file'
+      fieldId?: string
+      fieldKey?: ClientFieldKey
+      fieldLabel: string
+      paths: string[]
+      exact?: boolean
+      contextText?: string
+      sectionText?: string
+    }
 
 export type ClientFillFieldsMessage = {
   type: 'fillFields'
@@ -294,7 +305,7 @@ const MESSAGE_KEYS = {
   resize: new Set([...COMMON_MESSAGE_KEYS, 'width', 'height', 'capabilities']),
   navigate: new Set([...COMMON_MESSAGE_KEYS, 'url']),
   composition: new Set([...COMMON_MESSAGE_KEYS, 'eventType', 'data']),
-  file: new Set([...COMMON_MESSAGE_KEYS, 'paths', 'fieldId', 'fieldKey', 'x', 'y', 'fieldLabel', 'exact', 'strategy', 'dropX', 'dropY']),
+  file: new Set([...COMMON_MESSAGE_KEYS, 'paths', 'fieldId', 'fieldKey', 'x', 'y', 'fieldLabel', 'contextText', 'sectionText', 'exact', 'strategy', 'dropX', 'dropY']),
   setFieldText: new Set([...COMMON_MESSAGE_KEYS, 'fieldId', 'fieldKey', 'fieldLabel', 'value', 'exact', 'typingDelayMs', 'imeFriendly']),
   setFieldChoice: new Set([...COMMON_MESSAGE_KEYS, 'fieldId', 'fieldKey', 'fieldLabel', 'value', 'optionIndex', 'query', 'choiceType', 'exact']),
   fillOtp: new Set([...COMMON_MESSAGE_KEYS, 'value', 'fieldLabel', 'perCharDelayMs']),
@@ -319,7 +330,7 @@ const FILL_FIELD_KEYS = {
     'contextText',
     'sectionText',
   ]),
-  file: new Set(['kind', 'fieldId', 'fieldKey', 'fieldLabel', 'paths', 'exact']),
+  file: new Set(['kind', 'fieldId', 'fieldKey', 'fieldLabel', 'paths', 'exact', 'contextText', 'sectionText']),
 } satisfies Record<ClientFillField['kind'], ReadonlySet<string>>
 
 function asRecord(value: unknown): UnknownRecord | null {
@@ -378,6 +389,42 @@ function hasValidCommonFields(record: UnknownRecord): boolean {
     isOptionalFiniteNumber(record.proxyActionProtocolVersion)
 }
 
+function hasValidFileTargetContract(record: UnknownRecord): boolean {
+  const hasX = record.x !== undefined
+  const hasY = record.y !== undefined
+  const hasDropX = record.dropX !== undefined
+  const hasDropY = record.dropY !== undefined
+  if (hasX !== hasY || hasDropX !== hasDropY) return false
+
+  const hasClick = hasX && hasY
+  const hasDrop = hasDropX && hasDropY
+  const hasFieldLabel = isTrimmedNonEmptyString(record.fieldLabel)
+  const hasFieldKey = record.fieldKey !== undefined
+  const hasSemanticTarget = hasFieldLabel || hasFieldKey
+  const hasSemanticExtras = record.fieldId !== undefined || hasFieldKey || record.fieldLabel !== undefined ||
+    record.contextText !== undefined || record.sectionText !== undefined || record.exact !== undefined
+  const strategy = record.strategy ?? 'auto'
+
+  if ((record.contextText !== undefined || record.sectionText !== undefined || record.exact !== undefined) && !hasFieldLabel) return false
+  if (record.fieldId !== undefined && !hasSemanticTarget) return false
+  if (strategy === 'chooser') return hasClick && !hasDrop && !hasSemanticExtras
+  if (strategy === 'drop') return hasDrop && !hasClick && !hasSemanticExtras
+  if (strategy === 'hidden') return hasSemanticTarget && !hasClick && !hasDrop
+  return !hasDrop && hasClick !== hasSemanticTarget
+}
+
+function hasValidListboxTargetContract(record: UnknownRecord): boolean {
+  const hasOpenX = record.openX !== undefined
+  const hasOpenY = record.openY !== undefined
+  if (hasOpenX !== hasOpenY) return false
+  const hasCoordinates = hasOpenX && hasOpenY
+  const hasSemanticTarget = isTrimmedNonEmptyString(record.fieldLabel) || record.fieldKey !== undefined
+  if (record.fieldId !== undefined && !hasSemanticTarget) return false
+  if (hasCoordinates && (record.fieldLabel !== undefined || record.fieldId !== undefined || record.fieldKey !== undefined)) return false
+  if (hasCoordinates && record.query !== undefined) return false
+  return hasCoordinates !== hasSemanticTarget
+}
+
 function isClientFillField(value: unknown): value is ClientFillField {
   const field = asRecord(value)
   if (!field || !isTrimmedNonEmptyString(field.kind)) return false
@@ -406,7 +453,8 @@ function isClientFillField(value: unknown): value is ClientFillField {
   }
   if (field.kind === 'file') {
     return hasOnlyKeys(field, FILL_FIELD_KEYS.file) && isTrimmedNonEmptyString(field.fieldLabel) && Array.isArray(field.paths) && field.paths.length > 0 &&
-      field.paths.every(isTrimmedNonEmptyString)
+      field.paths.every(isTrimmedNonEmptyString) &&
+      isOptionalTrimmedString(field.contextText) && isOptionalTrimmedString(field.sectionText)
   }
   return false
 }
@@ -459,9 +507,12 @@ export function isFileMessage(msg: ParsedClientMessage): msg is ClientFileMessag
     (record.fieldId === undefined || isTrimmedNonEmptyString(record.fieldId)) &&
     (record.fieldKey === undefined || isClientFieldKey(record.fieldKey)) &&
     isOptionalFiniteNumber(record.x) && isOptionalFiniteNumber(record.y) &&
-    isOptionalTrimmedString(record.fieldLabel) && isOptionalBoolean(record.exact) &&
+    isOptionalTrimmedString(record.fieldLabel) &&
+    isOptionalTrimmedString(record.contextText) && isOptionalTrimmedString(record.sectionText) &&
+    isOptionalBoolean(record.exact) &&
     (record.strategy === undefined || record.strategy === 'auto' || record.strategy === 'chooser' || record.strategy === 'hidden' || record.strategy === 'drop') &&
-    isOptionalFiniteNumber(record.dropX) && isOptionalFiniteNumber(record.dropY) && hasValidCommonFields(record)
+    isOptionalFiniteNumber(record.dropX) && isOptionalFiniteNumber(record.dropY) &&
+    hasValidFileTargetContract(record) && hasValidCommonFields(record)
 }
 
 export function isSetFieldTextMessage(msg: ParsedClientMessage): msg is ClientSetFieldTextMessage {
@@ -527,7 +578,8 @@ export function isListboxPickMessage(msg: ParsedClientMessage): msg is ClientLis
     isOptionalBoolean(record.exact) && isOptionalFiniteNumber(record.openX) && isOptionalFiniteNumber(record.openY) &&
     (record.fieldId === undefined || isTrimmedNonEmptyString(record.fieldId)) &&
     (record.fieldKey === undefined || isClientFieldKey(record.fieldKey)) &&
-    isOptionalTrimmedString(record.fieldLabel) && isOptionalTrimmedString(record.query) && hasValidCommonFields(record)
+    isOptionalTrimmedString(record.fieldLabel) && isOptionalTrimmedString(record.query) &&
+    hasValidListboxTargetContract(record) && hasValidCommonFields(record)
 }
 
 export function isSetCheckedMessage(msg: ParsedClientMessage): msg is ClientSetCheckedMessage {
