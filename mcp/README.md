@@ -227,6 +227,12 @@ npm run build
 claude mcp add geometra -- node ./dist/index.js
 ```
 
+### Session state privacy
+
+Session lifecycle state is process-memory-only by default and does not create a state file. To opt into restart-persistent state, set `GEOMETRA_MCP_STATE_FILE` to a database path inside a private directory (mode `0700`). Geometra rejects symlinked or insecure state targets and keeps the database and SQLite sidecars at mode `0600`.
+
+Retained lifecycle and workflow state stores URL origins rather than paths or query strings, and redacts submitted field values, file paths, credentials, payloads, and raw error messages. Existing legacy state files are not migrated or deleted automatically.
+
 ## Usage
 
 ### Native Geometra server

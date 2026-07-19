@@ -577,7 +577,11 @@ describe('ATS integration patterns', () => {
         ],
       }]
       mockState.currentA11yRoot = node('group', undefined, {
-        meta: { pageUrl: 'https://careers.acme.com/apply/step1', scrollX: 0, scrollY: 0 },
+        meta: {
+          pageUrl: 'https://careers.acme.com/apply/step1?candidate=taylor%40example.com#profile',
+          scrollX: 0,
+          scrollY: 0,
+        },
         children: [
           node('textbox', 'Full name', { value: 'Taylor Smith', path: [0], state: { required: true } }),
           node('textbox', 'Email', { value: 'taylor@example.com', path: [1], state: { required: true } }),
@@ -606,33 +610,51 @@ describe('ATS integration patterns', () => {
       mockState.formSchemas = [{
         formId: 'fm:1',
         name: 'Experience',
-        fieldCount: 2,
-        requiredCount: 1,
+        fieldCount: 3,
+        requiredCount: 2,
         invalidCount: 0,
         fields: [
           { id: 'ff:1.0', kind: 'text', label: 'Current Company', required: true },
           { id: 'ff:1.1', kind: 'text', label: 'Years of Experience' },
+          {
+            id: 'ff:1.2',
+            kind: 'file',
+            label: 'Resume',
+            required: true,
+            format: { accept: '.pdf', multiple: false },
+          },
         ],
       }]
       mockState.currentA11yRoot = node('group', undefined, {
-        meta: { pageUrl: 'https://careers.acme.com/apply/step2', scrollX: 0, scrollY: 0 },
+        meta: {
+          pageUrl: 'https://careers.acme.com/apply/step2?token=private-workflow-token#documents',
+          scrollX: 0,
+          scrollY: 0,
+        },
         children: [
-          node('textbox', 'Current Company', { value: 'Acme Corp', path: [0], state: { required: true } }),
+          node('textbox', 'Current Company', { value: 'Nebula Dynamics', path: [0], state: { required: true } }),
           node('textbox', 'Years of Experience', { value: '5', path: [1] }),
-          node('button', 'Submit', { path: [2] }),
+          node('button', 'Resume', {
+            value: 'Taylor-Smith-Resume.pdf',
+            path: [2],
+            state: { required: true },
+            meta: { fileInput: true, accept: '.pdf', multiple: false },
+          }),
+          node('button', 'Submit', { path: [3] }),
         ],
       })
 
       // Fill page 2
       const fillResult2 = await fillHandler({
         formId: 'fm:1',
-        valuesById: {
-          'ff:1.0': 'Acme Corp',
-          'ff:1.1': '5',
+        valuesByLabel: {
+          'Current Company': 'Nebula Dynamics',
+          'Years of Experience': '5',
+          Resume: ['/Users/taylor/private/Taylor-Smith-Resume.pdf'],
         },
         stopOnError: true,
         failOnInvalid: false,
-        includeSteps: false,
+        includeSteps: true,
         detail: 'terse',
       })
       const payload2 = JSON.parse(fillResult2.content[0]!.text) as Record<string, unknown>
@@ -644,6 +666,45 @@ describe('ATS integration patterns', () => {
       const statePayload = JSON.parse(stateResult.content[0]!.text) as Record<string, unknown>
       expect(statePayload.pageCount).toBe(2)
       expect(statePayload.totalFieldsFilled).toBeGreaterThanOrEqual(4)
+      expect(statePayload.valuesRedacted).toBe(true)
+      expect(statePayload.pages).toEqual([
+        expect.objectContaining({
+          pageUrl: 'https://careers.acme.com',
+          valuesRedacted: true,
+          filledFields: ['ff:0.0', 'ff:0.1'],
+          filledValues: {
+            'ff:0.0': '[REDACTED]',
+            'ff:0.1': '[REDACTED]',
+          },
+        }),
+        expect.objectContaining({
+          pageUrl: 'https://careers.acme.com',
+          valuesRedacted: true,
+          filledFields: ['Current Company', 'Resume', 'Years of Experience'],
+          filledValues: {
+            'Current Company': '[REDACTED]',
+            'Years of Experience': '[REDACTED]',
+            Resume: '[REDACTED]',
+          },
+        }),
+      ])
+
+      const privateInputs = [
+        'Taylor Smith',
+        'taylor@example.com',
+        'Nebula Dynamics',
+        '/Users/taylor/private/Taylor-Smith-Resume.pdf',
+        '/apply/step1',
+        '/apply/step2',
+        'candidate=',
+        'private-workflow-token',
+      ]
+      const inMemoryState = JSON.stringify(mockState.session.workflowState)
+      const returnedState = JSON.stringify(statePayload)
+      for (const privateInput of privateInputs) {
+        expect(inMemoryState).not.toContain(privateInput)
+        expect(returnedState).not.toContain(privateInput)
+      }
     })
   })
 

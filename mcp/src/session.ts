@@ -16,6 +16,7 @@ import {
   initializeSessionLifecycle,
   recordSessionSnapshot,
 } from './session-state.js'
+import { REDACTED_STATE_URL, sanitizeUrlToOrigin } from './state-privacy.js'
 
 /**
  * Parsed accessibility node from the UI tree + computed layout.
@@ -465,7 +466,11 @@ export interface WorkflowPageEntry {
   pageUrl: string
   formId?: string
   formName?: string
-  filledValues: Record<string, string | boolean>
+  /** Backward-compatible value map whose contents are always redaction markers. */
+  filledValues: Record<string, '[REDACTED]'>
+  /** Stable field identities retained without submitted values. */
+  filledFields: string[]
+  valuesRedacted: true
   filledAt: number
   fieldCount: number
   invalidCount: number
@@ -1541,6 +1546,16 @@ function formatUnknownError(err: unknown): string {
   return err instanceof Error ? err.message : String(err)
 }
 
+/**
+ * Durable lifecycle records only need enough URL context to identify the
+ * remote origin. Paths, query strings, fragments, and credentials can carry
+ * application data or bearer capabilities, so call sites must not forward
+ * them to the persistence layer.
+ */
+function lifecycleUrlOrigin(rawUrl: string): string {
+  return sanitizeUrlToOrigin(rawUrl) ?? REDACTED_STATE_URL
+}
+
 function rejectOnRuntimeReadyFailure(runtime: EmbeddedProxyRuntime): Promise<never> {
   return new Promise((_, reject) => {
     runtime.ready.catch(reject)
@@ -1908,7 +1923,7 @@ async function attachToReusableProxy(proxy: ReusableProxyEntry, options: {
   updateReusableProxySnapshotState(proxy, session)
   safeRecordSessionSnapshot(session, 'session.proxy_attached', {
     transportMode: 'reused-proxy',
-    targetPageUrl: options.pageUrl,
+    targetPageOrigin: lifecycleUrlOrigin(options.pageUrl),
     reusedExistingSession: false,
   })
   return session
@@ -2011,7 +2026,7 @@ async function startFreshProxySession(options: {
       safeRecordSessionSnapshot(session, 'session.proxy_attached', {
         transportMode: 'fresh-proxy',
         proxyStartMode: 'embedded',
-        requestedPageUrl: options.pageUrl,
+        requestedPageOrigin: lifecycleUrlOrigin(options.pageUrl),
         isolated: options.isolated === true,
       })
       return session
@@ -2093,7 +2108,7 @@ async function startFreshProxySession(options: {
         safeRecordSessionSnapshot(session, 'session.proxy_attached', {
           transportMode: 'fresh-proxy',
           proxyStartMode: 'child',
-          requestedPageUrl: options.pageUrl,
+          requestedPageOrigin: lifecycleUrlOrigin(options.pageUrl),
           isolated: options.isolated === true,
         })
         return session
@@ -2218,7 +2233,7 @@ function connectWithOwnership(
     const timeout = setTimeout(() => {
       if (!resolved) {
         safeFailSessionLifecycle(session, 'connect_timeout', {
-          transportUrl: url,
+          transportOrigin: lifecycleUrlOrigin(url),
           timeoutMs: 10_000,
         })
         resolved = true
@@ -2330,8 +2345,8 @@ function connectWithOwnership(
       }
       if (!resolved) {
         safeFailSessionLifecycle(session, 'websocket_error', {
-          transportUrl: url,
-          message: err.message,
+          transportOrigin: lifecycleUrlOrigin(url),
+          errorCode: (err as Error & { code?: string }).code ?? 'websocket_error',
         })
         resolved = true
         clearTimeout(timeout)
@@ -2346,7 +2361,7 @@ function connectWithOwnership(
       invalidateSessionUiState(session)
       if (!resolved) {
         safeFailSessionLifecycle(session, 'websocket_closed_before_ready', {
-          transportUrl: url,
+          transportOrigin: lifecycleUrlOrigin(url),
         })
         resolved = true
         clearTimeout(timeout)
@@ -2835,13 +2850,13 @@ export async function ensureSessionConnected(session: Session): Promise<void> {
       }
       startSessionHeartbeat(session)
       safeRecordSessionSnapshot(session, 'session.reconnected', {
-        targetUrl,
+        targetOrigin: lifecycleUrlOrigin(targetUrl),
       })
       return true
     } catch (err) {
       safeFailSessionLifecycle(session, 'reconnect_failed', {
-        targetUrl,
-        message: formatUnknownError(err),
+        targetOrigin: lifecycleUrlOrigin(targetUrl),
+        errorName: err instanceof Error ? err.name : 'Error',
       })
       if (activeSessions.get(session.id) === session) {
         activeSessions.delete(session.id)
@@ -3224,9 +3239,8 @@ export function sendNavigate(
       url,
     }, timeoutMs, { requireUpdateOnAck: true })
     safeRecordSessionSnapshot(session, 'session.navigate', {
-      requestedUrl: url,
+      requestedOrigin: lifecycleUrlOrigin(url),
       status: result.status,
-      result: result.result ?? null,
     })
     return result
   })()

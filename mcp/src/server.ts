@@ -3,6 +3,7 @@ import { performance } from 'node:perf_hooks'
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js'
 import { z } from 'zod'
 import { formatConnectFailureMessage, isHttpUrl, normalizeConnectTarget } from './connect-utils.js'
+import { REDACTED_STATE_URL, sanitizeUrlToOrigin } from './state-privacy.js'
 import {
   connect,
   connectThroughProxy,
@@ -3692,7 +3693,7 @@ For a token-efficient semantic view, use geometra_snapshot (default compact). Fo
   // ── workflow state ───────────────────────────────────────────
   server.tool(
     'geometra_workflow_state',
-    `Get the accumulated workflow state across page navigations. Shows which pages/forms have been filled, what values were submitted, and the fill status per page.
+    `Get the accumulated workflow state across page navigations. Shows which pages/forms and field identities have been filled, with the fill status per page. Submitted values and local file paths are never stored or returned; every recorded field is represented by a redaction marker.
 
 Use this after navigating to a new page in a multi-step flow (e.g. job applications) to understand what has been completed so far. Pass \`clear: true\` to reset the workflow state.`,
     {
@@ -3712,6 +3713,8 @@ Use this after navigating to a new page in a multi-step flow (e.g. job applicati
       if (!session.workflowState || session.workflowState.pages.length === 0) {
         return ok(JSON.stringify({
           pageCount: 0,
+          valuesRedacted: true,
+          redactionNotice: 'Submitted values and local file paths are not stored.',
           message: 'No workflow state recorded yet. Fill a form with geometra_fill_form to start tracking.',
         }))
       }
@@ -3724,13 +3727,18 @@ Use this after navigating to a new page in a multi-step flow (e.g. job applicati
         totalFieldsFilled: totalFields,
         totalInvalidRemaining: totalInvalid,
         elapsedMs: Date.now() - state.startedAt,
+        valuesRedacted: true,
+        redactionNotice: 'Submitted values and local file paths are not stored; filledFields lists identities and filledValues contains redaction markers only.',
         pages: state.pages.map(p => ({
           pageUrl: p.pageUrl,
           ...(p.formId ? { formId: p.formId } : {}),
           ...(p.formName ? { formName: p.formName } : {}),
           fieldCount: p.fieldCount,
           invalidCount: p.invalidCount,
+          filledFields: p.filledFields,
+          // Preserve the established response key without retaining values.
           filledValues: p.filledValues,
+          valuesRedacted: true,
         })),
       }))
     }
@@ -6631,26 +6639,33 @@ function recordWorkflowFill(
   if (!session.workflowState) {
     session.workflowState = { pages: [], startedAt: Date.now() }
   }
-  const filledValues: Record<string, string | boolean> = {}
-  for (const [k, v] of Object.entries(valuesById ?? {})) {
-    if (typeof v === 'string' || typeof v === 'boolean') filledValues[k] = v
-  }
-  for (const [k, v] of Object.entries(valuesByLabel ?? {})) {
-    if (typeof v === 'string' || typeof v === 'boolean') filledValues[k] = v
-  }
+  const fieldIdentities = new Set([
+    ...Object.keys(valuesById ?? {}),
+    ...Object.keys(valuesByLabel ?? {}),
+  ])
+  const filledFields = Array.from(fieldIdentities).sort()
+  const filledValues = Object.fromEntries(
+    filledFields.map(identity => [identity, '[REDACTED]' as const]),
+  )
 
   const a11y = sessionA11y(session)
-  const pageUrl = (a11y?.meta?.pageUrl as string | undefined) ?? session.url
+  const pageUrl = workflowUrlOrigin((a11y?.meta?.pageUrl as string | undefined) ?? session.url)
 
   session.workflowState.pages.push({
     pageUrl,
     formId,
     formName,
     filledValues,
+    filledFields,
+    valuesRedacted: true,
     filledAt: Date.now(),
     fieldCount,
     invalidCount,
   })
+}
+
+function workflowUrlOrigin(rawUrl: string): string {
+  return sanitizeUrlToOrigin(rawUrl) ?? REDACTED_STATE_URL
 }
 
 async function captureScreenshotBase64(session: Session): Promise<string | undefined> {

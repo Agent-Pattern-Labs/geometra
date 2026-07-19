@@ -1,5 +1,18 @@
-import { afterAll, describe, expect, it } from 'vitest'
+import { afterAll, describe, expect, it, vi } from 'vitest'
 import { WebSocket as WsClient, WebSocketServer } from 'ws'
+
+const lifecycleMocks = vi.hoisted(() => ({
+  recordSessionSnapshot: vi.fn(),
+}))
+
+vi.mock('../session-state.js', () => ({
+  completeSessionLifecycle: vi.fn(),
+  failSessionLifecycle: vi.fn(),
+  heartbeatSessionLifecycle: vi.fn(),
+  initializeSessionLifecycle: vi.fn(),
+  recordSessionSnapshot: lifecycleMocks.recordSessionSnapshot,
+}))
+
 import {
   connect,
   disconnect,
@@ -1533,6 +1546,7 @@ describe('proxy-backed MCP actions', () => {
   it('supports in-session navigation and waits for the resulting frame', async () => {
     const wss = new WebSocketServer({ port: 0 })
     const received: Array<Record<string, unknown>> = []
+    const sensitiveTarget = 'https://jobs.example.com/application/private?candidate=taylor%40example.com#resume'
     wss.on('connection', ws => {
       ws.on('message', raw => {
         const msg = JSON.parse(String(raw)) as { type?: string; url?: string; requestId?: string }
@@ -1561,7 +1575,7 @@ describe('proxy-backed MCP actions', () => {
           ws.send(JSON.stringify({
             type: 'ack',
             requestId: msg.requestId,
-            result: { pageUrl: msg.url },
+            result: { pageUrl: msg.url, submittedEmail: 'taylor@example.com' },
           }))
         }
       })
@@ -1577,12 +1591,25 @@ describe('proxy-backed MCP actions', () => {
 
     try {
       const session = await connect(`ws://127.0.0.1:${port}`)
-      await expect(sendNavigate(session, 'https://jobs.example.com/application', 80)).resolves.toMatchObject({
+      lifecycleMocks.recordSessionSnapshot.mockClear()
+      await expect(sendNavigate(session, sensitiveTarget, 80)).resolves.toMatchObject({
         status: 'updated',
         timeoutMs: 80,
-        result: { pageUrl: 'https://jobs.example.com/application' },
+        result: { pageUrl: sensitiveTarget, submittedEmail: 'taylor@example.com' },
       })
-      expect(received.some(message => message.type === 'navigate' && message.url === 'https://jobs.example.com/application')).toBe(true)
+      expect(received.some(message => message.type === 'navigate' && message.url === sensitiveTarget)).toBe(true)
+
+      const navigationSnapshot = lifecycleMocks.recordSessionSnapshot.mock.calls.find(
+        call => call[1] === 'session.navigate',
+      )
+      expect(navigationSnapshot?.[2]).toEqual({
+        requestedOrigin: 'https://jobs.example.com',
+        status: 'updated',
+      })
+      const persistedSnapshot = JSON.stringify(navigationSnapshot?.[2])
+      expect(persistedSnapshot).not.toContain('/application/private')
+      expect(persistedSnapshot).not.toContain('candidate=')
+      expect(persistedSnapshot).not.toContain('taylor@example.com')
     } finally {
       disconnect()
       await new Promise<void>((resolve, reject) => wss.close(err => (err ? reject(err) : resolve())))
