@@ -32,10 +32,10 @@
     "ui-testing"
   ],
   "dependencies": {
-    "@geometra/proxy": "^1.19.23",
+    "@geometra/proxy": "^1.64.0",
     "@modelcontextprotocol/sdk": "^1.12.1",
     "@razroo/parallel-mcp": "^0.1.0",
-    "ws": "^8.18.0",
+    "ws": "^8.21.0",
     "zod": "^3.23.0"
   },
   "devDependencies": {

@@ -14,9 +14,24 @@ vi.mock('../proxy-spawn.js', () => ({
 
 const { connectThroughProxy, disconnect, prewarmProxy } = await import('../session.js')
 
+const AUTH_TOKEN = 'proxy-session-recovery-capability-000000000000'
+const PROXY_METADATA = {
+  protocolVersion: 1,
+  geometryProtocolVersion: 1,
+  proxyActionProtocolVersion: 2,
+  protocolCapabilities: {
+    transport: 'proxy',
+    authenticatedController: true,
+    requestScopedAcks: true,
+    proxyActions: true,
+    exactFieldIdentity: true,
+  },
+} as const
+
 function frame(pageUrl: string) {
   return {
     type: 'frame',
+    ...PROXY_METADATA,
     layout: { x: 0, y: 0, width: 1280, height: 720, children: [] },
     tree: {
       kind: 'box',
@@ -39,6 +54,7 @@ async function createProxyPeer(options?: {
 }) {
   const wss = new WebSocketServer({ port: 0 })
   wss.on('connection', ws => {
+    ws.send(JSON.stringify({ type: 'hello', ...PROXY_METADATA }))
     if (options?.sendInitialFrame !== false) {
       ws.send(JSON.stringify(frame(options?.pageUrl ?? 'https://jobs.example.com/original')))
     }
@@ -104,6 +120,7 @@ describe('connectThroughProxy recovery', () => {
 
     const staleRuntime = {
       wsUrl: stalePeer.wsUrl,
+      authToken: AUTH_TOKEN,
       ready: Promise.resolve(),
       closed: false,
       close: vi.fn(async () => {
@@ -112,6 +129,7 @@ describe('connectThroughProxy recovery', () => {
     }
     const freshRuntime = {
       wsUrl: freshPeer.wsUrl,
+      authToken: AUTH_TOKEN,
       ready: Promise.resolve(),
       closed: false,
       close: vi.fn(async () => {
@@ -157,6 +175,7 @@ describe('connectThroughProxy recovery', () => {
 
     const headedRuntime = {
       wsUrl: headedPeer.wsUrl,
+      authToken: AUTH_TOKEN,
       ready: Promise.resolve(),
       closed: false,
       close: vi.fn(async () => {
@@ -165,6 +184,7 @@ describe('connectThroughProxy recovery', () => {
     }
     const headlessRuntime = {
       wsUrl: headlessPeer.wsUrl,
+      authToken: AUTH_TOKEN,
       ready: Promise.resolve(),
       closed: false,
       close: vi.fn(async () => {
@@ -222,6 +242,7 @@ describe('connectThroughProxy recovery', () => {
 
     const stockRuntime = {
       wsUrl: stockPeer.wsUrl,
+      authToken: AUTH_TOKEN,
       ready: Promise.resolve(),
       closed: false,
       close: vi.fn(async () => {
@@ -230,6 +251,7 @@ describe('connectThroughProxy recovery', () => {
     }
     const stealthRuntime = {
       wsUrl: stealthPeer.wsUrl,
+      authToken: AUTH_TOKEN,
       ready: Promise.resolve(),
       closed: false,
       close: vi.fn(async () => {
@@ -288,6 +310,7 @@ describe('connectThroughProxy recovery', () => {
 
     const preparedRuntime = {
       wsUrl: preparedPeer.wsUrl,
+      authToken: AUTH_TOKEN,
       ready: Promise.resolve(),
       closed: false,
       close: vi.fn(async () => {
@@ -335,6 +358,7 @@ describe('connectThroughProxy recovery', () => {
 
     const preparedRuntime = {
       wsUrl: preparedPeer.wsUrl,
+      authToken: AUTH_TOKEN,
       ready: Promise.resolve(),
       closed: false,
       close: vi.fn(async () => {
@@ -379,6 +403,7 @@ describe('connectThroughProxy recovery', () => {
 
     const lazyRuntime = {
       wsUrl: lazyPeer.wsUrl,
+      authToken: AUTH_TOKEN,
       ready: Promise.resolve(),
       closed: false,
       close: vi.fn(async () => {

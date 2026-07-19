@@ -1,5 +1,5 @@
-import { existsSync } from 'node:fs'
-import { resolve } from 'node:path'
+import { existsSync, realpathSync, statSync } from 'node:fs'
+import { isAbsolute, relative, resolve } from 'node:path'
 import type { ElementHandle, Frame, Locator, Page } from 'playwright'
 import { canonicalizeHtmlInputValue } from './input-canonical.js'
 import type { ClientChoiceType, ClientFillField } from './types.js'
@@ -2805,19 +2805,39 @@ async function dismissAndReVerifySelection(
 /**
  * Resolve and validate paths on the machine running the proxy (not the agent host).
  */
-export function resolveExistingFiles(rawPaths: unknown[]): string[] {
+export function resolveExistingFiles(rawPaths: unknown[], allowedRoots: string[] = []): string[] {
   if (!Array.isArray(rawPaths) || rawPaths.length === 0) {
     throw new Error('file: paths must be a non-empty array of strings')
   }
+  if (allowedRoots.length === 0) {
+    throw new Error(
+      'file: uploads are disabled; configure one or more canonical roots with GEOMETRA_PROXY_FILE_ROOTS',
+    )
+  }
+  const canonicalRoots = allowedRoots.map(root => {
+    const absoluteRoot = resolve(root)
+    if (!existsSync(absoluteRoot)) throw new Error(`file: allowed root does not exist: ${absoluteRoot}`)
+    const canonicalRoot = realpathSync(absoluteRoot)
+    if (!statSync(canonicalRoot).isDirectory()) {
+      throw new Error(`file: allowed root is not a directory: ${absoluteRoot}`)
+    }
+    return canonicalRoot
+  })
   const paths: string[] = []
   for (const p of rawPaths) {
     if (typeof p !== 'string' || p.trim() === '') continue
-    paths.push(resolve(p))
+    const absolutePath = resolve(p)
+    if (!existsSync(absolutePath)) throw new Error(`file: path does not exist: ${absolutePath}`)
+    const canonicalPath = realpathSync(absolutePath)
+    if (!statSync(canonicalPath).isFile()) throw new Error(`file: path is not a regular file: ${absolutePath}`)
+    const allowed = canonicalRoots.some(root => {
+      const rel = relative(root, canonicalPath)
+      return rel !== '' && rel !== '..' && !rel.startsWith(`..${process.platform === 'win32' ? '\\' : '/'}`) && !isAbsolute(rel)
+    })
+    if (!allowed) throw new Error(`file: path is outside configured upload roots: ${absolutePath}`)
+    paths.push(canonicalPath)
   }
   if (paths.length === 0) throw new Error('file: paths must contain at least one non-empty string')
-  for (const p of paths) {
-    if (!existsSync(p)) throw new Error(`file: path does not exist: ${p}`)
-  }
   return paths
 }
 

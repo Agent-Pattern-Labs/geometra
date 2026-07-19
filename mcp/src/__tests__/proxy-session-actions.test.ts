@@ -376,6 +376,170 @@ describe('proxy-backed MCP actions', () => {
     }
   })
 
+  it('keeps the proxy capability private and reuses it on reconnect', async () => {
+    const wss = new WebSocketServer({ port: 0 })
+    const token = 'mcp-private-proxy-capability-0000000000000000'
+    const authorizationHeaders: Array<string | undefined> = []
+    const proxyMetadata = {
+      protocolVersion: 1,
+      geometryProtocolVersion: 1,
+      proxyActionProtocolVersion: 2,
+      protocolCapabilities: {
+        transport: 'proxy',
+        authenticatedController: true,
+        requestScopedAcks: true,
+        proxyActions: true,
+        exactFieldIdentity: true,
+      },
+    }
+    wss.on('connection', (ws, request) => {
+      authorizationHeaders.push(request.headers.authorization)
+      ws.send(JSON.stringify({ type: 'hello', ...proxyMetadata }))
+      ws.on('message', raw => {
+        const msg = JSON.parse(String(raw)) as { type?: string; requestId?: string }
+        if (msg.type !== 'event') return
+        ws.send(JSON.stringify({
+          type: 'frame',
+          layout: { x: 0, y: 0, width: 1024, height: 768, children: [] },
+          tree: { kind: 'box', props: {}, semantic: { tag: 'body', role: 'group' }, children: [] },
+          ...proxyMetadata,
+        }))
+        ws.send(JSON.stringify({
+          type: 'ack',
+          requestId: msg.requestId,
+          result: { ok: true },
+          ...proxyMetadata,
+        }))
+      })
+    })
+    const port = await new Promise<number>((resolve, reject) => {
+      wss.once('listening', () => {
+        const address = wss.address()
+        if (typeof address === 'object' && address) resolve(address.port)
+        else reject(new Error('Failed to resolve ephemeral WebSocket port'))
+      })
+      wss.once('error', reject)
+    })
+
+    try {
+      const url = `ws://127.0.0.1:${port}`
+      const session = await connect(url, { authToken: token, awaitInitialFrame: false })
+      expect(session.url).toBe(url)
+      expect(session.url).not.toContain(token)
+      await new Promise<void>(resolve => {
+        session.ws.once('close', () => resolve())
+        session.ws.close()
+      })
+
+      await expect(sendClick(session, 5, 5, 150)).resolves.toMatchObject({
+        status: 'updated',
+        result: { ok: true },
+      })
+      expect(authorizationHeaders).toEqual([
+        `Bearer ${token}`,
+        `Bearer ${token}`,
+      ])
+    } finally {
+      disconnect()
+      await new Promise<void>((resolve, reject) => wss.close(err => (err ? reject(err) : resolve())))
+    }
+  })
+
+  it('re-attests the proxy after reconnect before retrying an action', async () => {
+    const wss = new WebSocketServer({ port: 0 })
+    const token = 'mcp-reconnect-proxy-capability-000000000000000'
+    let connectionCount = 0
+    let actionReachedReplacement = false
+    wss.on('connection', ws => {
+      connectionCount += 1
+      if (connectionCount === 1) {
+        ws.send(JSON.stringify({
+          type: 'hello',
+          protocolVersion: 1,
+          geometryProtocolVersion: 1,
+          proxyActionProtocolVersion: 2,
+          protocolCapabilities: {
+            transport: 'proxy',
+            authenticatedController: true,
+          },
+        }))
+      }
+      ws.on('message', raw => {
+        const msg = JSON.parse(String(raw)) as { type?: string }
+        if (connectionCount !== 2) return
+        if (msg.type === 'event') actionReachedReplacement = true
+        if (msg.type === 'resize') {
+          // Simulate an older unauthenticated proxy taking over the same
+          // endpoint. A stale capability cache must not bless this frame.
+          ws.send(JSON.stringify({
+            type: 'frame',
+            protocolVersion: 2,
+            layout: { x: 0, y: 0, width: 1024, height: 768, children: [] },
+            tree: { kind: 'box', props: {}, children: [] },
+          }))
+        }
+      })
+    })
+    const port = await new Promise<number>((resolve, reject) => {
+      wss.once('listening', () => {
+        const address = wss.address()
+        if (typeof address === 'object' && address) resolve(address.port)
+        else reject(new Error('Failed to resolve ephemeral WebSocket port'))
+      })
+      wss.once('error', reject)
+    })
+
+    try {
+      const session = await connect(`ws://127.0.0.1:${port}`, {
+        authToken: token,
+        awaitInitialFrame: false,
+      })
+      await new Promise<void>(resolve => {
+        session.ws.once('close', () => resolve())
+        session.ws.close()
+      })
+
+      await expect(sendClick(session, 5, 5, 150)).rejects.toThrow(
+        'unauthenticated proxy transports are refused',
+      )
+      expect(connectionCount).toBe(2)
+      expect(actionReachedReplacement).toBe(false)
+    } finally {
+      disconnect()
+      await new Promise<void>((resolve, reject) => wss.close(err => (err ? reject(err) : resolve())))
+    }
+  })
+
+  it('refuses a spawned-style proxy that cannot attest authenticated control', async () => {
+    const wss = new WebSocketServer({ port: 0 })
+    wss.on('connection', ws => {
+      ws.send(JSON.stringify({
+        type: 'frame',
+        protocolVersion: 2,
+        layout: { x: 0, y: 0, width: 10, height: 10, children: [] },
+        tree: { kind: 'box', props: {}, children: [] },
+      }))
+    })
+    const port = await new Promise<number>((resolve, reject) => {
+      wss.once('listening', () => {
+        const address = wss.address()
+        if (typeof address === 'object' && address) resolve(address.port)
+        else reject(new Error('Failed to resolve ephemeral WebSocket port'))
+      })
+      wss.once('error', reject)
+    })
+
+    try {
+      await expect(connect(`ws://127.0.0.1:${port}`, {
+        authToken: 'mcp-private-proxy-capability-0000000000000000',
+        awaitInitialFrame: false,
+      })).rejects.toThrow('unauthenticated proxy transports are refused')
+    } finally {
+      disconnect()
+      await new Promise<void>((resolve, reject) => wss.close(err => (err ? reject(err) : resolve())))
+    }
+  })
+
   it('rejects a server frame from a newer unnegotiated protocol', async () => {
     const wss = new WebSocketServer({ port: 0 })
     wss.on('connection', ws => {

@@ -14,12 +14,21 @@ npx cloakbrowser install
 ## CLI
 
 ```bash
+export GEOMETRA_PROXY_AUTH_TOKEN="replace-with-a-random-32-character-or-longer-token"
+# Optional: approve upload directories (use your platform's path delimiter for multiple roots)
+export GEOMETRA_PROXY_FILE_ROOTS="/absolute/path/to/approved-files"
 npx geometra-proxy https://example.com --port 3200
 npx geometra-proxy http://localhost:8080 --width 1440 --height 900
 npx geometra-proxy https://example.com --port 3200 --headed
 npx geometra-proxy https://example.com --port 3200 --slow-mo 50
 npx geometra-proxy https://example.com --port 3200 --stealth
 ```
+
+The controller socket binds to `127.0.0.1`, requires the bearer capability,
+rejects browser-origin upgrades, and permits one live controller. Keep the
+token out of URLs and pass it as `authToken` to `geometra_connect`. Uploads are
+disabled unless `GEOMETRA_PROXY_FILE_ROOTS` approves one or more directories;
+canonical-path checks reject symlink and sibling-prefix escapes.
 
 **Default is headless** so MCP-driven browsing does not open windows. Use **`--headed`** when you need to watch clicks and typing. **`--slow-mo <ms>`** (or **`GEOMETRA_SLOW_MO`**) adds Playwright `slowMo` to make actions easier to follow.
 
@@ -31,7 +40,7 @@ Headed vs headless usually does **not** materially change token usage, because t
 
 ## Protocol
 
-Matches `packages/server` GEOM v1: `frame` with `layout`, `tree`, `protocolVersion`; `patch` with `patches`; client messages `resize`, `event` (`onClick`), `key`, `composition`.
+Matches `packages/server` GEOM v1 for geometry and advertises proxy-action v2 separately through the initial frame capability handshake.
 
 Proxy-specific client messages (native Textura servers respond with `error`):
 

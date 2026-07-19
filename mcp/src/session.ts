@@ -468,6 +468,8 @@ export interface Session {
   layout: Record<string, unknown> | null
   tree: Record<string, unknown> | null
   url: string
+  /** Private bearer capability for an authenticated proxy transport. */
+  transportAuthToken?: string
   updateRevision: number
   /** Negotiated owner of the WebSocket endpoint. */
   peerTransport?: 'native' | 'proxy'
@@ -478,6 +480,7 @@ export interface Session {
   /** True when the peer advertised the split protocol contract explicitly. */
   peerAdvertisedSplitProtocol?: boolean
   peerProtocolCapabilities?: {
+    authenticatedController?: boolean
     requestScopedAcks?: boolean
     proxyActions?: boolean
     exactFieldIdentity?: boolean
@@ -551,6 +554,7 @@ interface ReusableProxyEntry {
   child?: ChildProcess
   runtime?: EmbeddedProxyRuntime
   wsUrl: string
+  authToken: string
   headless: boolean
   stealth: boolean
   slowMo: number
@@ -717,6 +721,7 @@ function updatePeerProtocol(session: Session, msg: InboundServerMessage): void {
   }
   if (capabilities) {
     session.peerProtocolCapabilities = {
+      authenticatedController: typeof capabilities.authenticatedController === 'boolean' ? capabilities.authenticatedController : undefined,
       requestScopedAcks: typeof capabilities.requestScopedAcks === 'boolean' ? capabilities.requestScopedAcks : undefined,
       proxyActions: typeof capabilities.proxyActions === 'boolean' ? capabilities.proxyActions : undefined,
       exactFieldIdentity: typeof capabilities.exactFieldIdentity === 'boolean' ? capabilities.exactFieldIdentity : undefined,
@@ -785,6 +790,20 @@ function applyInboundSessionMessage(session: Session, data: WebSocket.Data): Inb
     invalidateSessionCaches(session)
   }
   return msg
+}
+
+function assertAuthenticatedProxyHandshake(session: Session): void {
+  const expectedAuthenticatedProxy = session.transportAuthToken !== undefined
+  const advertisedProxy = session.peerTransport === 'proxy'
+  if (!expectedAuthenticatedProxy && !advertisedProxy) return
+  if (
+    session.peerTransport !== 'proxy' ||
+    session.peerProtocolCapabilities?.authenticatedController !== true
+  ) {
+    throw new Error(
+      'Geometra proxy did not attest authenticated controller support. Rebuild or update @geometra/proxy; unauthenticated proxy transports are refused.',
+    )
+  }
 }
 
 function sameReusableProxyEntry(
@@ -899,18 +918,20 @@ function enforceReusableProxyPoolLimit(): void {
 }
 
 function setReusableProxy(
-  proxy: { child: ChildProcess } | { runtime: EmbeddedProxyRuntime },
+  proxy: { child: ChildProcess; authToken: string } | { runtime: EmbeddedProxyRuntime },
   wsUrl: string,
   opts: { headless?: boolean; stealth?: boolean; slowMo?: number; width?: number; height?: number; pageUrl?: string; snapshotReady?: boolean; proxy?: SpawnProxyConfig },
 ): void {
   clearReusableProxiesIfExited()
   const now = Date.now()
+  const authToken = 'child' in proxy ? proxy.authToken : proxy.runtime.authToken
   const proxyKey = proxyKeyFor(opts.proxy)
   const stealth = resolveStealthMode(opts.stealth)
   const existing = reusableProxies.find(entry => sameReusableProxyEntry(entry, proxy))
 
   if (existing) {
     existing.wsUrl = wsUrl
+    existing.authToken = authToken
     existing.headless = opts.headless !== false
     existing.stealth = stealth
     existing.slowMo = opts.slowMo ?? 0
@@ -928,6 +949,7 @@ function setReusableProxy(
     const entry: ReusableProxyEntry = {
       child,
       wsUrl,
+      authToken,
       headless: opts.headless !== false,
       stealth,
       slowMo: opts.slowMo ?? 0,
@@ -956,6 +978,7 @@ function setReusableProxy(
   reusableProxies.push({
     runtime: proxy.runtime,
     wsUrl,
+    authToken,
     headless: opts.headless !== false,
     stealth,
     slowMo: opts.slowMo ?? 0,
@@ -1351,7 +1374,7 @@ export async function prewarmProxy(options: {
   }
 
   try {
-    const { child, wsUrl } = await spawnGeometraProxy({
+    const { child, wsUrl, authToken } = await spawnGeometraProxy({
       pageUrl: options.pageUrl,
       port: options.port ?? 0,
       headless: options.headless,
@@ -1361,7 +1384,7 @@ export async function prewarmProxy(options: {
       stealth: options.stealth,
       proxy: options.proxy,
     })
-    setReusableProxy({ child }, wsUrl, {
+    setReusableProxy({ child, authToken }, wsUrl, {
       headless: options.headless,
       slowMo: options.slowMo,
       stealth: options.stealth,
@@ -1410,6 +1433,7 @@ async function attachToReusableProxy(proxy: ReusableProxyEntry, options: {
     skipInitialResize: true,
     closePreviousProxy: false,
     awaitInitialFrame: needsSnapshotKickoff ? false : options.awaitInitialFrame,
+    authToken: proxy.authToken,
   })
 
   if (!session) {
@@ -1514,6 +1538,7 @@ async function startFreshProxySession(options: {
         skipInitialResize: true,
         closePreviousProxy: false,
         awaitInitialFrame: options.awaitInitialFrame,
+        authToken: runtime.authToken,
       }),
       rejectOnRuntimeReadyFailure(runtime),
     ])
@@ -1573,7 +1598,7 @@ async function startFreshProxySession(options: {
       void leaked.close().catch(() => {})
     }
     const proxyStartStartedAt = performance.now()
-    const { child, wsUrl } = await spawnGeometraProxy({
+    const { child, wsUrl, authToken } = await spawnGeometraProxy({
       pageUrl: options.pageUrl,
       port: options.port ?? 0,
       headless: options.headless,
@@ -1590,6 +1615,7 @@ async function startFreshProxySession(options: {
         skipInitialResize: true,
         closePreviousProxy: false,
         awaitInitialFrame: options.awaitInitialFrame,
+        authToken,
       })
       session.proxyChild = child
       session.proxyReusable = !options.isolated
@@ -1599,7 +1625,7 @@ async function startFreshProxySession(options: {
         // not be the implicit default. Retract the pointer set by connect().
         retractDefaultIfPointsTo(session.id)
       } else {
-        setReusableProxy({ child }, wsUrl, {
+        setReusableProxy({ child, authToken }, wsUrl, {
           headless: options.headless,
           slowMo: options.slowMo,
           stealth: options.stealth,
@@ -1647,20 +1673,30 @@ async function startFreshProxySession(options: {
  */
 export function connect(
   url: string,
-  opts?: { width?: number; height?: number; skipInitialResize?: boolean; closePreviousProxy?: boolean; awaitInitialFrame?: boolean },
+  opts?: {
+    width?: number
+    height?: number
+    skipInitialResize?: boolean
+    closePreviousProxy?: boolean
+    awaitInitialFrame?: boolean
+    authToken?: string
+  },
 ): Promise<Session> {
   return new Promise((resolve, reject) => {
     const startedAt = performance.now()
     clearReusableProxiesIfExited()
     evictOldestSession()
 
-    const ws = new WebSocket(url)
+    const ws = new WebSocket(url, opts?.authToken
+      ? { headers: { Authorization: `Bearer ${opts.authToken}` } }
+      : undefined)
     const session: Session = {
       id: generateSessionId(),
       ws,
       layout: null,
       tree: null,
       url,
+      ...(opts?.authToken ? { transportAuthToken: opts.authToken } : {}),
       updateRevision: 0,
       connectTrace: {
         mode: 'direct-ws',
@@ -1721,21 +1757,6 @@ export function connect(
         // Legacy proxy v1/v2 endpoints both accept this compatibility hello.
         ws.send(JSON.stringify({ type: 'resize', width, height, protocolVersion: GEOMETRY_PROTOCOL_VERSION }))
       }
-      if (opts?.awaitInitialFrame === false && !resolved) {
-        resolved = true
-        clearTimeout(timeout)
-        if (session.connectTrace) {
-          session.connectTrace.resolvedWithoutInitialFrame = true
-          session.connectTrace.totalMs = performance.now() - startedAt
-        }
-        activeSessions.set(session.id, session)
-        defaultSessionId = session.id
-        startSessionHeartbeat(session)
-        safeRecordSessionSnapshot(session, 'session.open', {
-          awaitInitialFrame: false,
-        })
-        resolve(session)
-      }
     })
 
     ws.on('message', (data) => {
@@ -1743,6 +1764,25 @@ export function connect(
       if (session.ws !== ws) return
       try {
         const msg = applyInboundSessionMessage(session, data)
+        if (msg.type === 'hello' || msg.type === 'frame') {
+          assertAuthenticatedProxyHandshake(session)
+        }
+        if (msg.type === 'hello' && opts?.awaitInitialFrame === false && !resolved) {
+          resolved = true
+          clearTimeout(timeout)
+          if (session.connectTrace) {
+            session.connectTrace.resolvedWithoutInitialFrame = true
+            session.connectTrace.totalMs = performance.now() - startedAt
+          }
+          activeSessions.set(session.id, session)
+          defaultSessionId = session.id
+          startSessionHeartbeat(session)
+          safeRecordSessionSnapshot(session, 'session.open', {
+            awaitInitialFrame: false,
+            authenticatedProxyHandshake: true,
+          })
+          resolve(session)
+        }
         if (msg.type === 'frame') {
           const connectTrace = session.connectTrace
           const firstFrame = connectTrace?.firstFrameMs === undefined
@@ -2080,9 +2120,23 @@ function reconnectUrlForSession(session: Session): string | null {
   return null
 }
 
-async function openWebSocket(url: string, timeoutMs = SESSION_RECONNECT_TIMEOUT_MS): Promise<WebSocket> {
+async function openWebSocket(
+  url: string,
+  session: Session,
+  timeoutMs = SESSION_RECONNECT_TIMEOUT_MS,
+): Promise<{ ws: WebSocket; handshakeMessage: WebSocket.Data }> {
   return await new Promise((resolve, reject) => {
-    const ws = new WebSocket(url)
+    const ws = new WebSocket(url, session.transportAuthToken
+      ? { headers: { Authorization: `Bearer ${session.transportAuthToken}` } }
+      : undefined)
+    // Every transport replacement must negotiate from fresh evidence. Keeping
+    // the prior socket's capability flags would let a different process take
+    // over the endpoint and inherit an authenticated-proxy attestation.
+    session.peerTransport = undefined
+    session.peerGeometryProtocolVersion = undefined
+    session.peerProxyActionProtocolVersion = undefined
+    session.peerAdvertisedSplitProtocol = undefined
+    session.peerProtocolCapabilities = undefined
     const timeout = setTimeout(() => {
       cleanup()
       try {
@@ -2090,26 +2144,59 @@ async function openWebSocket(url: string, timeoutMs = SESSION_RECONNECT_TIMEOUT_
       } catch {
         /* ignore */
       }
-      reject(new Error(`Reconnect to ${url} timed out after ${timeoutMs}ms`))
+      reject(new Error(`Reconnect handshake to ${url} timed out after ${timeoutMs}ms`))
     }, timeoutMs)
 
     const onOpen = () => {
-      cleanup()
-      resolve(ws)
+      const width = typeof session.layout?.width === 'number' ? session.layout.width : 1024
+      const height = typeof session.layout?.height === 'number' ? session.layout.height : 768
+      // Current proxies attest immediately with `hello`. This compatibility
+      // resize prompts native/legacy peers that only emit a frame after input.
+      ws.send(JSON.stringify({
+        type: 'resize',
+        width,
+        height,
+        protocolVersion: GEOMETRY_PROTOCOL_VERSION,
+      }))
     }
     const onError = (err: Error) => {
       cleanup()
       reject(new Error(`WebSocket reconnect failed for ${url}: ${err.message}`))
+    }
+    const onClose = () => {
+      cleanup()
+      reject(new Error(`WebSocket reconnect to ${url} closed before capability handshake`))
+    }
+    const onMessage = (data: WebSocket.Data) => {
+      try {
+        const msg = parseInboundServerMessage(data)
+        updatePeerProtocol(session, msg)
+        if (msg.type === 'error') {
+          throw new Error(typeof msg.message === 'string' ? msg.message : 'Geometra server error')
+        }
+        if (msg.type !== 'hello' && msg.type !== 'frame') return
+        assertAuthenticatedProxyHandshake(session)
+        cleanup()
+        resolve({ ws, handshakeMessage: data })
+      } catch (err) {
+        cleanup()
+        try { ws.close(1002, 'Invalid capability handshake') } catch { /* ignore */ }
+        reject(err instanceof Error ? err : new Error(String(err)))
+      }
     }
 
     function cleanup() {
       clearTimeout(timeout)
       ws.off('open', onOpen)
       ws.off('error', onError)
+      ws.off('close', onClose)
+      ws.off('message', onMessage)
     }
 
     ws.on('open', onOpen)
     ws.on('error', onError)
+    ws.on('close', onClose)
+    ws.on('message', onMessage)
   })
 }
 
@@ -2153,7 +2240,7 @@ async function ensureSessionConnected(session: Session): Promise<void> {
   }
   const reconnectPromise = (async () => {
     try {
-      const nextWs = await openWebSocket(targetUrl)
+      const { ws: nextWs, handshakeMessage } = await openWebSocket(targetUrl, session)
       try {
         session.ws.close()
       } catch {
@@ -2162,6 +2249,7 @@ async function ensureSessionConnected(session: Session): Promise<void> {
       session.ws = nextWs
       noteSessionSocketActivity(session, nextWs)
       bindReconnectedSocket(session, nextWs)
+      applyInboundSessionMessage(session, handshakeMessage)
       activeSessions.set(session.id, session)
       if (!session.isolated) {
         defaultSessionId = session.id

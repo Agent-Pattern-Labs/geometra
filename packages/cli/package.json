@@ -38,7 +38,7 @@
     "@geometra/core": "^1.12.0",
     "@geometra/renderer-terminal": "^1.12.0",
     "textura": "^1.11.0",
-    "ws": "^8.18.0"
+    "ws": "^8.21.0"
   },
   "devDependencies": {
     "@types/node": "^22.0.0",

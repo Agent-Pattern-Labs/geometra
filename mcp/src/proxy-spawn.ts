@@ -1,4 +1,5 @@
 import { spawn, spawnSync, type ChildProcess } from 'node:child_process'
+import { randomBytes } from 'node:crypto'
 import { existsSync, realpathSync, rmSync } from 'node:fs'
 import { createRequire } from 'node:module'
 import path from 'node:path'
@@ -13,6 +14,7 @@ const PLAYWRIGHT_INSTALL_HINT =
 
 export interface EmbeddedProxyRuntime {
   wsUrl: string
+  authToken: string
   ready: Promise<void>
   getTrace?: () => Record<string, unknown>
   closed: boolean
@@ -236,6 +238,12 @@ export async function startEmbeddedGeometraProxy(
     eagerInitialExtract: opts.eagerInitialExtract,
     ...(opts.proxy && { proxy: opts.proxy }),
   })
+  if (typeof runtime.authToken !== 'string' || runtime.authToken.length < 32) {
+    await runtime.close().catch(() => {})
+    throw new Error(
+      `Resolved ${runtimePath}, but that proxy runtime does not implement authenticated controller capabilities. Rebuild or update @geometra/proxy.`,
+    )
+  }
   return { runtime, wsUrl: runtime.wsUrl }
 }
 
@@ -290,8 +298,11 @@ export function formatProxyStartupFailure(message: string, opts: SpawnProxyParam
 /**
  * Spawn geometra-proxy as a child process and resolve when it emits a structured ready signal.
  */
-export function spawnGeometraProxy(opts: SpawnProxyParams): Promise<{ child: ChildProcess; wsUrl: string }> {
+export function spawnGeometraProxy(
+  opts: SpawnProxyParams,
+): Promise<{ child: ChildProcess; wsUrl: string; authToken: string }> {
   const script = resolveProxyScriptPath()
+  const authToken = randomBytes(32).toString('base64url')
   const args = [script, opts.pageUrl, '--port', String(opts.port)]
   if (opts.width != null && opts.width > 0) args.push('--width', String(opts.width))
   if (opts.height != null && opts.height > 0) args.push('--height', String(opts.height))
@@ -301,17 +312,20 @@ export function spawnGeometraProxy(opts: SpawnProxyParams): Promise<{ child: Chi
   if (opts.stealth === true) args.push('--stealth')
   else if (opts.stealth === false) args.push('--no-stealth')
   if (opts.eagerInitialExtract === false) args.push('--lazy-initial-extract')
-  if (opts.proxy?.server) {
-    args.push('--proxy-server', opts.proxy.server)
-    if (opts.proxy.username !== undefined) args.push('--proxy-username', opts.proxy.username)
-    if (opts.proxy.password !== undefined) args.push('--proxy-password', opts.proxy.password)
-    if (opts.proxy.bypass !== undefined) args.push('--proxy-bypass', opts.proxy.bypass)
+  const childEnv = {
+    ...process.env,
+    GEOMETRA_PROXY_READY_JSON: '1',
+    GEOMETRA_PROXY_AUTH_TOKEN: authToken,
+    ...(opts.proxy?.server !== undefined ? { GEOMETRA_PROXY_SERVER: opts.proxy.server } : {}),
+    ...(opts.proxy?.username !== undefined ? { GEOMETRA_PROXY_USERNAME: opts.proxy.username } : {}),
+    ...(opts.proxy?.password !== undefined ? { GEOMETRA_PROXY_PASSWORD: opts.proxy.password } : {}),
+    ...(opts.proxy?.bypass !== undefined ? { GEOMETRA_PROXY_BYPASS: opts.proxy.bypass } : {}),
   }
 
   return new Promise((resolve, reject) => {
     const child = spawn(process.execPath, args, {
       stdio: ['ignore', 'pipe', 'pipe'],
-      env: { ...process.env, GEOMETRA_PROXY_READY_JSON: '1' },
+      env: childEnv,
     })
 
     let settled = false
@@ -329,7 +343,7 @@ export function spawnGeometraProxy(opts: SpawnProxyParams): Promise<{ child: Chi
       if (!wsUrl || settled) return false
       settled = true
       cleanup()
-      resolve({ child, wsUrl })
+      resolve({ child, wsUrl, authToken })
       return true
     }
 

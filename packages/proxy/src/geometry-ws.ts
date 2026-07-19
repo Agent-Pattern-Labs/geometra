@@ -1,3 +1,4 @@
+import { randomBytes, timingSafeEqual } from 'node:crypto'
 import { performance } from 'node:perf_hooks'
 import type { Page } from 'playwright'
 import { WebSocketServer, type WebSocket } from 'ws'
@@ -44,8 +45,11 @@ import {
 } from './types.js'
 
 const DOM_OBSERVER_BINDINGS = new WeakSet<Page>()
+const DEFAULT_PROXY_HOST = '127.0.0.1'
+const DEFAULT_MAX_PAYLOAD_BYTES = 4 * 1024 * 1024
 const PROXY_PROTOCOL_CAPABILITIES = {
   transport: 'proxy',
+  authenticatedController: true,
   requestScopedAcks: true,
   proxyActions: true,
   exactFieldIdentity: true,
@@ -123,6 +127,26 @@ function isProtocolCompatible(peerVersion: number | undefined): boolean {
   return peerVersion <= PROXY_PROTOCOL_VERSION
 }
 
+function generatedAuthToken(): string {
+  return randomBytes(32).toString('base64url')
+}
+
+function normalizedAuthToken(value: string | undefined): string {
+  const token = value?.trim() || generatedAuthToken()
+  if (token.length < 32) {
+    throw new Error('geometra-proxy authToken must contain at least 32 characters')
+  }
+  return token
+}
+
+function bearerTokenMatches(header: string | undefined, expected: string): boolean {
+  if (!header?.startsWith('Bearer ')) return false
+  const received = header.slice('Bearer '.length)
+  const receivedBytes = Buffer.from(received)
+  const expectedBytes = Buffer.from(expected)
+  return receivedBytes.length === expectedBytes.length && timingSafeEqual(receivedBytes, expectedBytes)
+}
+
 function protocolCompatibilityError(msg: ParsedClientMessage): string | null {
   const record = msg as {
     protocolVersion?: unknown
@@ -197,6 +221,7 @@ export async function handleClientMessage(
   waitForBeforeInput: () => Promise<void>,
   onViewportOrInput: (kind: 'resize' | 'input', requestId?: string, result?: unknown) => void,
   onHandlerError: (err: unknown) => void,
+  security?: { allowedFileRoots?: string[] },
 ): Promise<void> {
   const sendWireError = (message: string, requestId?: string) => {
     ws.send(JSON.stringify({
@@ -310,7 +335,7 @@ export async function handleClientMessage(
     }
 
     if (isFileMessage(msg)) {
-      const paths = resolveExistingFiles(msg.paths)
+      const paths = resolveExistingFiles(msg.paths, security?.allowedFileRoots)
       await attachFiles(page, paths, {
         clickX: msg.x,
         clickY: msg.y,
@@ -354,7 +379,10 @@ export async function handleClientMessage(
     }
 
     if (isFillFieldsMessage(msg)) {
-      await fillFields(page, msg.fields, fieldLookupCache)
+      const authorizedFields = msg.fields.map(field => field.kind === 'file'
+        ? { ...field, paths: resolveExistingFiles(field.paths, security?.allowedFileRoots) }
+        : field)
+      await fillFields(page, authorizedFields, fieldLookupCache)
       const result = await fillFieldsAckResult(page)
       onViewportOrInput('input', requestId, result)
       return
@@ -580,6 +608,10 @@ async function countAcrossFrames(frames: ReturnType<Page['frames']>, selector: s
 }
 
 export interface GeometryWsHub {
+  /** Secret bearer capability required by every WebSocket controller. */
+  authToken: string
+  /** Actual bind host (loopback by default). */
+  host: string
   /** Run extraction and broadcast (debounced observer calls this). */
   scheduleExtract: () => void
   /** Wait until any in-flight extract + broadcast finishes. */
@@ -611,6 +643,16 @@ export interface GeometryWsTrace {
 
 export function startGeometryWebSocket(options: {
   port: number
+  /** Bind address. Defaults to IPv4 loopback; remote exposure must be explicit. */
+  host?: string
+  /** Bearer capability. A random 256-bit token is generated when omitted. */
+  authToken?: string
+  /** Browser Origin values allowed to initiate a controller connection. Default: none. */
+  allowedOrigins?: string[]
+  /** Canonical filesystem roots from which uploads may be read. Default: uploads disabled. */
+  allowedFileRoots?: string[]
+  /** Maximum inbound WebSocket message size. Default: 4 MiB. */
+  maxPayloadBytes?: number
   page: Page | Promise<Page>
   /** DOM mutation debounce (ms). */
   debounceMs?: number
@@ -620,8 +662,41 @@ export function startGeometryWebSocket(options: {
   onError?: (err: unknown) => void
 }): GeometryWsHub {
   const debounceMs = options.debounceMs ?? 50
+  const host = options.host?.trim() || DEFAULT_PROXY_HOST
+  const authToken = normalizedAuthToken(options.authToken)
+  const allowedOrigins = new Set(options.allowedOrigins ?? [])
   const clients = new Set<WebSocket>()
-  const wss = new WebSocketServer({ port: options.port })
+  let controllerClaimed = false
+  const wss = new WebSocketServer({
+    port: options.port,
+    host,
+    maxPayload: Math.max(1024, options.maxPayloadBytes ?? DEFAULT_MAX_PAYLOAD_BYTES),
+    verifyClient(info, done) {
+      const origin = typeof info.req.headers.origin === 'string' ? info.req.headers.origin : undefined
+      if (origin !== undefined && !allowedOrigins.has(origin)) {
+        done(false, 403, 'WebSocket Origin is not allowed')
+        return
+      }
+      const authorization = typeof info.req.headers.authorization === 'string'
+        ? info.req.headers.authorization
+        : undefined
+      if (!bearerTokenMatches(authorization, authToken)) {
+        done(false, 401, 'Bearer capability required')
+        return
+      }
+      const liveController = Array.from(clients).some(client =>
+        client.readyState === client.OPEN || client.readyState === client.CONNECTING,
+      )
+      // Permit a clean handover while the prior controller is already
+      // CLOSING; reject both a live controller and a concurrent handshake.
+      if (controllerClaimed && (clients.size === 0 || liveController)) {
+        done(false, 409, 'A Geometra controller is already connected')
+        return
+      }
+      controllerClaimed = true
+      done(true)
+    },
+  })
   const axSessionManager = createCdpAxSessionManager()
 
   let prevLayout: LayoutSnapshot | null = null
@@ -832,6 +907,13 @@ export function startGeometryWebSocket(options: {
 
   wss.on('connection', (ws) => {
     clients.add(ws)
+    // Authentication happens during the HTTP upgrade, but MCP still needs a
+    // protocol-level attestation before it can trust a spawned proxy. Send it
+    // immediately so lazy extraction can remain lazy without weakening the
+    // capability handshake.
+    if (ws.readyState === ws.OPEN) {
+      ws.send(JSON.stringify({ type: 'hello', ...PROXY_GEOMETRY_METADATA }))
+    }
     if (prevLayout && prevTreeJson !== null) {
       const snap: GeometrySnapshot = {
         layout: prevLayout,
@@ -869,17 +951,21 @@ export function startGeometryWebSocket(options: {
               }
             },
             err => options.onError?.(err),
+            { allowedFileRoots: options.allowedFileRoots },
           ),
         )
         .catch(err => options.onError?.(err))
     })
     ws.on('close', () => {
       clients.delete(ws)
+      controllerClaimed = clients.size > 0
       pendingInputAcks = pendingInputAcks.filter(entry => entry.ws !== ws)
     })
   })
 
   return {
+    authToken,
+    host,
     scheduleExtract,
     flushExtract: async () => {
       await actionQueue.catch(() => {})

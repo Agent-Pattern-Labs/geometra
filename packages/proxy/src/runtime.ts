@@ -1,6 +1,6 @@
 import { spawn } from 'node:child_process'
 import { createRequire } from 'node:module'
-import path from 'node:path'
+import path, { delimiter } from 'node:path'
 import { performance } from 'node:perf_hooks'
 import { chromium, type Browser, type Page } from 'playwright'
 import {
@@ -33,6 +33,8 @@ export interface ProxyRuntimeHandle {
   hub: GeometryWsHub
   pageUrl: string
   wsUrl: string
+  /** Bearer capability used by MCP; never embedded in wsUrl. */
+  authToken: string
   ready: Promise<void>
   getTrace: () => ProxyRuntimeTrace
   closed: boolean
@@ -61,6 +63,14 @@ export interface ProxyConfig {
 export interface LaunchProxyRuntimeOptions {
   url: string
   port: number
+  /** WebSocket bind host. Defaults to 127.0.0.1. */
+  host?: string
+  /** WebSocket bearer capability. Randomly generated when omitted. */
+  authToken?: string
+  /** Browser Origins allowed to open the controller socket. Default: none. */
+  allowedOrigins?: string[]
+  /** Filesystem roots approved for upload actions. Default: GEOMETRA_PROXY_FILE_ROOTS or none. */
+  allowedFileRoots?: string[]
   width?: number
   height?: number
   headed?: boolean
@@ -235,6 +245,9 @@ export async function launchProxyRuntime(options: LaunchProxyRuntimeOptions): Pr
   const pageUrl = parseHttpPageUrl(options.url)
   const eagerInitialExtract = options.eagerInitialExtract !== false
   const trace: ProxyRuntimeTrace = {}
+  const allowedFileRoots = options.allowedFileRoots ?? (process.env.GEOMETRA_PROXY_FILE_ROOTS
+    ? process.env.GEOMETRA_PROXY_FILE_ROOTS.split(delimiter).map(root => root.trim()).filter(Boolean)
+    : [])
   const pageReady = createDeferred<Page>()
 
   let resolveListening!: (wsUrl: string) => void
@@ -266,6 +279,10 @@ export async function launchProxyRuntime(options: LaunchProxyRuntimeOptions): Pr
 
   const hub = startGeometryWebSocket({
     port: options.port,
+    host: options.host,
+    authToken: options.authToken,
+    allowedOrigins: options.allowedOrigins,
+    allowedFileRoots,
     page: pageReady.promise,
     debounceMs: options.debounceMs ?? 50,
     beforeInput,
@@ -416,6 +433,7 @@ export async function launchProxyRuntime(options: LaunchProxyRuntimeOptions): Pr
     hub,
     pageUrl,
     wsUrl: listeningWsUrl,
+    authToken: hub.authToken,
     ready,
     getTrace,
     get closed() {

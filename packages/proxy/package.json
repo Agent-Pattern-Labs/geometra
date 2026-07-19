@@ -41,7 +41,7 @@
   "dependencies": {
     "cloakbrowser": "^0.3.28",
     "playwright": "^1.54.0",
-    "ws": "^8.18.0"
+    "ws": "^8.21.0"
   },
   "devDependencies": {
     "@types/node": "^22.0.0",

@@ -799,6 +799,13 @@ Chromium runs **headless** by default unless \`headless: false\`. Pass \`stealth
         .describe(
           'WebSocket URL when a server is already running (e.g. ws://127.0.0.1:3200 or ws://localhost:3100). If you pass http(s) here by mistake, MCP will treat it as a page URL and start geometra-proxy.',
         ),
+      authToken: z
+        .string()
+        .min(32)
+        .optional()
+        .describe(
+          'Bearer capability for an already-running authenticated geometra-proxy. Kept private and never returned in session metadata. Not needed when pageUrl starts the proxy automatically.',
+        ),
       pageUrl: z
         .string()
         .url()
@@ -944,6 +951,7 @@ Chromium runs **headless** by default unless \`headless: false\`. Pass \`stealth
           width: input.width,
           height: input.height,
           awaitInitialFrame: deferInlinePageModel ? false : undefined,
+          authToken: input.authToken,
         })
         if (input.returnForms) {
           await stabilizeInlineFormSchemas(session, formSchema)

@@ -6,7 +6,10 @@ const READY_SIGNAL_TYPE = 'geometra-proxy-ready'
 function printUsage(): void {
   console.error(`Usage: geometra-proxy <url> [--port <n>] [--width <n>] [--height <n>] [--headless] [--headed] [--stealth] [--no-stealth] [--slow-mo <ms>] [--lazy-initial-extract] [--proxy-server <url> [--proxy-username <u>] [--proxy-password <p>] [--proxy-bypass <list>]]
 
-Open <url> in Chromium and stream GEOM v1 frames on WebSocket (JSON text).
+Open <url> in Chromium and stream GEOM v1 frames on an authenticated loopback WebSocket.
+
+Set GEOMETRA_PROXY_AUTH_TOKEN to a random value of at least 32 characters.
+Pass the same value as authToken when connecting MCP to this standalone proxy.
 
 Default is headless stock Playwright Chromium.
 Use --headed for a visible browser window.
@@ -135,6 +138,12 @@ async function main(): Promise<void> {
     printUsage()
     process.exit(1)
   }
+  const authToken = process.env.GEOMETRA_PROXY_AUTH_TOKEN?.trim()
+  if (!authToken) {
+    throw new Error(
+      'GEOMETRA_PROXY_AUTH_TOKEN is required for standalone geometra-proxy. Set it to a random value of at least 32 characters and pass the same token to geometra_connect.',
+    )
+  }
   const url = parseHttpPageUrl(rawUrl)
 
   const mode = headed ? 'headed (visible window)' : 'headless'
@@ -146,6 +155,7 @@ async function main(): Promise<void> {
   const runtime = await launchProxyRuntime({
     url,
     port,
+    authToken,
     width,
     height,
     headed,
@@ -176,7 +186,9 @@ async function main(): Promise<void> {
     await runtime.close().catch(() => {})
     throw err
   }
-  console.error(`[geometra-proxy] Ready. Connect MCP with geometra_connect({ url: "${wsUrl}" })`)
+  console.error(
+    `[geometra-proxy] Ready. Connect MCP with geometra_connect({ url: "${wsUrl}", authToken: <GEOMETRA_PROXY_AUTH_TOKEN> })`,
+  )
   emitReadySignal(wsUrl, url)
 
   let shuttingDown = false

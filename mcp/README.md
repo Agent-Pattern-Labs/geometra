@@ -250,6 +250,9 @@ python3 -m http.server 8080
 In another terminal (from repo root after `npm install` / `bun install` and `bun run build`):
 
 ```bash
+export GEOMETRA_PROXY_AUTH_TOKEN="replace-with-a-random-32-character-or-longer-token"
+# Required only if you want file-upload actions:
+export GEOMETRA_PROXY_FILE_ROOTS="/absolute/path/to/approved-files"
 npx geometra-proxy http://localhost:8080 --port 3200
 # Requires Chromium: npx playwright install chromium
 # Optional authorized stealth-testing prefetch: npx cloakbrowser install
@@ -259,7 +262,18 @@ npx geometra-proxy http://localhost:8080 --port 3200
 
 For blocked/challenge pages, keep `blockDetection: true` (default). Set `blockedSitePolicy` to `"continue"` (default), `"manual-handoff"` to return retry guidance for a visible user handoff, or `"error"` to stop immediately with structured `blockedSite` details.
 
-Point MCP at `ws://127.0.0.1:3200` instead of a native Geometra server. The proxy translates clicks and keyboard messages into Playwright actions and streams updated geometry.
+Point MCP at the authenticated loopback socket instead of a native Geometra server:
+
+```text
+geometra_connect({
+  url: "ws://127.0.0.1:3200",
+  authToken: "<GEOMETRA_PROXY_AUTH_TOKEN>"
+})
+```
+
+When MCP starts the proxy from `pageUrl`, it generates and carries the token
+privately, so no auth parameter is needed. The proxy translates clicks and
+keyboard messages into Playwright actions and streams updated geometry.
 
 Then in Claude Code (either backend):
 
@@ -302,7 +316,7 @@ No screenshots and no vision model in the loop. JSON in, JSON out.
 With `python3 -m http.server 8080` in `demos/proxy-mcp-sample` and `npx geometra-proxy http://localhost:8080 --port 3200` running:
 
 ```
-Agent:  geometra_connect({ url: "ws://127.0.0.1:3200" })
+Agent:  geometra_connect({ url: "ws://127.0.0.1:3200", authToken: "<configured token>" })
         → Connected. UI includes textbox "Email", button "Save", …
 
 Agent:  geometra_form_schema({})
