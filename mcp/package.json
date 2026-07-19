@@ -36,7 +36,7 @@
     "@modelcontextprotocol/sdk": "^1.12.1",
     "@razroo/parallel-mcp": "^0.1.0",
     "ws": "^8.21.0",
-    "zod": "^3.23.0"
+    "zod": "^4.3.6"
   },
   "devDependencies": {
     "@types/node": "^22.0.0",

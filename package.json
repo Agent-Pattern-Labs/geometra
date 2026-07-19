@@ -4,11 +4,12 @@
   "type": "module",
   "workspaces": [
     "packages/*",
-    "demos/*"
+    "demos/*",
+    "mcp"
   ],
   "scripts": {
     "build": "bun run --filter textura build && bun run --filter @geometra/core build && bun run --filter @geometra/client build && bun run --filter @geometra/renderer-canvas build && bun run --filter @geometra/renderer-terminal build && bun run --filter @geometra/renderer-webgpu build && bun run --filter @geometra/renderer-pdf build && bun run --filter @geometra/renderer-three build && bun run --filter @geometra/server build && bun run --filter @geometra/ui build && bun run --filter @geometra/router build && bun run --filter @geometra/tw build && bun run --filter @geometra/agent build && bun run --filter @geometra/gateway build && bun run --filter @geometra/evidence build && bun run --filter @geometra/cli build && bun run --filter @geometra/proxy build && bun run mcp:build",
-    "check": "bun run --workspaces --if-present check && bun run mcp:check",
+    "check": "bun run --workspaces --if-present check",
     "test": "vitest run --config vitest.fast.config.ts",
     "test:all": "vitest run --config vitest.fast.config.ts && vitest run packages/core/src/__tests__/fonts.test.ts packages/core/src/__tests__/virtual-scroll.test.ts && vitest run packages/core/src/__tests__/perf-smoke.test.ts packages/server/src/__tests__/protocol-perf-smoke.test.ts",
     "test:slow": "vitest run packages/core/src/__tests__/fonts.test.ts packages/core/src/__tests__/virtual-scroll.test.ts",

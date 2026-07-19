@@ -15,17 +15,17 @@
  * This script:
  *   - Verifies every package currently sits at <oldVersion> (refuses to
  *     proceed if any drift exists — explicit "first fix the drift" signal).
- *   - Rewrites each package.json's "version" field to <newVersion>.
+ *   - Rewrites each package.json's version and internal dependency ranges to <newVersion>.
  *   - Prints what it touched.
  *
- * It deliberately does NOT touch internal `^x.y.z` dependency ranges between
- * @geometra/* packages. `scripts/release/normalize-publish-deps.mjs`
- * rewrites those at publish time, so source can stay loose.
+ * It also updates internal dependency ranges. Keeping the committed source
+ * graph aligned with the release prevents clone installs from falling back to
+ * an older registry package after an incompatible version bump.
  */
 import { readFile, writeFile } from 'node:fs/promises'
 import { fileURLToPath } from 'node:url'
-import { dirname, join } from 'node:path'
-import { publishablePackageJsons } from './package-manifest.mjs'
+import { dirname, join, resolve } from 'node:path'
+import { publishablePackageJsons, publishTimeDependencyUpdates } from './package-manifest.mjs'
 
 const root = join(dirname(fileURLToPath(import.meta.url)), '../..')
 
@@ -33,13 +33,32 @@ const packages = publishablePackageJsons()
 
 const SEMVER_RE = /^\d+\.\d+\.\d+(?:-[\w.+-]+)?$/
 
+export function rewritePackageManifest(raw, expectedName, oldVersion, newVersion, dependencyUpdates = {}) {
+  const pkg = JSON.parse(raw)
+  if (pkg.name !== expectedName) {
+    throw new Error(`expected name ${expectedName}, found ${pkg.name ?? 'unknown'}`)
+  }
+  if (pkg.version !== oldVersion) {
+    throw new Error(`${pkg.name}: ${pkg.version ?? 'unknown'} (expected ${oldVersion})`)
+  }
+
+  pkg.version = newVersion
+  for (const [name, spec] of Object.entries(dependencyUpdates)) {
+    if (typeof pkg.dependencies?.[name] !== 'string') {
+      throw new Error(`${pkg.name}: missing dependencies["${name}"]`)
+    }
+    pkg.dependencies[name] = spec
+  }
+
+  return `${JSON.stringify(pkg, null, 2)}\n`
+}
+
 function usage() {
   console.error('Usage: node scripts/release/bump-version.mjs <oldVersion> <newVersion>')
   console.error('Example: node scripts/release/bump-version.mjs 1.34.0 1.35.0')
 }
 
-async function main() {
-  const [oldVersion, newVersion] = process.argv.slice(2)
+export async function run(oldVersion, newVersion) {
   if (!oldVersion || !newVersion) {
     usage()
     process.exit(1)
@@ -56,9 +75,11 @@ async function main() {
   // First pass: verify every package is at oldVersion. Fail fast on drift
   // before mutating anything, so we never leave the tree half-bumped.
   const drift = []
+  const sources = new Map()
   for (const [expectedName, relPath] of packages) {
     const abs = join(root, relPath)
     const raw = await readFile(abs, 'utf8')
+    sources.set(expectedName, { abs, raw, relPath })
     const pkg = JSON.parse(raw)
     if (pkg.name !== expectedName) {
       console.error(`${relPath}: expected name ${expectedName}, found ${pkg.name ?? 'unknown'}`)
@@ -75,31 +96,29 @@ async function main() {
     process.exit(1)
   }
 
-  // Second pass: rewrite "version" with a string replace that preserves the
-  // exact byte layout of the file (no JSON.stringify reformat). package.json
-  // line/indent style varies across this repo and we don't want bumps to
-  // produce noisy whitespace diffs.
-  const versionLineRe = /"version":\s*"\d+\.\d+\.\d+(?:-[\w.+-]+)?"/
-  const replacement = `"version": "${newVersion}"`
-  let updated = 0
-  for (const [, relPath] of packages) {
-    const abs = join(root, relPath)
-    const raw = await readFile(abs, 'utf8')
-    if (!versionLineRe.test(raw)) {
-      console.error(`${relPath}: could not locate "version" field — file may be hand-formatted in an unusual way`)
-      process.exit(1)
-    }
-    const next = raw.replace(versionLineRe, replacement)
+  // Second pass: update package versions and the internal source dependency graph.
+  const updatesByName = new Map(publishTimeDependencyUpdates(newVersion).map((update) => [update.name, update]))
+  const writes = []
+  for (const [expectedName, relPath] of packages) {
+    const { abs, raw } = sources.get(expectedName)
+    const dependencyUpdates = updatesByName.get(expectedName)?.dependencies ?? {}
+    const next = rewritePackageManifest(raw, expectedName, oldVersion, newVersion, dependencyUpdates)
+    writes.push({ abs, next, relPath })
+  }
+
+  for (const { abs, next, relPath } of writes) {
     await writeFile(abs, next)
-    updated++
     console.log(`  ${relPath}: ${oldVersion} → ${newVersion}`)
   }
 
-  console.log(`\nBumped ${updated} package.json files: ${oldVersion} → ${newVersion}`)
+  console.log(`\nBumped ${writes.length} package.json files: ${oldVersion} → ${newVersion}`)
   console.log('Next: commit as `chore(release): vX.Y.Z — <summary>`, push, then `gh release create vX.Y.Z`.')
 }
 
-main().catch((err) => {
-  console.error(String(err?.message ?? err))
-  process.exit(1)
-})
+if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
+  const [oldVersion, newVersion] = process.argv.slice(2)
+  run(oldVersion, newVersion).catch((err) => {
+    console.error(String(err?.message ?? err))
+    process.exit(1)
+  })
+}

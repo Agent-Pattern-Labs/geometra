@@ -1,3 +1,4 @@
+import { existsSync, realpathSync } from 'node:fs'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { defineConfig } from 'vitest/config'
@@ -6,6 +7,60 @@ const repoRoot = fileURLToPath(new URL('.', import.meta.url))
 
 function fromRoot(...segments: string[]) {
   return path.resolve(repoRoot, ...segments)
+}
+
+function splitViteId(id: string) {
+  const queryIndex = id.indexOf('?')
+  const hashIndex = id.indexOf('#')
+  const suffixIndex = [queryIndex, hashIndex]
+    .filter((index) => index >= 0)
+    .reduce((first, index) => Math.min(first, index), id.length)
+
+  return {
+    pathname: id.slice(0, suffixIndex),
+    suffix: id.slice(suffixIndex),
+  }
+}
+
+function isWorkspaceSourcePath(candidate: string) {
+  const relative = path.relative(repoRoot, candidate)
+  if (relative === '' || relative.startsWith(`..${path.sep}`) || path.isAbsolute(relative)) return false
+
+  const segments = relative.split(path.sep)
+  return (
+    (segments[0] === 'mcp' && segments[1] === 'src' && segments.length > 2) ||
+    (segments[0] === 'packages' && Boolean(segments[1]) && segments[2] === 'src' && segments.length > 3)
+  )
+}
+
+/**
+ * TypeScript's NodeNext convention keeps `.js` in source import specifiers. Vite normally
+ * falls back to the sibling `.ts`, but an ignored compiler artifact can win resolution.
+ * Resolve that one source-only case before Vite checks the filesystem.
+ */
+export function createWorkspaceSourceResolver() {
+  return {
+    name: 'geometra-workspace-source-js-to-ts',
+    enforce: 'pre' as const,
+    resolveId(id: string, importer?: string) {
+      if (!importer || !/^\.\.?\//.test(id)) return undefined
+
+      const source = splitViteId(id)
+      if (!source.pathname.endsWith('.js')) return undefined
+
+      const importerPath = splitViteId(importer).pathname
+      if (!isWorkspaceSourcePath(importerPath)) return undefined
+
+      const typescriptPath = path.resolve(path.dirname(importerPath), `${source.pathname.slice(0, -3)}.ts`)
+      if (!isWorkspaceSourcePath(typescriptPath) || !existsSync(typescriptPath)) return undefined
+
+      // Do not let an in-tree symlink turn this narrowly scoped resolver into an escape hatch.
+      const realTypescriptPath = realpathSync(typescriptPath)
+      if (!isWorkspaceSourcePath(realTypescriptPath)) return undefined
+
+      return `${realTypescriptPath}${source.suffix}`
+    },
+  }
 }
 
 // Exact-match aliases keep workspace package imports on source files without requiring dist builds.
@@ -25,6 +80,7 @@ const workspaceAliases = [
 ]
 
 export default defineConfig({
+  plugins: [createWorkspaceSourceResolver()],
   resolve: {
     alias: workspaceAliases,
   },

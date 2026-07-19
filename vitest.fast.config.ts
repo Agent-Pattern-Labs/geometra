@@ -3,7 +3,11 @@ import baseConfig from './vitest.config'
 
 export default mergeConfig(baseConfig, defineConfig({
   test: {
-    include: ['packages/*/src/__tests__/**/*.test.ts', 'mcp/src/__tests__/**/*.test.ts'],
+    include: [
+      'packages/*/src/__tests__/**/*.test.ts',
+      'mcp/src/__tests__/**/*.test.ts',
+      'scripts/release/**/*.test.ts',
+    ],
     exclude: [
       // Slower or threshold-based suites still run via `npm run test:all` / `npm run release:gate` (see TESTING_MATRIX.md).
       'packages/core/src/__tests__/fonts.test.ts', // WASM / web font loading

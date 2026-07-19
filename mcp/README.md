@@ -221,11 +221,13 @@ To uninstall, remove the server entry from your client's MCP configuration.
 ### From source (this repo)
 
 ```bash
-cd mcp
 npm install
-npm run build
-claude mcp add geometra -- node ./dist/index.js
+npm run build -w @geometra/proxy
+npm run build -w @geometra/mcp
+claude mcp add geometra -- node "$(pwd)/mcp/dist/index.js"
 ```
+
+Install from the repository root so npm links `@geometra/mcp` and `@geometra/proxy` to the current checkout instead of placing an independent registry copy under `mcp/node_modules`.
 
 ### Session state privacy
 

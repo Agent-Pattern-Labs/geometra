@@ -211,6 +211,25 @@
         "vite": "^8.0.3",
       },
     },
+    "mcp": {
+      "name": "@geometra/mcp",
+      "version": "1.64.0",
+      "bin": {
+        "geometra-mcp": "./dist/index.js",
+      },
+      "dependencies": {
+        "@geometra/proxy": "^1.64.0",
+        "@modelcontextprotocol/sdk": "^1.12.1",
+        "@razroo/parallel-mcp": "^0.1.0",
+        "ws": "^8.21.0",
+        "zod": "^4.3.6",
+      },
+      "devDependencies": {
+        "@types/node": "^22.0.0",
+        "@types/ws": "^8.5.0",
+        "typescript": "^6.0.0",
+      },
+    },
     "packages/agent": {
       "name": "@geometra/agent",
       "version": "1.64.0",
@@ -519,6 +538,8 @@
     "@geometra/evidence": ["@geometra/evidence@workspace:packages/evidence"],
 
     "@geometra/gateway": ["@geometra/gateway@workspace:packages/gateway"],
+
+    "@geometra/mcp": ["@geometra/mcp@workspace:mcp"],
 
     "@geometra/proxy": ["@geometra/proxy@workspace:packages/proxy"],
 
