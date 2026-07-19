@@ -15,6 +15,18 @@ import type { GeometrySnapshot, LayoutSnapshot, TreeSnapshot } from './types.js'
 function browserExtractGeometry(): { layout: LayoutSnapshot; tree: TreeSnapshot } {
   const SKIP_TAGS = new Set(['script', 'style', 'noscript', 'template'])
   const LEAF_FORM_TAGS = new Set(['input', 'textarea', 'select'])
+  const FORM_CONTROL_ROLES = new Set([
+    'button',
+    'checkbox',
+    'combobox',
+    'listbox',
+    'radio',
+    'searchbox',
+    'slider',
+    'spinbutton',
+    'switch',
+    'textbox',
+  ])
 
   function textWithoutNestedControls(node: Node): string {
     if (node.nodeType === Node.TEXT_NODE) return node.textContent ?? ''
@@ -601,10 +613,74 @@ function browserExtractGeometry(): { layout: LayoutSnapshot; tree: TreeSnapshot 
     return false
   }
 
+  /**
+   * Preserve an authored identity for form controls so downstream consumers do
+   * not have to resolve a field by its (often duplicated) accessible label.
+   *
+   * `controlKey` is deliberately based only on authored attributes. We do not
+   * fall back to a DOM index/path because those change whenever a reactive form
+   * inserts, removes, or reorders conditional fields.
+   */
+  function addAuthoredControlIdentity(
+    semantic: Record<string, unknown>,
+    el: Element,
+    tag: string,
+    role: string | undefined,
+  ): void {
+    const isNativeControl =
+      el instanceof HTMLInputElement ||
+      el instanceof HTMLTextAreaElement ||
+      el instanceof HTMLSelectElement ||
+      el instanceof HTMLButtonElement
+    const normalizedRole = role?.trim().toLowerCase()
+    if (!isNativeControl && (!normalizedRole || !FORM_CONTROL_ROLES.has(normalizedRole))) return
+
+    const controlId = el.getAttribute('id')
+    const controlName = el.getAttribute('name')
+    if (controlId?.trim()) semantic.controlId = controlId
+    if (controlName?.trim()) semantic.controlName = controlName
+
+    if (controlId?.trim()) {
+      semantic.controlKey = `id:${encodeURIComponent(controlId)}`
+      return
+    }
+    if (!controlName?.trim()) return
+
+    // Use the authored attribute, not DOM defaults such as input.type="text",
+    // button.type="submit", or select.type="select-one". This keeps the key
+    // derivation identical in the extractor and action resolver.
+    const controlType = el.getAttribute('type')?.trim().toLowerCase() || 'default'
+    semantic.controlKey = `name:${tag}:${controlType}:${encodeURIComponent(controlName)}`
+  }
+
+  /** Native select options are otherwise lost because <select> is a leaf node. */
+  function nativeSelectOptions(el: HTMLSelectElement): Array<{
+    value: string
+    label: string
+    disabled: boolean
+    selected: boolean
+    index: number
+  }> {
+    return Array.from(el.options).map((option, index) => ({
+      // Preserve the submitted value exactly. It can intentionally differ
+      // from the visible label (and may even be duplicated).
+      value: option.value,
+      label: option.label.replace(/\s+/g, ' ').trim(),
+      // HTMLOptionElement.disabled does not include a disabled <optgroup>.
+      disabled:
+        option.disabled || (option.parentElement instanceof HTMLOptGroupElement && option.parentElement.disabled),
+      selected: option.selected,
+      // Index is retained so two identical label/value pairs remain distinct.
+      index,
+    }))
+  }
+
   function semanticFor(el: Element, tag: string): Record<string, unknown> {
     const semantic: Record<string, unknown> = { tag }
     const role = defaultRoleForTag(el, tag)
     if (role) semantic.role = role
+    addAuthoredControlIdentity(semantic, el, tag, role)
+    if (el instanceof HTMLSelectElement) semantic.options = nativeSelectOptions(el)
     const al = el.getAttribute('aria-label')
     if (al) semantic.ariaLabel = al
     const valueText = controlValueText(el)

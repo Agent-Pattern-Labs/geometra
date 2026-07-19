@@ -110,6 +110,7 @@ describe('proxy-backed MCP actions', () => {
   it('waits for the post-batch update before resolving fillFields acks', async () => {
     const wss = new WebSocketServer({ port: 0 })
     let seenMessage: { type?: string; fields?: unknown[] } | undefined
+    let ackProtocolVersion = 2
     wss.on('connection', ws => {
       ws.on('message', raw => {
         const msg = JSON.parse(String(raw)) as { type?: string; fields?: unknown[]; requestId?: string }
@@ -138,6 +139,7 @@ describe('proxy-backed MCP actions', () => {
           ws.send(JSON.stringify({
             type: 'ack',
             requestId: msg.requestId,
+            protocolVersion: ackProtocolVersion,
             result: {
               pageUrl: 'https://jobs.example.com/application',
               invalidCount: 0,
@@ -162,8 +164,8 @@ describe('proxy-backed MCP actions', () => {
       const session = await connect(`ws://127.0.0.1:${port}`)
       await expect(
         sendFillFields(session, [
-          { kind: 'text', fieldId: 'ff:0.0', fieldLabel: 'Full name', value: 'Taylor Applicant' },
-          { kind: 'choice', fieldId: 'ff:0.1', fieldLabel: 'Country', value: 'Germany' },
+          { kind: 'text', fieldId: 'ff:0.0', fieldKey: 'id:full-name', fieldLabel: 'Full name', value: 'Taylor Applicant' },
+          { kind: 'choice', fieldId: 'ff:0.1', fieldKey: 'name:select:default:country', fieldLabel: 'Country', value: 'Germany' },
         ], 80),
       ).resolves.toMatchObject({
         status: 'updated',
@@ -177,10 +179,17 @@ describe('proxy-backed MCP actions', () => {
       expect(seenMessage).toMatchObject({
         type: 'fillFields',
         fields: [
-          { kind: 'text', fieldId: 'ff:0.0', fieldLabel: 'Full name', value: 'Taylor Applicant' },
-          { kind: 'choice', fieldId: 'ff:0.1', fieldLabel: 'Country', value: 'Germany' },
+          { kind: 'text', fieldId: 'ff:0.0', fieldKey: 'id:full-name', fieldLabel: 'Full name', value: 'Taylor Applicant' },
+          { kind: 'choice', fieldId: 'ff:0.1', fieldKey: 'name:select:default:country', fieldLabel: 'Country', value: 'Germany' },
         ],
       })
+
+      ackProtocolVersion = 1
+      await expect(
+        sendFillFields(session, [
+          { kind: 'text', fieldKey: 'id:full-name', fieldLabel: 'Full name', value: 'Taylor Applicant' },
+        ], 80),
+      ).rejects.toThrow('cannot guarantee exact field identity')
     } finally {
       disconnect()
       await new Promise<void>((resolve, reject) => wss.close(err => (err ? reject(err) : resolve())))

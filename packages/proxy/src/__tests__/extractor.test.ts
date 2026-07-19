@@ -317,6 +317,76 @@ describe('extractGeometry', () => {
     await page.close()
   })
 
+  it('preserves authored control identity and every native option without deduplicating labels or values', async () => {
+    const page = await browser.newPage({ viewport: { width: 800, height: 600 } })
+    await page.setContent(`
+      <form>
+        <label for="primary-country">Country</label>
+        <select id="primary-country" name="applicant[country]">
+          <option value="">Choose a country</option>
+          <option value="de" selected>Germany</option>
+          <option value="de">Germany</option>
+          <option value="de-alt">Germany</option>
+          <option value="eng" disabled>Engineering</option>
+          <optgroup label="Unavailable" disabled>
+            <option value="legacy">Legacy region</option>
+          </optgroup>
+        </select>
+
+        <label>
+          Country
+          <select name="secondary_country">
+            <option value="us" selected>United States</option>
+          </select>
+        </label>
+
+        <label>
+          Contact email
+          <input name="contact_email" type="EMAIL" />
+        </label>
+      </form>
+    `)
+
+    const snapshot = await extractGeometry(page)
+    const nodes = flattenSnapshot(snapshot.tree, snapshot.layout)
+    const countries = nodes.filter(
+      node => node.tree.semantic?.role === 'combobox' && node.tree.semantic?.ariaLabel === 'Country',
+    )
+
+    expect(countries).toHaveLength(2)
+
+    const primary = countries.find(node => node.tree.semantic?.controlId === 'primary-country')
+    expect(primary?.tree.semantic).toMatchObject({
+      tag: 'select',
+      controlId: 'primary-country',
+      controlName: 'applicant[country]',
+      controlKey: 'id:primary-country',
+    })
+    expect(primary?.tree.semantic?.options).toEqual([
+      { value: '', label: 'Choose a country', disabled: false, selected: false, index: 0 },
+      { value: 'de', label: 'Germany', disabled: false, selected: true, index: 1 },
+      { value: 'de', label: 'Germany', disabled: false, selected: false, index: 2 },
+      { value: 'de-alt', label: 'Germany', disabled: false, selected: false, index: 3 },
+      { value: 'eng', label: 'Engineering', disabled: true, selected: false, index: 4 },
+      { value: 'legacy', label: 'Legacy region', disabled: true, selected: false, index: 5 },
+    ])
+
+    const secondary = countries.find(node => node.tree.semantic?.controlName === 'secondary_country')
+    expect(secondary?.tree.semantic).toMatchObject({
+      tag: 'select',
+      controlName: 'secondary_country',
+      controlKey: 'name:select:default:secondary_country',
+    })
+    expect(secondary?.tree.semantic?.controlId).toBeUndefined()
+
+    const email = nodes.find(
+      node => node.tree.semantic?.role === 'textbox' && node.tree.semantic?.controlName === 'contact_email',
+    )
+    expect(email?.tree.semantic?.controlKey).toBe('name:input:email:contact_email')
+
+    await page.close()
+  })
+
   it('expands tiny text-control bounds to the visible control wrapper', async () => {
     const page = await browser.newPage({ viewport: { width: 900, height: 700 } })
     await page.setContent(`

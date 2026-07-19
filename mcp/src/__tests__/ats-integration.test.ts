@@ -128,6 +128,17 @@ vi.mock('../session.js', () => ({
   summarizeUiDelta: vi.fn(() => ''),
   nodeContextForNode: vi.fn((_: unknown, nd: { path?: number[] }) =>
     mockState.nodeContexts.get((nd.path ?? []).join('.'))),
+  parseSectionId: vi.fn((id: string) => {
+    const [prefix, encoded] = id.split(':', 2)
+    if (prefix !== 'fm' || !encoded) return null
+    const path = encoded === 'root' ? [] : encoded.split('.').map(Number)
+    return path.every(Number.isInteger) ? { kind: 'form' as const, path } : null
+  }),
+  findNodeByPath: vi.fn((root: A11yNode, path: number[]) => {
+    let current: A11yNode | undefined = root
+    for (const index of path) current = current?.children[index]
+    return current ?? null
+  }),
   waitForUiCondition: mockState.waitForUiCondition,
 }))
 

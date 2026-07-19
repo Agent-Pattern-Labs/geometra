@@ -13,6 +13,12 @@ export type FileAttachStrategy = 'auto' | 'chooser' | 'hidden' | 'drop'
 const LABELED_CONTROL_SELECTOR =
   'input, select, textarea, button, [role="combobox"], [role="textbox"], [aria-haspopup="listbox"], [aria-haspopup="menu"], [aria-haspopup="true"], [contenteditable="true"]'
 
+const EDITABLE_FIELD_SELECTOR =
+  'input:not([type="checkbox"]):not([type="radio"]):not([type="file"]):not([type="button"]):not([type="submit"]):not([type="reset"]):not([type="hidden"]), textarea, [role="textbox"], [role="combobox"], [contenteditable="true"]'
+
+const TOGGLE_CONTROL_SELECTOR =
+  'input[type="checkbox"], input[type="radio"], [role="checkbox"], [role="radio"], [role="switch"]'
+
 const MENU_TRIGGER_SELECTOR =
   'button[aria-haspopup="menu"], button[aria-haspopup="true"], [role="button"][aria-haspopup="menu"], [role="button"][aria-haspopup="true"]'
 
@@ -74,9 +80,16 @@ function lookupCacheKey(kind: 'control' | 'editable' | 'file', label: string, ex
   return `${kind}:${exact ? 'exact' : 'fuzzy'}:${normalizedOptionLabel(label)}`
 }
 
-function lookupCacheKeys(kind: 'control' | 'editable' | 'file', label: string, exact: boolean, fieldId?: string): string[] {
+function lookupCacheKeys(
+  kind: 'control' | 'editable' | 'file',
+  label: string,
+  exact: boolean,
+  fieldId?: string,
+  fieldKey?: string,
+): string[] {
   const keys = [lookupCacheKey(kind, label, exact)]
   if (fieldId) keys.unshift(`${kind}:id:${fieldId}`)
+  if (fieldKey) keys.unshift(`${kind}:key:${fieldKey}`)
   return keys
 }
 
@@ -86,17 +99,46 @@ function cacheMapForKind(cache: FillLookupCache, kind: 'control' | 'editable' | 
   return cache.fileInput
 }
 
-function readCachedLocator(
+async function readCachedLocator(
   cache: FillLookupCache | undefined,
   kind: 'control' | 'editable' | 'file',
   label: string,
   exact: boolean,
   fieldId?: string,
-): Locator | null | undefined {
+  fieldKey?: string,
+): Promise<Locator | undefined> {
   if (!cache) return undefined
   const map = cacheMapForKind(cache, kind)
+  const readLive = async (key: string): Promise<Locator | undefined> => {
+    if (!map.has(key)) return undefined
+    const locator = map.get(key)
+    // Never retain negative lookups across reactive re-renders.
+    if (!locator) {
+      map.delete(key)
+      return undefined
+    }
+    try {
+      const attached = await locator.count() > 0
+      const usable = attached && (kind === 'file' || await locator.isVisible())
+      const identityMatches = usable && fieldKey && key === `${kind}:key:${fieldKey}`
+        ? await locatorMatchesAuthoredFieldKey(locator, fieldKey)
+        : usable
+      if (identityMatches) return locator
+    } catch {
+      // Detached locators are normal after controlled-form re-renders.
+    }
+    map.delete(key)
+    return undefined
+  }
+  // A newly supplied authored fieldKey must get a chance to resolve before a
+  // locator cached under the looser schema id or label is reused.
+  if (fieldKey) {
+    const key = `${kind}:key:${fieldKey}`
+    return await readLive(key)
+  }
   for (const key of lookupCacheKeys(kind, label, exact, fieldId)) {
-    if (map.has(key)) return map.get(key) ?? null
+    const locator = await readLive(key)
+    if (locator) return locator
   }
   return undefined
 }
@@ -107,13 +149,120 @@ function writeCachedLocator(
   label: string,
   exact: boolean,
   fieldId: string | undefined,
+  fieldKey: string | undefined,
   locator: Locator | null,
 ): void {
   if (!cache) return
   const map = cacheMapForKind(cache, kind)
-  for (const key of lookupCacheKeys(kind, label, exact, fieldId)) {
-    map.set(key, locator)
+  const keys = fieldKey
+    ? [`${kind}:key:${fieldKey}`, ...(fieldId ? [`${kind}:id:${fieldId}`] : [])]
+    : lookupCacheKeys(kind, label, exact, fieldId)
+  for (const key of keys) {
+    if (locator) map.set(key, locator)
+    else map.delete(key)
   }
+}
+
+type AuthoredFieldLookupKind = 'control' | 'editable' | 'file' | 'toggle'
+
+type ParsedAuthoredFieldKey =
+  | { kind: 'id'; id: string }
+  | { kind: 'name'; tag: string; type: string; name: string }
+
+function parseAuthoredFieldKey(fieldKey: string): ParsedAuthoredFieldKey {
+  const normalized = fieldKey.trim()
+  if (!normalized || normalized !== fieldKey) {
+    throw new Error('fieldKey must be a trimmed, non-empty string')
+  }
+  if (normalized.startsWith('id:')) {
+    try {
+      const id = decodeURIComponent(normalized.slice(3))
+      if (id) return { kind: 'id', id }
+    } catch {
+      throw new Error('fieldKey contains an invalid encoded id')
+    }
+  }
+  if (normalized.startsWith('name:')) {
+    const parts = normalized.split(':')
+    const tag = parts[1]?.trim().toLowerCase()
+    const type = parts[2]?.trim().toLowerCase()
+    try {
+      const name = decodeURIComponent(parts.slice(3).join(':'))
+      if (tag && type && name) return { kind: 'name', tag, type, name }
+    } catch {
+      throw new Error('fieldKey contains an invalid encoded name')
+    }
+  }
+  throw new Error('fieldKey must use id:<id> or name:<tag>:<type-or-default>:<name>')
+}
+
+async function locatorMatchesAuthoredFieldKey(locator: Locator, fieldKey: string): Promise<boolean> {
+  const parsed = parseAuthoredFieldKey(fieldKey)
+  try {
+    return await locator.evaluate((element, key) => {
+      if (!(element instanceof Element)) return false
+      if (key.kind === 'id') return element.getAttribute('id') === key.id
+      const authoredType = element.getAttribute('type')?.trim().toLowerCase() || 'default'
+      return element.tagName.toLowerCase() === key.tag &&
+        authoredType === key.type &&
+        element.getAttribute('name') === key.name
+    }, parsed)
+  } catch {
+    return false
+  }
+}
+
+function selectorForAuthoredFieldKind(kind: AuthoredFieldLookupKind): string {
+  if (kind === 'editable') return EDITABLE_FIELD_SELECTOR
+  if (kind === 'file') return 'input[type="file"]'
+  if (kind === 'toggle') return TOGGLE_CONTROL_SELECTOR
+  return LABELED_CONTROL_SELECTOR
+}
+
+async function findAuthoredFieldByKeyInPage(
+  page: Page,
+  fieldKey: string,
+  kind: AuthoredFieldLookupKind,
+): Promise<Locator | null> {
+  const parsed = parseAuthoredFieldKey(fieldKey)
+  const matches: Array<{ locator: Locator; frameUrl: string }> = []
+
+  for (const frame of page.frames()) {
+    const candidates = frame.locator(selectorForAuthoredFieldKind(kind))
+    const indices = await candidates.evaluateAll((elements, key) => {
+      const result: number[] = []
+      for (let index = 0; index < elements.length; index++) {
+        const element = elements[index]
+        if (!(element instanceof Element)) continue
+        if (key.kind === 'id') {
+          if (element.getAttribute('id') === key.id) result.push(index)
+          continue
+        }
+        const authoredType = element.getAttribute('type')?.trim().toLowerCase() || 'default'
+        if (
+          element.tagName.toLowerCase() === key.tag &&
+          authoredType === key.type &&
+          element.getAttribute('name') === key.name
+        ) {
+          result.push(index)
+        }
+      }
+      return result
+    }, parsed)
+
+    for (const index of indices) {
+      const locator = candidates.nth(index)
+      if (kind === 'editable' && !(await locatorIsEditable(locator))) continue
+      if (kind !== 'file' && !(await locator.isVisible())) continue
+      matches.push({ locator, frameUrl: frame.url() })
+    }
+  }
+
+  if (matches.length > 1) {
+    const frames = [...new Set(matches.map(match => match.frameUrl || '<top-frame>'))]
+    throw new Error(`fieldKey "${fieldKey}" is ambiguous: matched ${matches.length} controls across ${frames.join(', ')}`)
+  }
+  return matches[0]?.locator ?? null
 }
 
 function normalizedOptionLabel(value: string): string {
@@ -770,12 +919,23 @@ async function findLabeledControlInPage(
   page: Page,
   fieldLabel: string,
   exact: boolean,
-  opts?: { preferredAnchor?: AnchorPoint; cache?: FillLookupCache; fieldId?: string },
+  opts?: { preferredAnchor?: AnchorPoint; cache?: FillLookupCache; fieldId?: string; fieldKey?: string },
 ): Promise<Locator | null> {
   const cacheable = !opts?.preferredAnchor
-  const cached = cacheable ? readCachedLocator(opts?.cache, 'control', fieldLabel, exact, opts?.fieldId) : undefined
+  const cached = cacheable
+    ? await readCachedLocator(opts?.cache, 'control', fieldLabel, exact, opts?.fieldId, opts?.fieldKey)
+    : undefined
   if (cached !== undefined) {
     return cached
+  }
+
+  if (opts?.fieldKey) {
+    const authored = await findAuthoredFieldByKeyInPage(page, opts.fieldKey, 'control')
+    if (authored) {
+      if (cacheable) writeCachedLocator(opts?.cache, 'control', fieldLabel, exact, opts?.fieldId, opts.fieldKey, authored)
+      return authored
+    }
+    throw new Error(`fieldKey "${opts.fieldKey}" did not resolve to a visible control; refresh geometra_form_schema`)
   }
 
   // Try the label as-is first. If the caller passed a fully-qualified DOM
@@ -783,7 +943,7 @@ async function findLabeledControlInPage(
   for (const frame of page.frames()) {
     const locator = await findLabeledControl(frame, fieldLabel, exact, { preferredAnchor: opts?.preferredAnchor })
     if (!locator) continue
-    if (cacheable) writeCachedLocator(opts?.cache, 'control', fieldLabel, exact, opts?.fieldId, locator)
+    if (cacheable) writeCachedLocator(opts?.cache, 'control', fieldLabel, exact, opts?.fieldId, undefined, locator)
     return locator
   }
 
@@ -798,7 +958,7 @@ async function findLabeledControlInPage(
     for (const frame of page.frames()) {
       const locator = await findLabeledControl(frame, stripped, exact, { preferredAnchor: opts?.preferredAnchor })
       if (!locator) continue
-      if (cacheable) writeCachedLocator(opts?.cache, 'control', fieldLabel, exact, opts?.fieldId, locator)
+      if (cacheable) writeCachedLocator(opts?.cache, 'control', fieldLabel, exact, opts?.fieldId, undefined, locator)
       return locator
     }
   }
@@ -814,12 +974,12 @@ async function findLabeledControlInPage(
     for (const frame of page.frames()) {
       const locator = await findMenuTriggerByContainerLabel(frame, candidate, exact)
       if (!locator) continue
-      if (cacheable) writeCachedLocator(opts?.cache, 'control', fieldLabel, exact, opts?.fieldId, locator)
+      if (cacheable) writeCachedLocator(opts?.cache, 'control', fieldLabel, exact, opts?.fieldId, undefined, locator)
       return locator
     }
   }
 
-  if (cacheable) writeCachedLocator(opts?.cache, 'control', fieldLabel, exact, opts?.fieldId, null)
+  if (cacheable) writeCachedLocator(opts?.cache, 'control', fieldLabel, exact, opts?.fieldId, undefined, null)
   return null
 }
 
@@ -851,8 +1011,9 @@ async function openDropdownControl(
   exact: boolean,
   cache?: FillLookupCache,
   fieldId?: string,
+  fieldKey?: string,
 ): Promise<{ locator: Locator; handle: ElementHandle<Element> | null; editable: boolean; anchorX?: number; anchorY?: number }> {
-  const locator = await findLabeledControlInPage(page, fieldLabel, exact, { cache, fieldId })
+  const locator = await findLabeledControlInPage(page, fieldLabel, exact, { cache, fieldId, fieldKey })
   if (locator) {
     await locator.scrollIntoViewIfNeeded()
     const handle = await locator.elementHandle()
@@ -2002,123 +2163,6 @@ async function readTriggerShowsPlaceholder(
 }
 
 /**
- * Detect whether a combobox trigger is a "searchable/autocomplete style"
- * combobox (React Select, Headless UI, Radix, Ant Design Select, etc.).
- *
- * These libraries commit their controlled `onChange` state on **keyboard
- * Enter**, not on a synthetic mouse click dispatched via Playwright's
- * `.click()`. For regular mouse interactions they use a bubbling
- * `mousedown`/`pointerdown` path that does not round-trip through React
- * Select's internal `selectOption` handler in some Remix-wrapped builds
- * (notably Greenhouse's ATS embed), so the option click fires visually but
- * the form state stays empty. Pressing Enter on the focused combobox input
- * after the click puts the selection through the keyboard code path which
- * ALWAYS commits.
- *
- * Detection is fully generic — no hostname or site-specific branching.
- * The signals we look for are:
- *
- *   1. `aria-autocomplete` on the element or its nearest ancestor input is
- *      `"list"` or `"both"`. This is the standards-aligned signal for any
- *      combobox that filters options as the user types.
- *   2. A class pattern indicative of React Select (`select__control`,
- *      `select__`), React Suite picker (`rs-picker`), or Ant Design Select
- *      (`ant-select`) on the element or any ancestor up to 5 levels.
- *   3. `role="combobox"` present together with `aria-expanded` on the
- *      element or an ancestor — the ARIA 1.2 combobox pattern.
- *
- * Native `<select>` elements do NOT match any of these signals, so the
- * caller can safely gate its `Enter` dispatch on this check without
- * breaking non-searchable listboxes.
- */
-async function isAutocompleteCombobox(
-  handle: ElementHandle<Element> | null | undefined,
-): Promise<boolean> {
-  if (!handle) return false
-  try {
-    return await handle.evaluate((el) => {
-      if (!(el instanceof Element)) return false
-      let cur: Element | null = el
-      let depth = 0
-      while (cur && depth < 5) {
-        // aria-autocomplete on the element or an ancestor input/combobox.
-        const ac = cur.getAttribute('aria-autocomplete')
-        if (ac === 'list' || ac === 'both') return true
-
-        // Class-based fingerprint for known autocomplete libraries.
-        const className = (cur.getAttribute('class') ?? '').toLowerCase()
-        if (className) {
-          if (
-            className.includes('select__control') ||
-            className.includes('select__') ||
-            className.includes('rs-picker') ||
-            className.includes('ant-select') ||
-            className.includes('headlessui-combobox') ||
-            className.includes('cmdk-')
-          ) {
-            return true
-          }
-        }
-
-        // ARIA 1.2 combobox pattern: role="combobox" + aria-expanded is a
-        // strong signal that the control commits via keyboard semantics.
-        if (cur.getAttribute('role') === 'combobox' && cur.hasAttribute('aria-expanded')) {
-          return true
-        }
-        cur = cur.parentElement
-        depth++
-      }
-
-      // Also look downward for a descendant input that declares
-      // aria-autocomplete — some Headless UI wrappers expose the control via
-      // a sibling input inside the trigger container.
-      const descendant = (el as Element).querySelector?.(
-        '[aria-autocomplete="list"], [aria-autocomplete="both"]',
-      )
-      return !!descendant
-    })
-  } catch {
-    return false
-  }
-}
-
-/**
- * Dispatch a keyboard `Enter` to commit an autocomplete-style combobox's
- * selection after the option has been clicked. Only fires if the trigger
- * looks like a searchable combobox per {@link isAutocompleteCombobox}.
- *
- * Why this exists: Playwright's `.click()` on a React Select option DOM
- * element dispatches a synthetic `pointerdown`/`mouseup`/`click` sequence
- * that a subset of React Select forks (and every Remix-wrapped Greenhouse
- * ATS build we've seen) will NOT commit through `selectOption`. The
- * library's `keydown Enter` handler, however, unconditionally commits via
- * the same internal `setValue` the visual selection uses. Pressing Enter
- * after the click is therefore a universal "force commit" primitive for
- * searchable comboboxes that benefit every library without touching the
- * native-<select> happy path.
- *
- * Intentionally swallows errors — this is a best-effort commit helper and
- * a missing page/focus should not break the surrounding selection flow.
- */
-async function pressEnterToCommitListbox(
-  page: Page,
-  handle: ElementHandle<Element> | null | undefined,
-): Promise<boolean> {
-  if (!handle) return false
-  if (!(await isAutocompleteCombobox(handle))) return false
-  try {
-    await page.keyboard.press('Enter')
-    // Short settle window for the library to run its onChange -> form
-    // state update. 80ms is the same budget used elsewhere in this file
-    // for React Select commit propagation.
-    await delay(80)
-    return true
-  } catch {
-    return false
-  }
-}
-
-/**
  * After a custom listbox option click, make the committed value visible to
  * framework state managers that listen on the backing input/select instead of
  * the popup option. This covers React controlled inputs, react-hook-form
@@ -2878,28 +2922,47 @@ async function findLabeledFileInputInPage(
   exact: boolean,
   cache?: FillLookupCache,
   fieldId?: string,
+  fieldKey?: string,
 ): Promise<Locator | null> {
-  const cached = readCachedLocator(cache, 'file', fieldLabel, exact, fieldId)
+  const cached = await readCachedLocator(cache, 'file', fieldLabel, exact, fieldId, fieldKey)
   if (cached !== undefined) return cached
 
-  for (const frame of page.frames()) {
-    const locator = await findLabeledFileInput(frame, fieldLabel, exact)
-    if (!locator) continue
-    writeCachedLocator(cache, 'file', fieldLabel, exact, fieldId, locator)
-    return locator
+  if (fieldKey) {
+    const authored = await findAuthoredFieldByKeyInPage(page, fieldKey, 'file')
+    if (authored) {
+      writeCachedLocator(cache, 'file', fieldLabel, exact, fieldId, fieldKey, authored)
+      return authored
+    }
+    throw new Error(`fieldKey "${fieldKey}" did not resolve to a file input; refresh geometra_form_schema`)
   }
 
-  writeCachedLocator(cache, 'file', fieldLabel, exact, fieldId, null)
+  if (fieldLabel) {
+    for (const frame of page.frames()) {
+      const locator = await findLabeledFileInput(frame, fieldLabel, exact)
+      if (!locator) continue
+      writeCachedLocator(cache, 'file', fieldLabel, exact, fieldId, undefined, locator)
+      return locator
+    }
+  }
+
+  writeCachedLocator(cache, 'file', fieldLabel, exact, fieldId, undefined, null)
   return null
 }
 
 async function attachHiddenInAllFrames(
   page: Page,
   paths: string[],
-  opts?: { fieldLabel?: string; exact?: boolean; cache?: FillLookupCache; fieldId?: string },
+  opts?: { fieldLabel?: string; exact?: boolean; cache?: FillLookupCache; fieldId?: string; fieldKey?: string },
 ): Promise<boolean> {
-  if (opts?.fieldLabel) {
-    const labeled = await findLabeledFileInputInPage(page, opts.fieldLabel, opts.exact ?? false, opts.cache, opts.fieldId)
+  if (opts?.fieldLabel || opts?.fieldKey) {
+    const labeled = await findLabeledFileInputInPage(
+      page,
+      opts.fieldLabel ?? '',
+      opts.exact ?? false,
+      opts.cache,
+      opts.fieldId,
+      opts.fieldKey,
+    )
     if (labeled) {
       try {
         await labeled.setInputFiles(paths)
@@ -3117,6 +3180,7 @@ export async function attachFiles(
   paths: string[],
   opts?: {
     fieldId?: string
+    fieldKey?: string
     clickX?: number
     clickY?: number
     fieldLabel?: string
@@ -3144,7 +3208,13 @@ export async function attachFiles(
   }
 
   if (strategy === 'hidden' || strategy === 'auto') {
-    if (await attachHiddenInAllFrames(page, paths, { fieldId: opts?.fieldId, fieldLabel, exact, cache: opts?.cache })) return
+    if (await attachHiddenInAllFrames(page, paths, {
+      fieldId: opts?.fieldId,
+      fieldKey: opts?.fieldKey,
+      fieldLabel,
+      exact,
+      cache: opts?.cache,
+    })) return
     if (strategy === 'hidden') {
       if (fieldLabel) {
         throw new Error(`file: hidden strategy could not find input[type=file] for field "${fieldLabel}"`)
@@ -3197,9 +3267,19 @@ async function findLabeledEditableField(
   exact: boolean,
   cache?: FillLookupCache,
   fieldId?: string,
+  fieldKey?: string,
 ): Promise<Locator | null> {
-  const cached = readCachedLocator(cache, 'editable', fieldLabel, exact, fieldId)
+  const cached = await readCachedLocator(cache, 'editable', fieldLabel, exact, fieldId, fieldKey)
   if (cached !== undefined) return cached
+
+  if (fieldKey) {
+    const authored = await findAuthoredFieldByKeyInPage(page, fieldKey, 'editable')
+    if (authored) {
+      writeCachedLocator(cache, 'editable', fieldLabel, exact, fieldId, fieldKey, authored)
+      return authored
+    }
+    throw new Error(`fieldKey "${fieldKey}" did not resolve to a visible editable control; refresh geometra_form_schema`)
+  }
 
   for (const frame of page.frames()) {
     // Always try exact-match candidates first, even when the caller passed
@@ -3219,7 +3299,7 @@ async function findLabeledEditableField(
       const visible = await firstVisible(candidate, { minWidth: 1, minHeight: 1 })
       if (!visible) continue
       if (await locatorIsEditable(visible)) {
-        writeCachedLocator(cache, 'editable', fieldLabel, exact, fieldId, visible)
+        writeCachedLocator(cache, 'editable', fieldLabel, exact, fieldId, undefined, visible)
         return visible
       }
     }
@@ -3235,7 +3315,7 @@ async function findLabeledEditableField(
         const visible = await firstVisible(candidate, { minWidth: 1, minHeight: 1 })
         if (!visible) continue
         if (await locatorIsEditable(visible)) {
-          writeCachedLocator(cache, 'editable', fieldLabel, exact, fieldId, visible)
+          writeCachedLocator(cache, 'editable', fieldLabel, exact, fieldId, undefined, visible)
           return visible
         }
       }
@@ -3243,7 +3323,7 @@ async function findLabeledEditableField(
 
     const fallback = await findLabeledControl(frame, fieldLabel, exact)
     if (fallback && await locatorIsEditable(fallback)) {
-      writeCachedLocator(cache, 'editable', fieldLabel, exact, fieldId, fallback)
+      writeCachedLocator(cache, 'editable', fieldLabel, exact, fieldId, undefined, fallback)
       return fallback
     }
   }
@@ -3266,19 +3346,19 @@ async function findLabeledEditableField(
         const visible = await firstVisible(candidate, { minWidth: 1, minHeight: 1 })
         if (!visible) continue
         if (await locatorIsEditable(visible)) {
-          writeCachedLocator(cache, 'editable', fieldLabel, exact, fieldId, visible)
+          writeCachedLocator(cache, 'editable', fieldLabel, exact, fieldId, undefined, visible)
           return visible
         }
       }
       const fallback = await findLabeledControl(frame, stripped, exact)
       if (fallback && await locatorIsEditable(fallback)) {
-        writeCachedLocator(cache, 'editable', fieldLabel, exact, fieldId, fallback)
+        writeCachedLocator(cache, 'editable', fieldLabel, exact, fieldId, undefined, fallback)
         return fallback
       }
     }
   }
 
-  writeCachedLocator(cache, 'editable', fieldLabel, exact, fieldId, null)
+  writeCachedLocator(cache, 'editable', fieldLabel, exact, fieldId, undefined, null)
   return null
 }
 
@@ -3451,6 +3531,10 @@ async function attemptNativeBatchFill(page: Page, fields: FormFieldFill[]): Prom
     for (let index = 0; index < fields.length; index++) {
       if (results[index]) continue
       const field = fields[index]!
+      // Authored field keys are global, exact identities. The per-frame
+      // native batch path only knows labels, so let the normal resolvers scan
+      // all frames before committing a keyed action.
+      if (field.fieldKey) continue
       if (field.kind === 'file') continue
       if (field.kind === 'auto') {
         pending.push({
@@ -3490,6 +3574,10 @@ async function attemptNativeBatchFill(page: Page, fields: FormFieldFill[]): Prom
         continue
       }
       if (field.kind === 'choice') {
+        // An option index is an exact schema identity. The label-only native
+        // batch path cannot preserve or validate it, so route this field
+        // through setFieldChoice below.
+        if (field.optionIndex !== undefined) continue
         pending.push({
           index,
           kind: 'choice',
@@ -3500,14 +3588,9 @@ async function attemptNativeBatchFill(page: Page, fields: FormFieldFill[]): Prom
         })
         continue
       }
-      pending.push({
-        index,
-        kind: 'toggle',
-        label: field.label,
-        checked: field.checked ?? true,
-        exact: field.exact ?? false,
-        controlType: field.controlType ?? null,
-      })
+      // Toggle resolution must collect every candidate before committing so
+      // duplicate labels are rejected instead of silently selecting the first.
+      continue
     }
 
     if (pending.length === 0) break
@@ -4433,6 +4516,7 @@ export async function setFieldText(
     exact?: boolean
     cache?: FillLookupCache
     fieldId?: string
+    fieldKey?: string
     /** Delay between keystrokes when using keyboard typing fallback (masked inputs). */
     typingDelayMs?: number
     /** Composition events before assignment; small default key delay when typing. */
@@ -4447,7 +4531,7 @@ export async function setFieldText(
   // from fillOtp propagates out of setFieldText unchanged: silent fallback
   // to the plain text-fill path would write the whole string into box 0
   // and pretend success, which is the bug we're fixing.
-  if (labelLooksLikeOtp(fieldLabel) && /^\S{4,}$/.test(value)) {
+  if (!opts?.fieldKey && labelLooksLikeOtp(fieldLabel) && /^\S{4,}$/.test(value)) {
     const group = await findOtpBoxGroup(page, fieldLabel, value.length)
     if (group) {
       await fillOtp(page, value, { fieldLabel })
@@ -4456,7 +4540,7 @@ export async function setFieldText(
   }
 
   const exact = opts?.exact ?? false
-  const locator = await findLabeledEditableField(page, fieldLabel, exact, opts?.cache, opts?.fieldId)
+  const locator = await findLabeledEditableField(page, fieldLabel, exact, opts?.cache, opts?.fieldId, opts?.fieldKey)
   if (!locator) {
     throw new Error(`setFieldText: no visible editable field matching "${fieldLabel}"`)
   }
@@ -4489,28 +4573,44 @@ export async function setFieldText(
   throw new Error(`setFieldText: set "${fieldLabel}" but could not confirm value ${JSON.stringify(value)}`)
 }
 
-async function setNativeSelectByLabel(locator: Locator, value: string, exact: boolean): Promise<boolean> {
+async function setNativeSelectByLabel(
+  locator: Locator,
+  value: string,
+  exact: boolean,
+  optionIndex?: number,
+): Promise<boolean> {
   try {
     return await locator.evaluate((el, payload) => {
       if (!(el instanceof HTMLSelectElement)) return false
       const normalize = (input: string | undefined | null) => input?.replace(/\s+/g, ' ').trim().toLowerCase() ?? ''
       const expected = normalize(payload.value)
-      if (!expected) return false
+      const enabled = (candidate: HTMLOptionElement): boolean =>
+        !candidate.disabled && !(candidate.parentElement instanceof HTMLOptGroupElement && candidate.parentElement.disabled)
 
-      const option = Array.from(el.options).find((candidate) => {
-        if (candidate.disabled) return false
-        const label = normalize(candidate.textContent)
-        const rawValue = normalize(candidate.value)
-        if (payload.exact) return label === expected || rawValue === expected
-        return label.includes(expected) || rawValue.includes(expected)
-      })
+      let option: HTMLOptionElement | undefined
+      if (payload.optionIndex !== undefined) {
+        const indexed = el.options.item(payload.optionIndex) ?? undefined
+        if (!indexed || !enabled(indexed) || indexed.value !== payload.value) return false
+        option = indexed
+      } else {
+        const options = Array.from(el.options).filter(enabled)
+        // Values are the submitted identity and take precedence over labels.
+        // This prevents an earlier option whose label happens to equal a
+        // different option's value from being selected silently.
+        option = options.find(candidate => normalize(candidate.value) === expected)
+        if (!option) option = options.find(candidate => normalize(candidate.textContent) === expected)
+        if (!option && !payload.exact && expected) {
+          option = options.find(candidate => normalize(candidate.value).includes(expected))
+            ?? options.find(candidate => normalize(candidate.textContent).includes(expected))
+        }
+      }
 
       if (!option) return false
-      el.value = option.value
+      el.selectedIndex = option.index
       el.dispatchEvent(new Event('input', { bubbles: true }))
       el.dispatchEvent(new Event('change', { bubbles: true }))
       return true
-    }, { value, exact })
+    }, { value, exact, optionIndex })
   } catch {
     return false
   }
@@ -4770,26 +4870,35 @@ export async function setAutoFieldValue(
   page: Page,
   fieldLabel: string,
   value: string | boolean,
-  opts?: { exact?: boolean; cache?: FillLookupCache; fieldId?: string },
+  opts?: { exact?: boolean; cache?: FillLookupCache; fieldId?: string; fieldKey?: string },
 ): Promise<void> {
   const exact = opts?.exact ?? false
 
   if (typeof value === 'boolean') {
+    if (opts?.fieldKey) {
+      await setCheckedControl(page, fieldLabel, { fieldKey: opts.fieldKey, checked: value, exact })
+      return
+    }
     if (await chooseValueFromLabeledGroup(page, fieldLabel, value ? 'Yes' : 'No', exact)) return
-    await setCheckedControl(page, fieldLabel, { checked: value, exact })
+    await setCheckedControl(page, fieldLabel, { fieldKey: opts?.fieldKey, checked: value, exact })
     return
   }
 
-  if (prefersGroupedChoiceValue(value) && await chooseValueFromLabeledGroup(page, fieldLabel, value, exact)) {
+  if (!opts?.fieldKey && prefersGroupedChoiceValue(value) && await chooseValueFromLabeledGroup(page, fieldLabel, value, exact)) {
     return
   }
 
-  const locator = await findLabeledControlInPage(page, fieldLabel, exact, { cache: opts?.cache, fieldId: opts?.fieldId })
+  const locator = await findLabeledControlInPage(page, fieldLabel, exact, {
+    cache: opts?.cache,
+    fieldId: opts?.fieldId,
+    fieldKey: opts?.fieldKey,
+  })
   if (locator) {
     const kind = await autoFieldLocatorKind(locator)
     if (kind === 'select') {
       await setFieldChoice(page, fieldLabel, value, {
         fieldId: opts?.fieldId,
+        fieldKey: opts?.fieldKey,
         exact,
         choiceType: 'select',
         cache: opts?.cache,
@@ -4799,6 +4908,7 @@ export async function setAutoFieldValue(
     if (kind === 'text') {
       await setFieldText(page, fieldLabel, value, {
         fieldId: opts?.fieldId,
+        fieldKey: opts?.fieldKey,
         exact,
         cache: opts?.cache,
       })
@@ -4807,6 +4917,7 @@ export async function setAutoFieldValue(
     if (kind === 'choice') {
       await setFieldChoice(page, fieldLabel, value, {
         fieldId: opts?.fieldId,
+        fieldKey: opts?.fieldKey,
         exact,
         cache: opts?.cache,
       })
@@ -4814,11 +4925,16 @@ export async function setAutoFieldValue(
     }
   }
 
+  if (opts?.fieldKey) {
+    throw new Error(`fieldKey "${opts.fieldKey}" resolved to an unsupported control for field "${fieldLabel}"`)
+  }
+
   if (await chooseValueFromLabeledGroup(page, fieldLabel, value, exact)) return
 
   try {
     await setFieldText(page, fieldLabel, value, {
       fieldId: opts?.fieldId,
+      fieldKey: opts?.fieldKey,
       exact,
       cache: opts?.cache,
     })
@@ -4826,6 +4942,7 @@ export async function setAutoFieldValue(
   } catch {
     await setFieldChoice(page, fieldLabel, value, {
       fieldId: opts?.fieldId,
+      fieldKey: opts?.fieldKey,
       exact,
       cache: opts?.cache,
     })
@@ -4836,15 +4953,24 @@ export async function setFieldChoice(
   page: Page,
   fieldLabel: string,
   value: string,
-  opts?: { exact?: boolean; query?: string; choiceType?: ClientChoiceType; cache?: FillLookupCache; fieldId?: string },
+  opts?: { exact?: boolean; optionIndex?: number; query?: string; choiceType?: ClientChoiceType; cache?: FillLookupCache; fieldId?: string; fieldKey?: string },
 ): Promise<void> {
   const exact = opts?.exact ?? false
 
-  const locator = await findLabeledControlInPage(page, fieldLabel, exact, { cache: opts?.cache, fieldId: opts?.fieldId })
+  const locator = await findLabeledControlInPage(page, fieldLabel, exact, {
+    cache: opts?.cache,
+    fieldId: opts?.fieldId,
+    fieldKey: opts?.fieldKey,
+  })
   if (locator) {
     await locator.scrollIntoViewIfNeeded()
     const isNativeSelect = await locator.evaluate(el => el instanceof HTMLSelectElement)
-    if (await setNativeSelectByLabel(locator, value, exact)) {
+    if (await setNativeSelectByLabel(locator, value, exact, opts?.optionIndex)) {
+      if (opts?.optionIndex !== undefined) {
+        const selectedIndex = await locator.evaluate(el => el instanceof HTMLSelectElement ? el.selectedIndex : -1)
+        if (selectedIndex === opts.optionIndex) return
+        throw new Error(`setFieldChoice: selected native option index ${opts.optionIndex} for field "${fieldLabel}" but could not confirm it`)
+      }
       const displayed = await locatorDisplayedValues(locator)
       if (displayed.some(candidate => displayedValueMatchesSelection(candidate, value, exact))) return
       throw new Error(`setFieldChoice: selected "${value}" for field "${fieldLabel}" but could not confirm it`)
@@ -4865,6 +4991,7 @@ export async function setFieldChoice(
   try {
     await pickListboxOption(page, value, {
       fieldId: opts?.fieldId,
+      fieldKey: opts?.fieldKey,
       fieldLabel,
       exact,
       query: opts?.query,
@@ -4913,6 +5040,7 @@ export async function fillFields(page: Page, fields: FormFieldFill[], cache = cr
     const results = await Promise.allSettled(textFills.map(({ field }) =>
       setFieldText(page, field.fieldLabel, field.value, {
         fieldId: field.fieldId,
+        fieldKey: field.fieldKey,
         exact: field.exact,
         cache,
         typingDelayMs: field.typingDelayMs,
@@ -4946,6 +5074,7 @@ export async function fillFields(page: Page, fields: FormFieldFill[], cache = cr
       if (field.kind === 'auto') {
         await setAutoFieldValue(page, field.fieldLabel, field.value, {
           fieldId: field.fieldId,
+          fieldKey: field.fieldKey,
           exact: field.exact,
           cache,
         })
@@ -4954,7 +5083,9 @@ export async function fillFields(page: Page, fields: FormFieldFill[], cache = cr
       if (field.kind === 'choice') {
         await setFieldChoice(page, field.fieldLabel, field.value, {
           fieldId: field.fieldId,
+          fieldKey: field.fieldKey,
           exact: field.exact,
+          optionIndex: field.optionIndex,
           query: field.query,
           choiceType: field.choiceType,
           cache,
@@ -4963,14 +5094,23 @@ export async function fillFields(page: Page, fields: FormFieldFill[], cache = cr
       }
       if (field.kind === 'toggle') {
         await setCheckedControl(page, field.label, {
+          fieldKey: field.fieldKey,
           checked: field.checked,
           exact: field.exact,
           controlType: field.controlType,
+          contextText: field.contextText,
+          sectionText: field.sectionText,
         })
         continue
       }
       if (field.kind === 'file') {
-        await attachFiles(page, field.paths, { fieldId: field.fieldId, fieldLabel: field.fieldLabel, exact: field.exact, cache })
+        await attachFiles(page, field.paths, {
+          fieldId: field.fieldId,
+          fieldKey: field.fieldKey,
+          fieldLabel: field.fieldLabel,
+          exact: field.exact,
+          cache,
+        })
       }
     } catch (e) {
       otherFillFailures.push({
@@ -5020,7 +5160,7 @@ export async function selectNativeOption(page: Page, x: number, y: number, opt: 
           o: HTMLOptionElement,
           expected: string,
         ): boolean => {
-          if (o.disabled) return false
+          if (o.disabled || (o.parentElement instanceof HTMLOptGroupElement && o.parentElement.disabled)) return false
           const label = normalize(o.textContent)
           const rawValue = normalize(o.value)
           return label === expected || rawValue === expected || label.includes(expected) || rawValue.includes(expected)
@@ -5032,7 +5172,10 @@ export async function selectNativeOption(page: Page, x: number, y: number, opt: 
         if (typeof payload.index === 'number' && Number.isFinite(payload.index)) {
           const i = Math.trunc(payload.index)
           if (i < 0 || i >= sel.options.length) return false
-          if (sel.options[i]!.disabled) return false
+          const indexed = sel.options[i]!
+          if (indexed.disabled || (indexed.parentElement instanceof HTMLOptGroupElement && indexed.parentElement.disabled)) return false
+          if (payload.value !== null && normalize(indexed.value) !== normalize(payload.value)) return false
+          if (payload.label !== null && !normalize(indexed.textContent).includes(normalize(payload.label))) return false
           sel.selectedIndex = i
         } else if (payload.value !== null && payload.value !== undefined) {
           const raw = String(payload.value)
@@ -5043,6 +5186,7 @@ export async function selectNativeOption(page: Page, x: number, y: number, opt: 
           const ok =
             selected &&
             !selected.disabled &&
+            !(selected.parentElement instanceof HTMLOptGroupElement && selected.parentElement.disabled) &&
             (normalize(selected.value) === expected ||
               normalize(selected.textContent) === expected ||
               normalize(selected.value).includes(expected) ||
@@ -5050,14 +5194,14 @@ export async function selectNativeOption(page: Page, x: number, y: number, opt: 
           if (!ok) {
             const found = Array.from(sel.options).find(o => optionMatchesExpected(o, expected))
             if (!found) return false
-            sel.value = found.value
+            sel.selectedIndex = found.index
           }
         } else if (payload.label !== null && payload.label !== undefined) {
           const expected = normalize(payload.label)
           if (!expected) return false
           const optEl = Array.from(sel.options).find(o => optionMatchesExpected(o, expected))
           if (!optEl) return false
-          sel.value = optEl.value
+          sel.selectedIndex = optEl.index
         } else {
           return false
         }
@@ -5084,7 +5228,7 @@ export async function selectNativeOption(page: Page, x: number, y: number, opt: 
 export async function pickListboxOption(
   page: Page,
   label: string,
-  opts?: { exact?: boolean; openX?: number; openY?: number; fieldId?: string; fieldLabel?: string; query?: string; cache?: FillLookupCache },
+  opts?: { exact?: boolean; openX?: number; openY?: number; fieldId?: string; fieldKey?: string; fieldLabel?: string; query?: string; cache?: FillLookupCache },
 ): Promise<void> {
   let anchor: AnchorPoint | undefined
   const exact = opts?.exact ?? false
@@ -5114,7 +5258,7 @@ export async function pickListboxOption(
   if (opts?.fieldLabel) {
     let opened
     try {
-      opened = await openDropdownControl(page, opts.fieldLabel, exact, opts.cache, opts.fieldId)
+      opened = await openDropdownControl(page, opts.fieldLabel, exact, opts.cache, opts.fieldId, opts.fieldKey)
     } catch {
       throw new Error(listboxErrorMessage({
         reason: 'field_not_found',
@@ -5146,15 +5290,12 @@ export async function pickListboxOption(
     selectedOptionText = (await clickVisibleOptionCandidate(page, label, exact, anchor, popupScope)) ?? undefined
     if (!selectedOptionText) return false
     attemptedSelection = true
-    // Force-commit for searchable/autocomplete comboboxes (React Select,
-    // Headless UI, Radix, Ant Design, etc.). Some library versions — most
-    // notably Greenhouse's Remix-wrapped react-select — visually select the
-    // option on synthetic mouse click but never invoke `onChange`, leaving
-    // the controlled form state empty. Dispatching a keyboard `Enter` on
-    // the focused combobox input puts the selection through the keyboard
-    // commit path, which ALL tested libraries honor. No-op for native
-    // <select> / plain ARIA listboxes — see isAutocompleteCombobox.
-    await pressEnterToCommitListbox(page, openedHandle)
+    // Do not press Enter after a successful pointer selection. Both
+    // react-select and non-editable Radix triggers can interpret Enter on
+    // the now-closed control as "open again", leaving several adjacent
+    // dropdowns expanded and making later shared-label picks hit the wrong
+    // popup. If the pointer click did not commit, the keyboard fallback
+    // below deliberately reopens this exact control and selects by Enter.
     await dispatchListboxCommitEvents(openedHandle)
     if (
       !opts?.fieldLabel ||
@@ -5305,9 +5446,201 @@ export async function pickListboxOption(
 }
 
 export interface SetCheckedPayload {
+  fieldKey?: string
   checked?: boolean
   exact?: boolean
   controlType?: 'checkbox' | 'radio'
+  contextText?: string
+  sectionText?: string
+}
+
+type ToggleMatch = {
+  locator: Locator
+  kind: 'checkbox' | 'radio'
+  name: string
+  exactLabel: boolean
+  contextText: string
+  sectionText: string
+  frameUrl: string
+}
+
+async function applyToggleState(
+  locator: Locator,
+  desiredChecked: boolean,
+): Promise<{ success: boolean; reason?: 'radio-uncheck'; kind: 'checkbox' | 'radio'; name: string; before: boolean; after: boolean }> {
+  return await locator.evaluate((target, checked) => {
+    function referencedText(ids: string | null, visited?: Set<string>): string | undefined {
+      if (!ids) return undefined
+      const seen = visited ?? new Set<string>()
+      const text = ids.split(/\s+/).map(id => {
+        if (seen.has(id)) return ''
+        seen.add(id)
+        const node = document.getElementById(id)
+        if (!node) return ''
+        return referencedText(node.getAttribute('aria-labelledby'), seen) ?? node.textContent?.trim() ?? ''
+      }).filter(Boolean).join(' ').trim()
+      return text || undefined
+    }
+    function kindOf(el: Element): 'checkbox' | 'radio' {
+      if (el instanceof HTMLInputElement && el.type === 'radio') return 'radio'
+      return el.getAttribute('role') === 'radio' ? 'radio' : 'checkbox'
+    }
+    function nameOf(el: Element): string {
+      const aria = el.getAttribute('aria-label')?.trim()
+      if (aria) return aria
+      const labelledBy = referencedText(el.getAttribute('aria-labelledby'))
+      if (labelledBy) return labelledBy
+      if (el instanceof HTMLInputElement) {
+        const labelText = Array.from(el.labels ?? []).map(label => label.textContent?.trim()).find(Boolean)
+        if (labelText) return labelText
+      }
+      return el.textContent?.trim() || '<unnamed>'
+    }
+    function readChecked(el: Element): boolean {
+      return el instanceof HTMLInputElement ? el.checked : el.getAttribute('aria-checked') === 'true'
+    }
+    function dispatch(el: HTMLElement): void {
+      el.dispatchEvent(new Event('input', { bubbles: true }))
+      el.dispatchEvent(new Event('change', { bubbles: true }))
+    }
+    function setInputCheckedReactAware(input: HTMLInputElement, next: boolean): void {
+      const tracker = (input as unknown as { _valueTracker?: { setValue: (value: string) => void } })._valueTracker
+      if (tracker && typeof tracker.setValue === 'function') {
+        try { tracker.setValue(String(!next)) } catch { /* ignore */ }
+      }
+      const descriptor = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'checked')
+      if (descriptor?.set) descriptor.set.call(input, next)
+      else input.checked = next
+      dispatch(input)
+    }
+
+    const kind = kindOf(target)
+    const name = nameOf(target)
+    const before = readChecked(target)
+    if (kind === 'radio' && checked === false) {
+      return { success: before === false, reason: 'radio-uncheck' as const, kind, name, before, after: before }
+    }
+    if (before !== checked) {
+      if (target instanceof HTMLInputElement) {
+        setInputCheckedReactAware(target, checked)
+      } else if (target instanceof HTMLElement) {
+        target.click()
+      }
+    }
+    const after = readChecked(target)
+    return { success: after === checked, kind, name, before, after }
+  }, desiredChecked)
+}
+
+async function collectToggleMatches(
+  page: Page,
+  label: string,
+  exact: boolean,
+  controlType: 'checkbox' | 'radio' | undefined,
+  contextText: string | undefined,
+  sectionText: string | undefined,
+): Promise<ToggleMatch[]> {
+  const matches: ToggleMatch[] = []
+  for (const frame of page.frames()) {
+    const candidates = frame.locator(TOGGLE_CONTROL_SELECTOR)
+    const metadata = await candidates.evaluateAll((elements, payload) => {
+      function normalize(value: string | null | undefined): string {
+        return (value ?? '').replace(/\s+/g, ' ').trim().toLowerCase()
+      }
+      function visible(el: Element): el is HTMLElement {
+        if (!(el instanceof HTMLElement)) return false
+        const rect = el.getBoundingClientRect()
+        const style = getComputedStyle(el)
+        return rect.width > 0 && rect.height > 0 && style.display !== 'none' && style.visibility !== 'hidden'
+      }
+      function referencedText(ids: string | null, visited?: Set<string>): string | undefined {
+        if (!ids) return undefined
+        const seen = visited ?? new Set<string>()
+        const text = ids.split(/\s+/).map(id => {
+          if (seen.has(id)) return ''
+          seen.add(id)
+          const node = document.getElementById(id)
+          if (!node) return ''
+          return referencedText(node.getAttribute('aria-labelledby'), seen) ?? node.textContent?.trim() ?? ''
+        }).filter(Boolean).join(' ').trim()
+        return text || undefined
+      }
+      function kindOf(el: Element): 'checkbox' | 'radio' | undefined {
+        if (el instanceof HTMLInputElement) {
+          if (el.type === 'checkbox') return 'checkbox'
+          if (el.type === 'radio') return 'radio'
+          return undefined
+        }
+        const role = el.getAttribute('role')
+        if (role === 'radio') return 'radio'
+        if (role === 'checkbox' || role === 'switch') return 'checkbox'
+        return undefined
+      }
+      function nameOf(el: Element): string | undefined {
+        const aria = el.getAttribute('aria-label')?.trim()
+        if (aria) return aria
+        const labelledBy = referencedText(el.getAttribute('aria-labelledby'))
+        if (labelledBy) return labelledBy
+        if (el instanceof HTMLInputElement) {
+          const labelText = Array.from(el.labels ?? []).map(label => label.textContent?.trim()).find(Boolean)
+          if (labelText) return labelText
+          const name = el.getAttribute('name')?.trim()
+          if (name && /[A-Za-z]/.test(name) && /[\s,./()_-]/.test(name)) return name
+        }
+        return el.textContent?.trim() || undefined
+      }
+      function nearestContext(el: Element, name: string): string {
+        const normalizedName = normalize(name)
+        let current = el.parentElement
+        for (let depth = 0; current && depth < 6; depth++, current = current.parentElement) {
+          if (current === document.body || current === document.documentElement) break
+          const text = (current.innerText || current.textContent || '').replace(/\s+/g, ' ').trim()
+          if (text && normalize(text) !== normalizedName) return text
+        }
+        return ''
+      }
+      function nearestSection(el: Element): string {
+        const section = el.closest('fieldset, section, form, dialog, [role="group"], [role="radiogroup"], [role="region"], [role="dialog"]')
+        if (!(section instanceof HTMLElement)) return ''
+        const explicit = section.getAttribute('aria-label')?.trim() ||
+          referencedText(section.getAttribute('aria-labelledby')) ||
+          section.querySelector('legend, h1, h2, h3, h4, h5, h6')?.textContent?.trim()
+        return (explicit || section.innerText || section.textContent || '').replace(/\s+/g, ' ').trim()
+      }
+
+      const needle = normalize(payload.label)
+      const contextNeedle = normalize(payload.contextText)
+      const sectionNeedle = normalize(payload.sectionText)
+      const result: Array<{ index: number; kind: 'checkbox' | 'radio'; name: string; exactLabel: boolean; contextText: string; sectionText: string }> = []
+      for (let index = 0; index < elements.length; index++) {
+        const element = elements[index]
+        if (!element) continue
+        if (!visible(element)) continue
+        const kind = kindOf(element)
+        if (!kind || (payload.controlType && kind !== payload.controlType)) continue
+        const name = nameOf(element)
+        if (!name) continue
+        const normalizedName = normalize(name)
+        const exactLabel = normalizedName === needle
+        if (payload.exact ? !exactLabel : !normalizedName.includes(needle)) continue
+        const context = nearestContext(element, name)
+        const section = nearestSection(element)
+        if (contextNeedle && !normalize(context).includes(contextNeedle)) continue
+        if (sectionNeedle && !normalize(section).includes(sectionNeedle)) continue
+        result.push({ index, kind, name, exactLabel, contextText: context, sectionText: section })
+      }
+      return result
+    }, { label, exact, controlType: controlType ?? null, contextText: contextText ?? '', sectionText: sectionText ?? '' })
+
+    for (const candidate of metadata) {
+      matches.push({ ...candidate, locator: candidates.nth(candidate.index), frameUrl: frame.url() })
+    }
+  }
+  if (!exact) {
+    const exactMatches = matches.filter(match => match.exactLabel)
+    if (exactMatches.length > 0) return exactMatches
+  }
+  return matches
 }
 
 /**
@@ -5315,174 +5648,48 @@ export interface SetCheckedPayload {
  * Helps custom form UIs that keep the real control opacity-hidden but still interactive.
  */
 export async function setCheckedControl(page: Page, label: string, opts?: SetCheckedPayload): Promise<void> {
+  if (!label || label !== label.trim()) {
+    throw new Error('setChecked: label must be a trimmed, non-empty string')
+  }
+  if (opts?.contextText !== undefined && (!opts.contextText || opts.contextText !== opts.contextText.trim())) {
+    throw new Error('setChecked: contextText must be a trimmed, non-empty string when provided')
+  }
+  if (opts?.sectionText !== undefined && (!opts.sectionText || opts.sectionText !== opts.sectionText.trim())) {
+    throw new Error('setChecked: sectionText must be a trimmed, non-empty string when provided')
+  }
   const exact = opts?.exact ?? false
   const desiredChecked = opts?.checked ?? true
   const controlType = opts?.controlType
 
-  for (const frame of page.frames()) {
-    const result = await frame.evaluate(
-      (payload: { label: string; exact: boolean; checked: boolean; controlType: 'checkbox' | 'radio' | null }) => {
-        function normalize(value: string): string {
-          return value.replace(/\s+/g, ' ').trim().toLowerCase()
-        }
-
-        function matchesLabel(candidate: string | undefined): boolean {
-          if (!candidate) return false
-          const normalizedCandidate = normalize(candidate)
-          const normalizedNeedle = normalize(payload.label)
-          return payload.exact ? normalizedCandidate === normalizedNeedle : normalizedCandidate.includes(normalizedNeedle)
-        }
-
-        function visible(el: HTMLElement): boolean {
-          const rect = el.getBoundingClientRect()
-          if (rect.width <= 0 || rect.height <= 0) return false
-          const style = getComputedStyle(el)
-          return style.display !== 'none' && style.visibility !== 'hidden'
-        }
-
-        function referencedText(ids: string | null, visited?: Set<string>): string | undefined {
-          if (!ids) return undefined
-          const seen = visited ?? new Set<string>()
-          const text = ids
-            .split(/\s+/)
-            .map(id => {
-              if (seen.has(id)) return ''
-              seen.add(id)
-              const target = document.getElementById(id)
-              if (!target) return ''
-              const chained = target.getAttribute('aria-labelledby')
-              if (chained) return referencedText(chained, seen) ?? ''
-              return target.textContent?.trim() ?? ''
-            })
-            .filter(Boolean)
-            .join(' ')
-            .trim()
-          return text || undefined
-        }
-
-        function controlKind(el: Element): 'checkbox' | 'radio' | undefined {
-          if (el instanceof HTMLInputElement) {
-            if (el.type === 'checkbox') return 'checkbox'
-            if (el.type === 'radio') return 'radio'
-            return undefined
-          }
-          const role = el.getAttribute('role')
-          if (role === 'switch' || role === 'checkbox') return 'checkbox'
-          if (role === 'radio') return 'radio'
-          return undefined
-        }
-
-        function controlName(el: Element): string | undefined {
-          const aria = el.getAttribute('aria-label')?.trim()
-          if (aria) return aria
-          const labelledBy = referencedText(el.getAttribute('aria-labelledby'))
-          if (labelledBy) return labelledBy
-          if (el instanceof HTMLInputElement) {
-            const labels = el.labels ? Array.from(el.labels) : []
-            for (const labelEl of labels) {
-              const text = labelEl.textContent?.trim()
-              if (text) return text
-            }
-            const nameAttr = el.getAttribute('name')?.trim()
-            if (nameAttr && /[A-Za-z]/.test(nameAttr) && /[\s,./()_-]/.test(nameAttr)) return nameAttr
-          }
-          const text = el.textContent?.trim()
-          return text || undefined
-        }
-
-        function readChecked(el: Element): boolean {
-          if (el instanceof HTMLInputElement) return !!el.checked
-          return el.getAttribute('aria-checked') === 'true'
-        }
-
-        function clickTarget(el: Element): HTMLElement | null {
-          if (el instanceof HTMLInputElement) {
-            const labelEl = el.labels?.[0]
-            if (labelEl instanceof HTMLElement) return labelEl
-          }
-          return el instanceof HTMLElement ? el : null
-        }
-
-        function dispatch(target: HTMLElement): void {
-          target.dispatchEvent(new Event('input', { bubbles: true }))
-          target.dispatchEvent(new Event('change', { bubbles: true }))
-        }
-
-        function clearReactTracker(target: HTMLInputElement, next: boolean): boolean {
-          const tracker = (target as unknown as { _valueTracker?: { setValue: (value: string) => void } })._valueTracker
-          if (tracker && typeof tracker.setValue === 'function') {
-            try {
-              tracker.setValue(String(!next))
-              return true
-            } catch { /* ignore */ }
-          }
-          return false
-        }
-
-        function setInputCheckedReactAware(target: HTMLInputElement, next: boolean): boolean {
-          const hadReactTracker = clearReactTracker(target, next)
-          if (!hadReactTracker && target.checked === next) return true
-          const descriptor = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'checked')
-          if (descriptor?.set) descriptor.set.call(target, next)
-          else target.checked = next
-          dispatch(target)
-          return target.checked === next
-        }
-
-        const selector = 'input[type="checkbox"], input[type="radio"], [role="checkbox"], [role="radio"], [role="switch"]'
-        const candidates = Array.from(document.querySelectorAll(selector)).filter(
-          (el): el is HTMLElement => el instanceof HTMLElement && visible(el),
-        )
-        const target = candidates.find((el) => {
-          const kind = controlKind(el)
-          if (!kind) return false
-          if (payload.controlType && kind !== payload.controlType) return false
-          return matchesLabel(controlName(el))
-        })
-
-        if (!target) {
-          return { matched: false as const }
-        }
-
-        const kind = controlKind(target)!
-        const name = controlName(target) ?? payload.label
-        const before = readChecked(target)
-        if (kind === 'radio' && payload.checked === false) {
-          return { matched: true as const, success: before === false, reason: 'radio-uncheck' as const, kind, name }
-        }
-
-        if (before !== payload.checked && !(target instanceof HTMLInputElement)) {
-          clickTarget(target)?.click()
-        }
-
-        let after = readChecked(target)
-        if (target instanceof HTMLInputElement) {
-          setInputCheckedReactAware(target, payload.checked)
-          after = target.checked
-        }
-
-        return {
-          matched: true as const,
-          success: after === payload.checked,
-          kind,
-          name,
-          before,
-          after,
-        }
-      },
-      { label, exact, checked: desiredChecked, controlType: controlType ?? null },
-    )
-
-    if (!result.matched) continue
-    if (result.success) return
-    if (result.reason === 'radio-uncheck') {
-      throw new Error(`setChecked: radio "${result.name}" cannot be unchecked directly; choose a different option instead`)
+  let target: Locator | null = null
+  if (opts?.fieldKey) {
+    target = await findAuthoredFieldByKeyInPage(page, opts.fieldKey, 'toggle')
+    if (!target) {
+      throw new Error(`setChecked: fieldKey "${opts.fieldKey}" did not resolve to a visible checkbox/radio; refresh geometra_form_schema`)
     }
-    throw new Error(`setChecked: matched ${result.kind} "${result.name}" but could not set it to ${String(desiredChecked)}`)
   }
 
-  const kindLabel = controlType ?? 'checkbox/radio'
-  throw new Error(`setChecked: no visible ${kindLabel} matching "${label}"`)
+  if (!target) {
+    const matches = await collectToggleMatches(page, label, exact, controlType, opts?.contextText, opts?.sectionText)
+    if (matches.length === 0) {
+      const kindLabel = controlType ?? 'checkbox/radio'
+      const context = [opts?.contextText && `context "${opts.contextText}"`, opts?.sectionText && `section "${opts.sectionText}"`]
+        .filter(Boolean).join(' and ')
+      throw new Error(`setChecked: no visible ${kindLabel} matching "${label}"${context ? ` in ${context}` : ''}`)
+    }
+    if (matches.length > 1) {
+      const details = matches.slice(0, 5).map(match => `"${match.name}"${match.frameUrl ? ` in ${match.frameUrl}` : ''}`).join(', ')
+      throw new Error(`setChecked: ambiguous label "${label}" matched ${matches.length} controls (${details}); provide fieldKey, contextText, or sectionText`)
+    }
+    target = matches[0]!.locator
+  }
+
+  const result = await applyToggleState(target, desiredChecked)
+  if (result.success) return
+  if (result.reason === 'radio-uncheck') {
+    throw new Error(`setChecked: radio "${result.name}" cannot be unchecked directly; choose a different option instead`)
+  }
+  throw new Error(`setChecked: matched ${result.kind} "${result.name}" but could not set it to ${String(desiredChecked)}`)
 }
 
 export async function wheelAt(page: Page, deltaX: number, deltaY: number, x?: number, y?: number): Promise<void> {

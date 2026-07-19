@@ -3,7 +3,7 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { afterAll, beforeAll, describe, expect, it } from 'vitest'
 import { chromium, type Browser } from 'playwright'
-import { attachFiles, fillFields, fillOtp, pickListboxOption, setCheckedControl, setFieldChoice, setFieldText, wheelAt } from '../dom-actions.ts'
+import { attachFiles, createFillLookupCache, fillFields, fillOtp, pickListboxOption, selectNativeOption, setCheckedControl, setFieldChoice, setFieldText, wheelAt } from '../dom-actions.ts'
 
 describe('pickListboxOption', () => {
   let browser: Browser
@@ -731,7 +731,63 @@ describe('pickListboxOption', () => {
     await page.close()
   }, 60_000)
 
-  it('commits a React-Select/Greenhouse-Remix combobox that only honors keyboard Enter after the option click', async () => {
+  it('does not press Enter after selecting from a non-editable Radix-style combobox trigger', async () => {
+    const page = await browser.newPage({ viewport: { width: 900, height: 700 } })
+    await page.setContent(`
+      <label for="prior-employment">Have you previously worked for this company?</label>
+      <button
+        id="prior-employment"
+        type="button"
+        role="combobox"
+        aria-expanded="false"
+        aria-controls="prior-options"
+        aria-label="Have you previously worked for this company?"
+      >
+        <span id="prior-value">Select...</span><span aria-hidden="true">▾</span>
+      </button>
+      <div id="prior-options" role="listbox" hidden>
+        <div role="option" data-value="Yes">Yes</div>
+        <div role="option" data-value="No">No</div>
+      </div>
+      <script>
+        const trigger = document.getElementById('prior-employment')
+        const value = document.getElementById('prior-value')
+        const popup = document.getElementById('prior-options')
+        window.radixEnterCount = 0
+        trigger.addEventListener('click', () => {
+          popup.hidden = false
+          trigger.setAttribute('aria-expanded', 'true')
+        })
+        trigger.addEventListener('keydown', event => {
+          if (event.key !== 'Enter') return
+          window.radixEnterCount += 1
+          // Models the damaging path: Enter on a closed non-editable trigger
+          // reopens it and commits the first highlighted item.
+          if (popup.hidden) value.textContent = 'Yes'
+        })
+        for (const option of popup.querySelectorAll('[role="option"]')) {
+          option.addEventListener('click', () => {
+            value.textContent = option.dataset.value
+            popup.hidden = true
+            trigger.setAttribute('aria-expanded', 'false')
+            trigger.focus()
+          })
+        }
+      </script>
+    `)
+
+    await pickListboxOption(page, 'No', {
+      fieldKey: 'id:prior-employment',
+      fieldLabel: 'Have you previously worked for this company?',
+      exact: false,
+    })
+
+    expect(await page.locator('#prior-value').textContent()).toBe('No')
+    expect(await page.evaluate(() => (window as unknown as { radixEnterCount: number }).radixEnterCount)).toBe(0)
+    await page.close()
+  })
+
+  it('falls back to keyboard Enter when a React-Select-style option click does not commit', async () => {
     // Regression: Greenhouse's Remix-wrapped react-select build (used by
     // Anthropic, Intercom, Glean, Databricks, GitLab, etc.) has a silent-
     // fill shape that none of the existing checks catch: the option click
@@ -894,8 +950,9 @@ describe('pickListboxOption', () => {
           })
         }
 
-        // Keyboard commit path — real commit. pressEnterToCommitListbox
-        // must route through here for the fix to work.
+        // Keyboard commit path — real commit. The fallback must reopen this
+        // exact field and route through here after rejecting the click-only
+        // visual update.
         input.addEventListener('keydown', (event) => {
           if (event.key === 'Enter') {
             event.preventDefault()
@@ -1380,6 +1437,28 @@ describe('attachFiles', () => {
       await page.close()
     }
   })
+
+  it('prefers an authored fieldKey over duplicate file labels', async () => {
+    const page = await browser.newPage({ viewport: { width: 900, height: 700 } })
+    const tempFile = join(tmpdir(), `geometra-upload-key-${Date.now()}.txt`)
+    await writeFile(tempFile, 'cover letter')
+    await page.setContent(`
+      <label for="first-upload">Application document</label><input id="first-upload" type="file" />
+      <label for="cover:upload">Application document</label><input id="cover:upload" type="file" />
+    `)
+
+    try {
+      await attachFiles(page, [tempFile], {
+        fieldLabel: 'Application document',
+        fieldKey: `id:${encodeURIComponent('cover:upload')}`,
+      })
+      expect(await page.locator('#first-upload').evaluate((el: HTMLInputElement) => el.files?.length ?? 0)).toBe(0)
+      expect(await page.locator('[id="cover:upload"]').evaluate((el: HTMLInputElement) => el.files?.length ?? 0)).toBe(1)
+    } finally {
+      await rm(tempFile, { force: true })
+      await page.close()
+    }
+  })
 })
 
 describe('setFieldText', () => {
@@ -1448,6 +1527,37 @@ describe('setFieldText', () => {
     await setFieldText(page, 'Username', 'standard_user')
 
     expect(await page.locator('#username').inputValue()).toBe('standard_user')
+    await page.close()
+  })
+
+  it('prefers an authored name fieldKey over duplicate labels', async () => {
+    const page = await browser.newPage({ viewport: { width: 900, height: 700 } })
+    await page.setContent(`
+      <label>Full name <input id="first-name" name="first" /></label>
+      <label>Full name <input id="target-name" name="applicant:target" /></label>
+    `)
+
+    await setFieldText(page, 'Full name', 'Taylor Applicant', {
+      fieldKey: `name:input:default:${encodeURIComponent('applicant:target')}`,
+    })
+
+    expect(await page.locator('#first-name').inputValue()).toBe('')
+    expect(await page.locator('#target-name').inputValue()).toBe('Taylor Applicant')
+    await page.close()
+  })
+
+  it('does not retain a negative field lookup across a reactive render', async () => {
+    const page = await browser.newPage({ viewport: { width: 900, height: 700 } })
+    const cache = createFillLookupCache()
+    await page.setContent('<main id="root"></main>')
+
+    await expect(setFieldText(page, 'Email', 'first@example.com', { cache })).rejects.toThrow('no visible editable field')
+    await page.locator('#root').evaluate(root => {
+      root.innerHTML = '<label for="email">Email</label><input id="email" />'
+    })
+    await setFieldText(page, 'Email', 'second@example.com', { cache })
+
+    expect(await page.locator('#email').inputValue()).toBe('second@example.com')
     await page.close()
   })
 })
@@ -1527,6 +1637,150 @@ describe('setFieldChoice', () => {
       setFieldChoice(page, 'Will you require sponsorship?', 'Maybe', { choiceType: 'group' }),
     ).rejects.toThrow('no grouped choice matching "Maybe"')
 
+    await page.close()
+  })
+
+  it('prefers an authored fieldKey over duplicate select labels', async () => {
+    const page = await browser.newPage({ viewport: { width: 900, height: 700 } })
+    await page.setContent(`
+      <label>Country <select id="billing-country" name="billing"><option>Canada</option><option>Germany</option></select></label>
+      <label>Country <select id="work-country" name="work:country"><option>Canada</option><option>Germany</option></select></label>
+    `)
+
+    await setFieldChoice(page, 'Country', 'Germany', {
+      fieldKey: `name:select:default:${encodeURIComponent('work:country')}`,
+      choiceType: 'select',
+    })
+
+    expect(await page.locator('#billing-country').inputValue()).toBe('Canada')
+    expect(await page.locator('#work-country').inputValue()).toBe('Germany')
+    await page.close()
+  })
+
+  it('selects the exact native option index when labels and values collide or repeat', async () => {
+    const page = await browser.newPage({ viewport: { width: 900, height: 700 } })
+    await page.setContent(`
+      <label for="office">Office</label>
+      <select id="office">
+        <option value="wrong-value">nyc-alt</option>
+        <option value="nyc-alt">New York primary</option>
+        <option value="nyc-alt">New York alternate</option>
+      </select>
+    `)
+
+    await setFieldChoice(page, 'Office', 'nyc-alt', {
+      fieldKey: 'id:office',
+      choiceType: 'select',
+      exact: true,
+      optionIndex: 2,
+    })
+
+    expect(await page.locator('#office').evaluate(el => (el as HTMLSelectElement).selectedIndex)).toBe(2)
+    expect(await page.locator('#office option').nth(2).evaluate(el => (el as HTMLOptionElement).selected)).toBe(true)
+    await page.close()
+  })
+
+  it('rejects an option index that no longer has the resolved submitted value', async () => {
+    const page = await browser.newPage({ viewport: { width: 900, height: 700 } })
+    await page.setContent(`
+      <label for="office">Office</label>
+      <select id="office">
+        <option value="">Choose an office</option>
+        <option value="la">Los Angeles</option>
+        <option value="nyc-alt">New York alternate</option>
+      </select>
+    `)
+
+    await expect(setFieldChoice(page, 'Office', 'nyc-alt', {
+      fieldKey: 'id:office',
+      choiceType: 'select',
+      exact: true,
+      optionIndex: 1,
+    })).rejects.toThrow('no enabled <option> matching "nyc-alt"')
+
+    expect(await page.locator('#office').evaluate(el => (el as HTMLSelectElement).selectedIndex)).toBe(0)
+    await page.close()
+  })
+
+  it('cross-checks coordinate option indices and rejects disabled optgroups', async () => {
+    const page = await browser.newPage({ viewport: { width: 900, height: 700 } })
+    await page.setContent(`
+      <label for="office">Office</label>
+      <select id="office" style="margin:24px;width:240px;height:40px">
+        <option value="">Choose an office</option>
+        <optgroup label="Closed" disabled>
+          <option value="legacy">Legacy office</option>
+        </optgroup>
+        <option value="nyc">New York</option>
+      </select>
+    `)
+    const box = await page.locator('#office').boundingBox()
+    if (!box) throw new Error('expected select bounds')
+    const x = box.x + box.width / 2
+    const y = box.y + box.height / 2
+
+    await expect(selectNativeOption(page, x, y, { index: 1, value: 'legacy' })).rejects.toThrow('selectOption:')
+    expect(await page.locator('#office').evaluate(el => (el as HTMLSelectElement).selectedIndex)).toBe(0)
+
+    await expect(selectNativeOption(page, x, y, { index: 2, value: 'legacy' })).rejects.toThrow('selectOption:')
+    expect(await page.locator('#office').evaluate(el => (el as HTMLSelectElement).selectedIndex)).toBe(0)
+    await page.close()
+  })
+
+  it('does not reuse a keyed cache entry after DOM reorder or fall back when the key is stale', async () => {
+    const page = await browser.newPage({ viewport: { width: 900, height: 700 } })
+    const cache = createFillLookupCache()
+    await page.setContent(`
+      <main id="root">
+        <label>Country <select id="work-country"><option>Canada</option><option>Germany</option></select></label>
+      </main>
+    `)
+
+    await setFieldChoice(page, 'Country', 'Germany', {
+      fieldKey: 'id:work-country',
+      choiceType: 'select',
+      cache,
+    })
+    await page.locator('#root').evaluate(root => {
+      root.insertAdjacentHTML('afterbegin', '<label>Country <select id="other-country"><option>Canada</option><option>Germany</option></select></label>')
+    })
+    await setFieldChoice(page, 'Country', 'Canada', {
+      fieldKey: 'id:work-country',
+      choiceType: 'select',
+      cache,
+    })
+
+    expect(await page.locator('#work-country').inputValue()).toBe('Canada')
+    expect(await page.locator('#other-country').inputValue()).toBe('Canada')
+
+    await page.locator('#work-country').evaluate(el => el.remove())
+    await expect(setFieldChoice(page, 'Country', 'Germany', {
+      fieldKey: 'id:work-country',
+      choiceType: 'select',
+      cache,
+    })).rejects.toThrow('fieldKey "id:work-country" did not resolve')
+    expect(await page.locator('#other-country').inputValue()).toBe('Canada')
+    await page.close()
+  })
+
+  it('refuses options disabled through their parent optgroup', async () => {
+    const page = await browser.newPage({ viewport: { width: 900, height: 700 } })
+    await page.setContent(`
+      <label for="region">Region</label>
+      <select id="region">
+        <option value="open">Open region</option>
+        <optgroup label="Unavailable" disabled>
+          <option value="closed">Closed region</option>
+        </optgroup>
+      </select>
+    `)
+
+    await expect(setFieldChoice(page, 'Region', 'closed', {
+      fieldKey: 'id:region',
+      choiceType: 'select',
+      exact: true,
+    })).rejects.toThrow('no enabled <option>')
+    expect(await page.locator('#region').inputValue()).toBe('open')
     await page.close()
   })
 })
@@ -1668,6 +1922,49 @@ describe('fillFields auto', () => {
     await page.close()
   })
 
+  it('preserves an exact option index through batched choice filling', async () => {
+    const page = await browser.newPage({ viewport: { width: 900, height: 700 } })
+    await page.setContent(`
+      <label for="office">Office</label>
+      <select id="office">
+        <option value="wrong-value">nyc-alt</option>
+        <option value="nyc-alt">New York primary</option>
+        <option value="nyc-alt">New York alternate</option>
+      </select>
+    `)
+
+    await fillFields(page, [{
+      kind: 'choice',
+      fieldLabel: 'Office',
+      value: 'nyc-alt',
+      optionIndex: 2,
+      choiceType: 'select',
+      exact: true,
+    }])
+
+    expect(await page.locator('#office').evaluate(el => (el as HTMLSelectElement).selectedIndex)).toBe(2)
+    await page.close()
+  })
+
+  it('does not let a keyed auto fill fall back to a duplicate label', async () => {
+    const page = await browser.newPage({ viewport: { width: 900, height: 700 } })
+    await page.setContent(`
+      <label><input id="first-consent" type="checkbox" /> Consent</label>
+      <label><input id="second-consent" type="checkbox" /> Consent</label>
+    `)
+
+    await expect(fillFields(page, [{
+      kind: 'auto',
+      fieldKey: 'id:missing-consent',
+      fieldLabel: 'Consent',
+      value: true,
+    }])).rejects.toThrow('fieldKey "id:missing-consent" did not resolve')
+
+    expect(await page.locator('#first-consent').isChecked()).toBe(false)
+    expect(await page.locator('#second-consent').isChecked()).toBe(false)
+    await page.close()
+  })
+
   it('commits checkbox-backed grouped choices through framework-visible change events', async () => {
     // Regression for Greenhouse/Betterment-style checkbox pairs that model a
     // binary answer. A low-level click can move the DOM checked bit while the
@@ -1764,6 +2061,54 @@ describe('fillFields auto', () => {
 
     expect(await page.locator('#share-profile').isChecked()).toBe(true)
     expect(await page.locator('#state').textContent()).toBe('on')
+    await page.close()
+  })
+
+  it('rejects blank labels without mutating a control', async () => {
+    const page = await browser.newPage({ viewport: { width: 900, height: 700 } })
+    await page.setContent('<label><input id="consent" type="checkbox" /> Consent</label>')
+
+    await expect(setCheckedControl(page, '   ')).rejects.toThrow('label must be a trimmed, non-empty string')
+    expect(await page.locator('#consent').isChecked()).toBe(false)
+    await page.close()
+  })
+
+  it('prefers an exact toggle label and rejects unresolved ambiguity', async () => {
+    const page = await browser.newPage({ viewport: { width: 900, height: 700 } })
+    await page.setContent(`
+      <label><input id="consent-details" type="checkbox" /> Consent details</label>
+      <label><input id="consent" type="checkbox" /> Consent</label>
+      <fieldset id="authorization"><legend>Work authorization</legend><label><input id="auth-yes" type="radio" name="auth" /> Yes</label></fieldset>
+      <fieldset id="sponsorship"><legend>Sponsorship</legend><label><input id="sponsor-yes" type="radio" name="sponsor" /> Yes</label></fieldset>
+    `)
+
+    await setCheckedControl(page, 'Consent')
+    expect(await page.locator('#consent').isChecked()).toBe(true)
+    expect(await page.locator('#consent-details').isChecked()).toBe(false)
+
+    await expect(setCheckedControl(page, 'Yes')).rejects.toThrow('ambiguous label "Yes" matched 2 controls')
+    expect(await page.locator('#auth-yes').isChecked()).toBe(false)
+    expect(await page.locator('#sponsor-yes').isChecked()).toBe(false)
+
+    await setCheckedControl(page, 'Yes', { contextText: 'Sponsorship' })
+    expect(await page.locator('#auth-yes').isChecked()).toBe(false)
+    expect(await page.locator('#sponsor-yes').isChecked()).toBe(true)
+    await page.close()
+  })
+
+  it('prefers an authored toggle fieldKey across duplicate labels', async () => {
+    const page = await browser.newPage({ viewport: { width: 900, height: 700 } })
+    await page.setContent(`
+      <label><input id="first-consent" type="checkbox" /> Consent</label>
+      <label><input id="target:consent" type="checkbox" /> Consent</label>
+    `)
+
+    await setCheckedControl(page, 'Consent', {
+      fieldKey: `id:${encodeURIComponent('target:consent')}`,
+    })
+
+    expect(await page.locator('#first-consent').isChecked()).toBe(false)
+    expect(await page.locator('[id="target:consent"]').isChecked()).toBe(true)
     await page.close()
   })
 

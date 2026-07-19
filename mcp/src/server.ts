@@ -31,6 +31,7 @@ import {
   buildFormRequiredSnapshot,
   buildPageModel,
   buildFormSchemas,
+  formSchemaToFormGraph,
   expandPageSection,
   buildUiDelta,
   hasUiDelta,
@@ -50,6 +51,7 @@ import type {
   FormSchemaField,
   FormSchemaModel,
   PageModel,
+  ProxyFillField,
   Session,
   UpdateWaitResult,
 } from './session.js'
@@ -57,6 +59,11 @@ import type {
 type NodeStateFilterValue = boolean | 'mixed'
 type ResponseDetail = 'terse' | 'minimal' | 'verbose'
 type FormSchemaFormat = 'compact' | 'packed'
+type FormSchemaResponseOptions = FormSchemaBuildOptions & {
+  sinceSchemaId?: string
+  format?: FormSchemaFormat
+  includeFormGraph?: boolean
+}
 type BrowserMode = 'stock' | 'cloakbrowser'
 type BlockedSitePolicy = 'continue' | 'manual-handoff' | 'error'
 
@@ -486,11 +493,15 @@ function capBatchActionTimeouts(action: BatchAction, capMs: number): BatchAction
   }
 }
 
+const nonEmptyFieldIdSchema = z.string().trim().min(1, 'fieldId must not be empty')
+const nonEmptyFieldLabelSchema = z.string().trim().min(1, 'fieldLabel must not be empty')
+const nonEmptyToggleLabelSchema = z.string().trim().min(1, 'toggle label must not be empty')
+
 const fillFieldSchema = z.union([
   z.object({
     kind: z.literal('text'),
-    fieldId: z.string().optional().describe('Optional stable field id from geometra_form_schema'),
-    fieldLabel: z.string().describe('Visible field label / accessible name. Optional to duplicate when fieldId is present.'),
+    fieldId: nonEmptyFieldIdSchema.optional().describe('Optional stable field id from geometra_form_schema'),
+    fieldLabel: nonEmptyFieldLabelSchema.describe('Visible field label / accessible name. Optional to duplicate when fieldId is present.'),
     value: z.string().describe('Text value to set'),
     exact: z.boolean().optional().describe('Exact label match'),
     typingDelayMs: z
@@ -505,11 +516,11 @@ const fillFieldSchema = z.union([
       .optional()
       .describe('Use composition-friendly events for IME-heavy controlled fields.'),
     timeoutMs: timeoutMsInput.describe('Optional action wait timeout'),
-  }),
+  }).strict(),
   z.object({
     kind: z.literal('text'),
-    fieldId: z.string().describe('Stable field id from geometra_form_schema'),
-    fieldLabel: z.string().optional().describe('Optional when fieldId is present; MCP resolves the current label from geometra_form_schema'),
+    fieldId: nonEmptyFieldIdSchema.describe('Stable field id from geometra_form_schema'),
+    fieldLabel: nonEmptyFieldLabelSchema.optional().describe('Optional when fieldId is present; MCP resolves the current label from geometra_form_schema'),
     value: z.string().describe('Text value to set'),
     exact: z.boolean().optional().describe('Exact label match'),
     typingDelayMs: z
@@ -524,12 +535,13 @@ const fillFieldSchema = z.union([
       .optional()
       .describe('Use composition-friendly events for IME-heavy controlled fields.'),
     timeoutMs: timeoutMsInput.describe('Optional action wait timeout'),
-  }),
+  }).strict(),
   z.object({
     kind: z.literal('choice'),
-    fieldId: z.string().optional().describe('Optional stable field id from geometra_form_schema'),
-    fieldLabel: z.string().describe('Visible field label / accessible name. Optional to duplicate when fieldId is present.'),
+    fieldId: nonEmptyFieldIdSchema.optional().describe('Optional stable field id from geometra_form_schema'),
+    fieldLabel: nonEmptyFieldLabelSchema.describe('Visible field label / accessible name. Optional to duplicate when fieldId is present.'),
     value: z.string().describe('Desired option value / answer label'),
+    optionIndex: z.number().int().min(0).optional().describe('Exact native <select> option index from optionDetails'),
     query: z.string().optional().describe('Optional search text for searchable comboboxes'),
     choiceType: z
       .enum(['select', 'group', 'listbox'])
@@ -537,12 +549,13 @@ const fillFieldSchema = z.union([
       .describe('Optional choice subtype hint. Use `group` for repeated radio/button answers, `select` for native selects, and `listbox` for searchable dropdowns.'),
     exact: z.boolean().optional().describe('Exact label match'),
     timeoutMs: timeoutMsInput.describe('Optional action wait timeout'),
-  }),
+  }).strict(),
   z.object({
     kind: z.literal('choice'),
-    fieldId: z.string().describe('Stable field id from geometra_form_schema'),
-    fieldLabel: z.string().optional().describe('Optional when fieldId is present; MCP resolves the current label from geometra_form_schema'),
+    fieldId: nonEmptyFieldIdSchema.describe('Stable field id from geometra_form_schema'),
+    fieldLabel: nonEmptyFieldLabelSchema.optional().describe('Optional when fieldId is present; MCP resolves the current label from geometra_form_schema'),
     value: z.string().describe('Desired option value / answer label'),
+    optionIndex: z.number().int().min(0).optional().describe('Exact native <select> option index from optionDetails'),
     query: z.string().optional().describe('Optional search text for searchable comboboxes'),
     choiceType: z
       .enum(['select', 'group', 'listbox'])
@@ -550,41 +563,41 @@ const fillFieldSchema = z.union([
       .describe('Optional choice subtype hint. Use `group` for repeated radio/button answers, `select` for native selects, and `listbox` for searchable dropdowns.'),
     exact: z.boolean().optional().describe('Exact label match'),
     timeoutMs: timeoutMsInput.describe('Optional action wait timeout'),
-  }),
+  }).strict(),
   z.object({
     kind: z.literal('toggle'),
-    fieldId: z.string().optional().describe('Optional stable field id from geometra_form_schema'),
-    label: z.string().describe('Visible checkbox/radio label to set. Optional to duplicate when fieldId is present.'),
+    fieldId: nonEmptyFieldIdSchema.optional().describe('Optional stable field id from geometra_form_schema'),
+    label: nonEmptyToggleLabelSchema.describe('Visible checkbox/radio label to set. Optional to duplicate when fieldId is present.'),
     checked: z.boolean().optional().default(true).describe('Desired checked state (default true)'),
     exact: z.boolean().optional().describe('Exact label match'),
     controlType: z.enum(['checkbox', 'radio']).optional().describe('Limit matching to checkbox or radio'),
     timeoutMs: timeoutMsInput.describe('Optional action wait timeout'),
-  }),
+  }).strict(),
   z.object({
     kind: z.literal('toggle'),
-    fieldId: z.string().describe('Stable field id from geometra_form_schema'),
-    label: z.string().optional().describe('Optional when fieldId is present; MCP resolves the current label from geometra_form_schema'),
+    fieldId: nonEmptyFieldIdSchema.describe('Stable field id from geometra_form_schema'),
+    label: nonEmptyToggleLabelSchema.optional().describe('Optional when fieldId is present; MCP resolves the current label from geometra_form_schema'),
     checked: z.boolean().optional().default(true).describe('Desired checked state (default true)'),
     exact: z.boolean().optional().describe('Exact label match'),
     controlType: z.enum(['checkbox', 'radio']).optional().describe('Limit matching to checkbox or radio'),
     timeoutMs: timeoutMsInput.describe('Optional action wait timeout'),
-  }),
+  }).strict(),
   z.object({
     kind: z.literal('file'),
-    fieldId: z.string().optional().describe('Optional stable field id from geometra_form_schema'),
-    fieldLabel: z.string().describe('Visible file-field label / accessible name'),
+    fieldId: nonEmptyFieldIdSchema.optional().describe('Optional stable field id from geometra_form_schema'),
+    fieldLabel: nonEmptyFieldLabelSchema.describe('Visible file-field label / accessible name'),
     paths: z.array(z.string()).min(1).describe('Absolute paths on the proxy machine'),
     exact: z.boolean().optional().describe('Exact label match'),
     timeoutMs: timeoutMsInput.describe('Optional action wait timeout'),
-  }),
+  }).strict(),
   z.object({
     kind: z.literal('file'),
-    fieldId: z.string().describe('Stable field id from geometra_form_schema'),
-    fieldLabel: z.string().optional().describe('Optional when fieldId is present; MCP resolves the current label when file fields are exposed by geometra_form_schema'),
+    fieldId: nonEmptyFieldIdSchema.describe('Stable field id from geometra_form_schema'),
+    fieldLabel: nonEmptyFieldLabelSchema.optional().describe('Optional when fieldId is present; MCP resolves the current label when file fields are exposed by geometra_form_schema'),
     paths: z.array(z.string()).min(1).describe('Absolute paths on the proxy machine'),
     exact: z.boolean().optional().describe('Exact label match'),
     timeoutMs: timeoutMsInput.describe('Optional action wait timeout'),
-  }),
+  }).strict(),
 ])
 
 type FillFieldInput = z.infer<typeof fillFieldSchema>
@@ -592,6 +605,7 @@ type ResolvedFillFieldInput =
   | {
       kind: 'text'
       fieldId?: string
+      fieldKey?: string
       fieldLabel: string
       value: string
       exact?: boolean
@@ -602,8 +616,11 @@ type ResolvedFillFieldInput =
   | {
       kind: 'choice'
       fieldId?: string
+      fieldKey?: string
       fieldLabel: string
       value: string
+      optionIndex?: number
+      expectedReadback?: string
       query?: string
       choiceType?: 'select' | 'group' | 'listbox'
       exact?: boolean
@@ -612,13 +629,23 @@ type ResolvedFillFieldInput =
   | {
       kind: 'toggle'
       fieldId?: string
+      fieldKey?: string
       label: string
       checked: boolean
       controlType?: 'checkbox' | 'radio'
       exact?: boolean
       timeoutMs?: number
     }
-  | { kind: 'file'; fieldId?: string; fieldLabel: string; paths: string[]; exact?: boolean; timeoutMs?: number }
+  | { kind: 'file'; fieldId?: string; fieldKey?: string; fieldLabel: string; paths: string[]; exact?: boolean; timeoutMs?: number }
+
+function toProxyFillFields(fields: ResolvedFillFieldInput[]): ProxyFillField[] {
+  return fields.map(field => {
+    const proxyField = { ...field }
+    delete proxyField.timeoutMs
+    if (proxyField.kind === 'choice') delete proxyField.expectedReadback
+    return proxyField
+  })
+}
 
 const formValueSchema = z.union([
   z.string(),
@@ -639,14 +666,14 @@ const batchActionSchema = z.discriminatedUnion('type', [
     fullyVisible: z.boolean().optional().describe('When clicking by semantic target, require full visibility before clicking (default true)'),
     maxRevealSteps: z.number().int().min(1).max(48).optional().describe('Maximum reveal attempts before clicking a semantic target. When omitted, Geometra auto-scales from scroll distance for tall forms.'),
     revealTimeoutMs: timeoutMsInput.describe('Per-scroll wait timeout while revealing a semantic target'),
-    waitFor: z.object(waitConditionShape()).optional().describe('Optional semantic condition to wait for after the click'),
+    waitFor: z.object(waitConditionShape()).strict().optional().describe('Optional semantic condition to wait for after the click'),
     timeoutMs: timeoutMsInput,
-  }),
+  }).strict(),
   z.object({
     type: z.literal('type'),
     text: z.string(),
     timeoutMs: timeoutMsInput,
-  }),
+  }).strict(),
   z.object({
     type: z.literal('key'),
     key: z.string(),
@@ -655,7 +682,7 @@ const batchActionSchema = z.discriminatedUnion('type', [
     meta: z.boolean().optional(),
     alt: z.boolean().optional(),
     timeoutMs: timeoutMsInput,
-  }),
+  }).strict(),
   z.object({
     type: z.literal('upload_files'),
     paths: z.array(z.string()).min(1),
@@ -667,17 +694,19 @@ const batchActionSchema = z.discriminatedUnion('type', [
     dropX: z.number().optional(),
     dropY: z.number().optional(),
     timeoutMs: timeoutMsInput,
-  }),
+  }).strict(),
   z.object({
     type: z.literal('pick_listbox_option'),
     label: z.string(),
     exact: z.boolean().optional(),
     openX: z.number().optional(),
     openY: z.number().optional(),
+    fieldId: z.string().trim().min(1).optional(),
+    fieldKey: z.string().trim().min(1).optional(),
     fieldLabel: z.string().optional(),
     query: z.string().optional(),
     timeoutMs: timeoutMsInput,
-  }),
+  }).strict(),
   z.object({
     type: z.literal('select_option'),
     x: z.number(),
@@ -686,15 +715,18 @@ const batchActionSchema = z.discriminatedUnion('type', [
     label: z.string().optional(),
     index: z.number().int().min(0).optional(),
     timeoutMs: timeoutMsInput,
-  }),
+  }).strict(),
   z.object({
     type: z.literal('set_checked'),
-    label: z.string(),
+    label: z.string().trim().min(1, 'set_checked label must not be empty'),
     checked: z.boolean().optional(),
     exact: z.boolean().optional(),
     controlType: z.enum(['checkbox', 'radio']).optional(),
+    fieldKey: z.string().trim().min(1).optional(),
+    contextText: z.string().trim().min(1).optional(),
+    sectionText: z.string().trim().min(1).optional(),
     timeoutMs: timeoutMsInput,
-  }),
+  }).strict(),
   z.object({
     type: z.literal('wheel'),
     deltaY: z.number(),
@@ -702,13 +734,13 @@ const batchActionSchema = z.discriminatedUnion('type', [
     x: z.number().optional(),
     y: z.number().optional(),
     timeoutMs: timeoutMsInput,
-  }),
+  }).strict(),
   z.object({
     type: z.literal('wait_for'),
     ...nodeFilterShape(),
     present: z.boolean().optional(),
     timeoutMs: timeoutMsInput,
-  }),
+  }).strict(),
   z.object({
     type: z.literal('fill_fields'),
     fields: z.array(fillFieldSchema).min(1).max(80),
@@ -716,7 +748,7 @@ const batchActionSchema = z.discriminatedUnion('type', [
       .boolean()
       .optional()
       .describe('After filling, read each text/choice field back and flag mismatches (e.g. autocomplete rejected input, format transformed). Adds a `verification` entry to the step.'),
-  }),
+  }).strict(),
   z.object({
     type: z.literal('expand_section'),
     id: z.string().describe('Stable section id from geometra_page_model (e.g. fm:1.0, ls:2.1).'),
@@ -733,7 +765,7 @@ const batchActionSchema = z.discriminatedUnion('type', [
     itemOffset: z.number().int().min(0).optional(),
     maxTextPreview: z.number().int().min(0).max(20).optional(),
     includeBounds: z.boolean().optional(),
-  }),
+  }).strict(),
 ])
 
 type BatchAction = z.infer<typeof batchActionSchema>
@@ -836,6 +868,7 @@ Chromium runs **headless** by default unless \`headless: false\`. Pass \`stealth
       onlyRequiredFields: z.boolean().optional().default(false).describe('Only include required fields when returnForms=true'),
       onlyInvalidFields: z.boolean().optional().default(false).describe('Only include invalid fields when returnForms=true'),
       includeOptions: z.boolean().optional().default(false).describe('Include explicit choice option labels in returned form schemas'),
+      includeFormGraph: z.boolean().optional().default(false).describe('Also include FormGraph 0.1-compatible graphs in returned form schemas. Use for paperwork/application workflows that need field paths, review gates, and source anchors.'),
       includeContext: formSchemaContextInput(),
       sinceSchemaId: z.string().optional().describe('If the current schema matches this id, return changed=false without resending forms'),
       schemaFormat: formSchemaFormatInput(),
@@ -855,6 +888,7 @@ Chromium runs **headless** by default unless \`headless: false\`. Pass \`stealth
         onlyRequiredFields: input.onlyRequiredFields,
         onlyInvalidFields: input.onlyInvalidFields,
         includeOptions: input.includeOptions,
+        includeFormGraph: input.includeFormGraph,
         includeContext: input.includeContext,
         sinceSchemaId: input.sinceSchemaId,
         format: input.schemaFormat,
@@ -1380,7 +1414,7 @@ Use \`kind: "text"\` for textboxes / textareas, \`"choice"\` for selects / combo
       const successCount = steps.filter(step => step.ok === true).length
       const errorCount = steps.length - successCount
       const payload = {
-        completed: stoppedAt === undefined && steps.length === resolvedFields.fields.length,
+        completed: errorCount === 0 && stoppedAt === undefined && steps.length === resolvedFields.fields.length,
         fieldCount: resolvedFields.fields.length,
         successCount,
         errorCount,
@@ -1454,10 +1488,6 @@ Pass \`valuesById\` with field ids from \`geometra_form_schema\` for the most st
     async ({ url, pageUrl, port, headless, width, height, slowMo, stealth, browserMode, formId, valuesById, valuesByLabel, stopOnError, failOnInvalid, includeSteps, resumeFromIndex, verifyFills, skipPreFilled, isolated, detail, sessionId }) => {
       const browser = resolveBrowserStealth({ stealth, browserMode })
       if (!browser.ok) return err(browser.error)
-      const directFields =
-        !includeSteps && !formId && Object.keys(valuesById ?? {}).length === 0
-          ? directLabelBatchFields(valuesByLabel)
-          : null
 
       const resolved = await ensureToolSession(
         {
@@ -1471,7 +1501,6 @@ Pass \`valuesById\` with field ids from \`geometra_form_schema\` for the most st
           slowMo,
           stealth: browser.stealth,
           isolated,
-          awaitInitialFrame: directFields ? false : undefined,
         },
         'Not connected. Call geometra_connect first, or pass pageUrl/url to geometra_fill_form.',
       )
@@ -1482,51 +1511,6 @@ Pass \`valuesById\` with field ids from \`geometra_form_schema\` for the most st
       const entryCount = Object.keys(valuesById ?? {}).length + Object.keys(valuesByLabel ?? {}).length
       if (entryCount === 0) {
         return err('Provide at least one value in valuesById or valuesByLabel')
-      }
-
-      if (directFields) {
-        try {
-          const startRevision = session.updateRevision
-          const wait = await sendFillFields(session, directFields)
-          const ackResult = parseProxyFillAckResult(wait.result)
-          if (ackResult && ackResult.invalidCount === 0) {
-            recordWorkflowFill(session, undefined, undefined, valuesById, valuesByLabel, 0, directFields.length)
-            return ok(JSON.stringify({
-              ...connection,
-              completed: true,
-              execution: 'batched-direct',
-              finalSource: 'proxy',
-              requestedValueCount: entryCount,
-              fieldCount: directFields.length,
-              successCount: directFields.length,
-              errorCount: 0,
-              final: ackResult,
-            }, null, detail === 'verbose' ? 2 : undefined))
-          }
-
-          await waitForDeferredBatchUpdate(session, startRevision, wait)
-          const afterDirect = sessionA11y(session)
-          const directSignals = afterDirect ? collectSessionSignals(afterDirect) : undefined
-          if (directSignals && directSignals.invalidFields.length === 0) {
-            recordWorkflowFill(session, undefined, undefined, valuesById, valuesByLabel, 0, directFields.length)
-            return ok(JSON.stringify({
-              ...connection,
-              completed: true,
-              execution: 'batched-direct',
-              finalSource: 'session',
-              requestedValueCount: entryCount,
-              fieldCount: directFields.length,
-              successCount: directFields.length,
-              errorCount: 0,
-              final: sessionSignalsPayload(directSignals, detail),
-            }, null, detail === 'verbose' ? 2 : undefined))
-          }
-        } catch (e) {
-          if (!canFallbackToSequentialFill(e)) {
-            const message = e instanceof Error ? e.message : String(e)
-            return err(message)
-          }
-        }
       }
 
       if (!session.tree || !session.layout) {
@@ -1545,8 +1529,9 @@ Pass \`valuesById\` with field ids from \`geometra_form_schema\` for the most st
       const resolution = resolveTargetFormSchema(schemas, { formId, valuesById, valuesByLabel })
       if (!resolution.ok) return err(resolution.error)
       const schema = resolution.schema
+      const targetFormPath = parseSectionId(schema.formId)?.path
 
-      const planned = planFormFill(schema, { valuesById, valuesByLabel })
+      const planned = planFormFill(schema, { valuesById, valuesByLabel }, schemas)
       if (!planned.ok) return err(planned.error)
 
       let skippedCount = 0
@@ -1577,27 +1562,27 @@ Pass \`valuesById\` with field ids from \`geometra_form_schema\` for the most st
       let fallbackFromBatch: { attempted: true; used: true; reason: 'batched-threw' | 'batched-invalid-readback'; attempts: number } | undefined
       if (!includeSteps) {
         let usedBatch = false
-        let batchAckResult: ProxyFillAckResult | undefined
         try {
           const startRevision = session.updateRevision
-          const wait = await sendFillFields(session, planned.fields)
+          const wait = await sendFillFields(session, toProxyFillFields(planned.fields))
           const ackResult = parseProxyFillAckResult(wait.result)
-          batchAckResult = ackResult
           if (ackResult && ackResult.invalidCount === 0) {
             usedBatch = true
-            const payload = {
-              ...connection,
-              completed: true,
-              execution: 'batched',
-              finalSource: 'proxy',
-              formId: schema.formId,
-              requestedValueCount: entryCount,
-              fieldCount: planned.fields.length,
-              successCount: planned.fields.length,
-              errorCount: 0,
-              final: ackResult,
+            if (!verifyFills) {
+              const payload = {
+                ...connection,
+                completed: true,
+                execution: 'batched',
+                finalSource: 'proxy',
+                formId: schema.formId,
+                requestedValueCount: entryCount,
+                fieldCount: planned.fields.length,
+                successCount: planned.fields.length,
+                errorCount: 0,
+                final: ackResult,
+              }
+              return ok(JSON.stringify(payload, null, detail === 'verbose' ? 2 : undefined))
             }
-            return ok(JSON.stringify(payload, null, detail === 'verbose' ? 2 : undefined))
           }
           await waitForDeferredBatchUpdate(session, startRevision, wait)
           await waitForBatchFieldReadback(session, planned.fields)
@@ -1612,9 +1597,15 @@ Pass \`valuesById\` with field ids from \`geometra_form_schema\` for the most st
 
         if (usedBatch) {
           const after = sessionA11y(session)
-          const signals = after ? collectSessionSignals(after) : undefined
+          const signals = after
+            ? scopeSessionSignalsToForm(
+                after,
+                targetFormPath ? formNodeAtPath(after, targetFormPath) : undefined,
+                targetFormPath !== undefined,
+              )
+            : undefined
           const invalidRemaining = signals?.invalidFields.length ?? 0
-          if ((!batchAckResult || batchAckResult.invalidCount > 0) && invalidRemaining > 0) {
+          if (invalidRemaining > 0) {
             usedBatch = false
             fallbackFromBatch = { attempted: true, used: true, reason: 'batched-invalid-readback', attempts: 2 }
           }
@@ -1622,8 +1613,15 @@ Pass \`valuesById\` with field ids from \`geometra_form_schema\` for the most st
 
         if (usedBatch) {
           const after = sessionA11y(session)
-          const signals = after ? collectSessionSignals(after) : undefined
+          const signals = after
+            ? scopeSessionSignalsToForm(
+                after,
+                targetFormPath ? formNodeAtPath(after, targetFormPath) : undefined,
+                targetFormPath !== undefined,
+              )
+            : undefined
           const invalidRemaining = signals?.invalidFields.length ?? 0
+          const verification = verifyFills ? verifyFormFills(session, planned.planned) : undefined
           const payload = {
             ...connection,
             completed: true,
@@ -1637,6 +1635,7 @@ Pass \`valuesById\` with field ids from \`geometra_form_schema\` for the most st
             minConfidence: planned.planned.length > 0
               ? Number(Math.min(...planned.planned.map(p => p.confidence)).toFixed(2))
               : undefined,
+            ...(verification ? { verification } : {}),
             ...(signals ? { final: sessionSignalsPayload(signals, detail) } : {}),
           }
 
@@ -1676,7 +1675,13 @@ Pass \`valuesById\` with field ids from \`geometra_form_schema\` for the most st
       }
 
       const after = sessionA11y(session)
-      const signals = after ? collectSessionSignals(after) : undefined
+      const signals = after
+        ? scopeSessionSignalsToForm(
+            after,
+            targetFormPath ? formNodeAtPath(after, targetFormPath) : undefined,
+            targetFormPath !== undefined,
+          )
+        : undefined
       const invalidRemaining = signals?.invalidFields.length ?? 0
       const successCount = steps.filter(step => step.ok === true).length
       const errorCount = steps.length - successCount
@@ -1685,7 +1690,7 @@ Pass \`valuesById\` with field ids from \`geometra_form_schema\` for the most st
 
       const payload = {
         ...connection,
-        completed: stoppedAt === undefined && (startIndex + steps.length) === planned.fields.length,
+        completed: errorCount === 0 && stoppedAt === undefined && (startIndex + steps.length) === planned.fields.length,
         execution: 'sequential',
         formId: schema.formId,
         requestedValueCount: entryCount,
@@ -1749,13 +1754,13 @@ Pass \`pageUrl\`/\`url\` to auto-connect in the same call — use \`isolated: tr
       formId: z.string().optional().describe('Optional form id from geometra_form_schema or geometra_page_model'),
       valuesById: formValuesRecordSchema.optional().describe('Form values keyed by stable field id from geometra_form_schema'),
       valuesByLabel: formValuesRecordSchema.optional().describe('Form values keyed by schema field label'),
-      submit: z.object(nodeFilterShape()).optional().describe('Semantic target for the submit button. Defaults to {role: "button", name: "Submit"}.'),
+      submit: z.object(nodeFilterShape()).strict().optional().describe('Semantic target for the submit button. Defaults to {role: "button", name: "Submit"}.'),
       submitIndex: z.number().int().min(0).optional().default(0).describe('Which matching submit target to click after sorting top-to-bottom (default 0)'),
       submitTimeoutMs: z.number().int().min(50).max(60_000).optional().default(15_000).describe('Action wait timeout for the submit click (default 15000ms). Increase for slow backends.'),
-      waitFor: z.object(waitConditionShape()).optional().describe('Optional semantic condition to wait for after the submit click (success banner, navigation, submit gone, etc.)'),
+      waitFor: z.object(waitConditionShape()).strict().optional().describe('Optional semantic condition to wait for after the submit click (success banner, submit gone, etc.)'),
       skipFill: z.boolean().optional().default(false).describe('Skip the fill phase and go straight to submit+wait. Use when values have already been filled by a previous call.'),
       softTimeoutMs: softTimeoutMsInput(),
-      failOnInvalid: z.boolean().optional().default(false).describe('Return an error if invalid fields remain after the submit wait resolves.'),
+      failOnInvalid: z.boolean().optional().default(false).describe('Control whether a validation_failed outcome is returned as an MCP error. Outcome facts are always reported.'),
       detail: detailInput(),
       sessionId: sessionIdInput,
     },
@@ -1772,11 +1777,13 @@ Pass \`pageUrl\`/\`url\` to auto-connect in the same call — use \`isolated: tr
       if (!resolved.ok) return err(resolved.error)
       const session = resolved.session
       const connection = autoConnectionPayload(resolved)
+      let targetFormId = formId
       let fillSummary: Record<string, unknown> | undefined
       let fillFallback: { attempted: true; used: true; reason: 'batched-threw'; attempts: number } | undefined
       const pausedPayload = (phase: string, resumeHint?: Record<string, unknown>, extra?: Record<string, unknown>): Record<string, unknown> => ({
         ...connection,
         completed: false,
+        outcome: 'unconfirmed',
         paused: true,
         phase,
         pauseReason: 'soft-timeout',
@@ -1797,7 +1804,6 @@ Pass \`pageUrl\`/\`url\` to auto-connect in the same call — use \`isolated: tr
       }
       const entryA11y = sessionA11y(session)
       if (!entryA11y) return err('No UI tree available for form submission')
-      const entryUrl = entryA11y.meta?.pageUrl
       if (!hasSoftBudget(deadlineAt)) {
         return ok(JSON.stringify(pausedPayload('before-fill', { retrySameCall: true }), null, detail === 'verbose' ? 2 : undefined))
       }
@@ -1814,8 +1820,9 @@ Pass \`pageUrl\`/\`url\` to auto-connect in the same call — use \`isolated: tr
         const resolution = resolveTargetFormSchema(schemas, { formId, valuesById, valuesByLabel })
         if (!resolution.ok) return err(resolution.error)
         const schema = resolution.schema
+        targetFormId = schema.formId
 
-        const planned = planFormFill(schema, { valuesById, valuesByLabel })
+        const planned = planFormFill(schema, { valuesById, valuesByLabel }, schemas)
         if (!planned.ok) return err(planned.error)
 
         let usedBatch = true
@@ -1823,7 +1830,7 @@ Pass \`pageUrl\`/\`url\` to auto-connect in the same call — use \`isolated: tr
           const startRevision = session.updateRevision
           const wait = await sendFillFields(
             session,
-            planned.fields.map(field => capFillFieldTimeout(field, timeoutCapFromDeadline(deadlineAt))),
+            toProxyFillFields(planned.fields),
             capTimeoutMs(undefined, timeoutCapFromDeadline(deadlineAt), HOST_SAFE_TOOL_TIMEOUT_MS),
           )
           const ack = parseProxyFillAckResult(wait.result)
@@ -1834,15 +1841,14 @@ Pass \`pageUrl\`/\`url\` to auto-connect in the same call — use \`isolated: tr
             fieldCount: planned.fields.length,
             ...waitStatusPayload(wait),
             ...(ack ? { invalidCount: ack.invalidCount, alertCount: ack.alertCount } : {}),
+            ...(ack?.invalidFields ? { invalidFields: ack.invalidFields } : {}),
             ...(entryCount !== planned.fields.length ? { requestedValueCount: entryCount } : {}),
           }
           if (wait.status === 'timed_out') {
             return ok(JSON.stringify(pausedPayload('fill', {
               tool: 'geometra_submit_form',
-              skipFill: true,
-              submit: submit ?? { role: 'button', name: 'Submit' },
-              submitIndex,
-              ...(waitFor ? { waitFor } : {}),
+              retrySameCall: true,
+              skipFill: false,
             }), null, detail === 'verbose' ? 2 : undefined))
           }
         } catch (e) {
@@ -1868,10 +1874,8 @@ Pass \`pageUrl\`/\`url\` to auto-connect in the same call — use \`isolated: tr
               }
               return ok(JSON.stringify(pausedPayload('fill', {
                 tool: 'geometra_submit_form',
-                skipFill: true,
-                submit: submit ?? { role: 'button', name: 'Submit' },
-                submitIndex,
-                ...(waitFor ? { waitFor } : {}),
+                retrySameCall: true,
+                skipFill: false,
               }), null, detail === 'verbose' ? 2 : undefined))
             }
             try {
@@ -1882,15 +1886,25 @@ Pass \`pageUrl\`/\`url\` to auto-connect in the same call — use \`isolated: tr
               break
             }
           }
-          if (firstErr !== undefined && successCount === 0) {
-            return err(`Failed to fill form before submit (sequential fallback): ${firstErr}`)
-          }
           fillSummary = {
             formId: schema.formId,
             execution: 'sequential',
             fieldCount: planned.fields.length,
             successCount,
+            ...(firstErr !== undefined ? { error: firstErr } : {}),
             ...(entryCount !== planned.fields.length ? { requestedValueCount: entryCount } : {}),
+          }
+          if (firstErr !== undefined) {
+            return err(JSON.stringify({
+              ...connection,
+              completed: false,
+              execution: 'unconfirmed',
+              outcome: 'unconfirmed',
+              phase: 'fill',
+              fill: fillSummary,
+              ...(fillFallback ? { fill_fallback: fillFallback } : {}),
+              submit: { attempted: false, reason: 'Fill phase did not complete successfully.' },
+            }, null, detail === 'verbose' ? 2 : undefined))
           }
         }
       }
@@ -1917,6 +1931,7 @@ Pass \`pageUrl\`/\`url\` to auto-connect in the same call — use \`isolated: tr
         const payload = {
           ...connection,
           completed: false,
+          outcome: 'unconfirmed',
           ...(fillSummary ? { fill: fillSummary } : {}),
           ...(fillFallback ? { fill_fallback: fillFallback } : {}),
           submit: { ok: false, error: `Submit target not found: ${resolvedClick.error}` },
@@ -1925,10 +1940,59 @@ Pass \`pageUrl\`/\`url\` to auto-connect in the same call — use \`isolated: tr
         return err(JSON.stringify(payload, null, detail === 'verbose' ? 2 : undefined))
       }
 
+      const preSubmitA11y = sessionA11y(session)
+      const submitFormNode = preSubmitA11y
+        ? resolveSubmitFormNode(preSubmitA11y, targetFormId, resolvedClick.value.target?.path)
+        : undefined
+      const submitFormPath = submitFormNode?.path
+      const preSubmitSignals = preSubmitA11y
+        ? scopeSessionSignalsToForm(preSubmitA11y, submitFormNode)
+        : undefined
+      if (preSubmitSignals && preSubmitSignals.invalidFields.length > 0) {
+        const payload = {
+          ...connection,
+          completed: false,
+          execution: 'not_started',
+          outcome: 'validation_failed',
+          ...(fillSummary ? { fill: fillSummary } : {}),
+          ...(fillFallback ? { fill_fallback: fillFallback } : {}),
+          submit: {
+            attempted: false,
+            reason: 'Invalid fields remain in the target form before submit; the submit control was not clicked.',
+          },
+          final: sessionSignalsPayload(preSubmitSignals, detail),
+        }
+        const serialized = JSON.stringify(payload, null, detail === 'verbose' ? 2 : undefined)
+        return failOnInvalid ? err(serialized) : ok(serialized)
+      }
+
       if (!hasSoftBudget(deadlineAt)) {
         return ok(JSON.stringify(pausedPayload('submit', submitResumeHint), null, detail === 'verbose' ? 2 : undefined))
       }
       const beforeSubmit = sessionA11y(session)
+      const beforeClickUrl = beforeSubmit?.meta?.pageUrl
+      const waitFilter: NodeFilter = {
+        id: waitFor?.id,
+        role: waitFor?.role,
+        name: waitFor?.name,
+        text: waitFor?.text,
+        contextText: waitFor?.contextText,
+        promptText: waitFor?.promptText,
+        sectionText: waitFor?.sectionText,
+        itemText: waitFor?.itemText,
+        value: waitFor?.value,
+        checked: waitFor?.checked,
+        disabled: waitFor?.disabled,
+        focused: waitFor?.focused,
+        selected: waitFor?.selected,
+        expanded: waitFor?.expanded,
+        invalid: waitFor?.invalid,
+        required: waitFor?.required,
+        busy: waitFor?.busy,
+      }
+      const beforeWaitEvidence = waitFor && beforeSubmit
+        ? captureWaitEvidence(beforeSubmit, waitFilter)
+        : undefined
       const clickWait = await sendClick(
         session,
         resolvedClick.value.x,
@@ -1937,29 +2001,12 @@ Pass \`pageUrl\`/\`url\` to auto-connect in the same call — use \`isolated: tr
       )
 
       let waitResult: WaitConditionResult | undefined
+      let waitError: string | undefined
       if (waitFor) {
         if (!hasSoftBudget(deadlineAt)) {
           return ok(JSON.stringify(pausedPayload('wait_for', {
             tool: 'geometra_wait_for',
-            filter: compactFilterPayload({
-              id: waitFor.id,
-              role: waitFor.role,
-              name: waitFor.name,
-              text: waitFor.text,
-              contextText: waitFor.contextText,
-              promptText: waitFor.promptText,
-              sectionText: waitFor.sectionText,
-              itemText: waitFor.itemText,
-              value: waitFor.value,
-              checked: waitFor.checked,
-              disabled: waitFor.disabled,
-              focused: waitFor.focused,
-              selected: waitFor.selected,
-              expanded: waitFor.expanded,
-              invalid: waitFor.invalid,
-              required: waitFor.required,
-              busy: waitFor.busy,
-            }),
+            filter: compactFilterPayload(waitFilter),
             present: waitFor.present ?? true,
           }, {
             submit: {
@@ -1970,53 +2017,59 @@ Pass \`pageUrl\`/\`url\` to auto-connect in the same call — use \`isolated: tr
           }), null, detail === 'verbose' ? 2 : undefined))
         }
         const postWait = await waitForSemanticCondition(session, {
-          filter: {
-            id: waitFor.id,
-            role: waitFor.role,
-            name: waitFor.name,
-            text: waitFor.text,
-            contextText: waitFor.contextText,
-            promptText: waitFor.promptText,
-            sectionText: waitFor.sectionText,
-            itemText: waitFor.itemText,
-            value: waitFor.value,
-            checked: waitFor.checked,
-            disabled: waitFor.disabled,
-            focused: waitFor.focused,
-            selected: waitFor.selected,
-            expanded: waitFor.expanded,
-            invalid: waitFor.invalid,
-            required: waitFor.required,
-            busy: waitFor.busy,
-          },
+          filter: waitFilter,
           present: waitFor.present ?? true,
           timeoutMs: capTimeoutMs(waitFor.timeoutMs, timeoutCapFromDeadline(deadlineAt), 15_000),
         })
         if (!postWait.ok) {
-          const preErrFallbacks: Array<Record<string, unknown>> = []
-          if (fillFallback) preErrFallbacks.push({ phase: 'fill', ...fillFallback })
-          if (resolvedClick.fallback) preErrFallbacks.push({ phase: 'submit', ...resolvedClick.fallback })
-          const payload = {
-            ...connection,
-            completed: false,
-            ...(fillSummary ? { fill: fillSummary } : {}),
-            submit: {
-              at: { x: resolvedClick.value.x, y: resolvedClick.value.y },
-              ...(resolvedClick.value.target ? { target: compactNodeReference(resolvedClick.value.target) } : {}),
-              ...waitStatusPayload(clickWait),
-            },
-            ...(preErrFallbacks.length > 0 ? { fallbacks: preErrFallbacks } : {}),
-            waitFor: { ok: false, error: postWait.error },
-          }
-          return err(JSON.stringify(payload, null, detail === 'verbose' ? 2 : undefined))
+          waitError = postWait.error
+        } else {
+          waitResult = postWait.value
         }
-        waitResult = postWait.value
       }
 
       const after = sessionA11y(session)
-      const signals = after ? collectSessionSignals(after) : undefined
-      const afterUrl = after?.meta?.pageUrl
-      const navigated = Boolean(afterUrl && entryUrl && afterUrl !== entryUrl)
+      const signals = after
+        ? scopeSessionSignalsToForm(
+            after,
+            submitFormPath ? formNodeAtPath(after, submitFormPath) : undefined,
+            submitFormPath !== undefined,
+          )
+        : undefined
+      const clickResult = clickWait.result && typeof clickWait.result === 'object'
+        ? clickWait.result as Record<string, unknown>
+        : undefined
+      const clickAfterUrl = typeof clickResult?.pageUrl === 'string' ? clickResult.pageUrl : undefined
+      const clickBeforeUrl = typeof clickResult?.urlBefore === 'string' ? clickResult.urlBefore : beforeClickUrl
+      const observedAfterUrl = after?.meta?.pageUrl
+      const navigatedByClick = Boolean(
+        clickResult?.navigated === true &&
+        clickAfterUrl &&
+        clickBeforeUrl &&
+        clickAfterUrl !== clickBeforeUrl,
+      )
+      const navigatedByTree = Boolean(observedAfterUrl && beforeClickUrl && observedAfterUrl !== beforeClickUrl)
+      const navigated = navigatedByClick || navigatedByTree
+      const afterUrl = navigatedByClick && clickAfterUrl
+        ? clickAfterUrl
+        : observedAfterUrl ?? clickAfterUrl
+      const waitEvidenceFresh = waitResult
+        ? waitConditionHasFreshEvidence(beforeWaitEvidence, after, waitResult)
+        : false
+      const execution = clickWait.status === 'timed_out' ? 'unconfirmed' : 'completed'
+      const invalidCount = signals?.invalidFields.length ?? 0
+      const outcome: 'submitted' | 'validation_failed' | 'unconfirmed' = invalidCount > 0
+        ? 'validation_failed'
+        : execution === 'unconfirmed' || Boolean(waitError)
+          ? 'unconfirmed'
+          : waitFor
+            ? waitEvidenceFresh
+              ? 'submitted'
+              : 'unconfirmed'
+            : navigated
+            ? 'submitted'
+            : 'unconfirmed'
+      const completed = outcome === 'submitted'
 
       // Aggregate all fallback usage into a single top-level `fallbacks[]`
       // array so this tool matches the shape emitted by `geometra_run_actions`
@@ -2031,16 +2084,22 @@ Pass \`pageUrl\`/\`url\` to auto-connect in the same call — use \`isolated: tr
 
       const payload: Record<string, unknown> = {
         ...connection,
-        completed: true,
+        completed,
+        execution,
+        outcome,
         ...(fillSummary ? { fill: fillSummary } : {}),
         submit: {
           at: { x: resolvedClick.value.x, y: resolvedClick.value.y },
           ...(resolvedClick.value.target ? { target: compactNodeReference(resolvedClick.value.target), revealSteps: resolvedClick.value.revealAttempts ?? 0 } : {}),
           ...waitStatusPayload(clickWait),
         },
-        ...(waitResult ? { waitFor: waitConditionCompact(waitResult) } : {}),
+        ...(waitResult
+          ? { waitFor: { ...waitConditionCompact(waitResult), fresh: waitEvidenceFresh } }
+          : waitError
+            ? { waitFor: { ok: false, error: waitError } }
+            : {}),
         ...(fallbackRecords.length > 0 ? { fallbacks: fallbackRecords } : {}),
-        ...(navigated ? { navigated: true, afterUrl } : {}),
+        ...(navigated ? { navigated: true, ...(afterUrl ? { afterUrl } : {}) } : {}),
         ...(signals ? { final: sessionSignalsPayload(signals, detail) } : {}),
       }
 
@@ -2051,17 +2110,10 @@ Pass \`pageUrl\`/\`url\` to auto-connect in the same call — use \`isolated: tr
         if (model.verification) payload.verification = model.verification
       }
 
-      if (failOnInvalid && signals && signals.invalidFields.length > 0) {
-        return err(JSON.stringify(payload, null, detail === 'verbose' ? 2 : undefined))
-      }
-
-      // Swallow the unused `beforeSubmit` binding; it anchors that the a11y tree was
-      // captured pre-click and keeps the pattern consistent with other tools that
-      // diff before/after for summaries (we rely on the waitFor / final signals
-      // for the actual comparison here).
-      void beforeSubmit
-
-      return ok(JSON.stringify(payload, null, detail === 'verbose' ? 2 : undefined))
+      const serialized = JSON.stringify(payload, null, detail === 'verbose' ? 2 : undefined)
+      if (waitError) return err(serialized)
+      if (failOnInvalid && outcome === 'validation_failed') return err(serialized)
+      return ok(serialized)
     }
   )
 
@@ -2237,7 +2289,7 @@ Supported step types: \`click\`, \`type\`, \`key\`, \`upload_files\`, \`pick_lis
       const successCount = steps.filter(step => step.ok === true).length
       const errorCount = steps.length - successCount
       const elapsedMs = Number((performance.now() - toolStartedAt).toFixed(1))
-      const completed = stoppedAt === undefined && pausedAt === undefined && startIndex + steps.length >= actions.length
+      const completed = errorCount === 0 && stoppedAt === undefined && pausedAt === undefined && startIndex + steps.length >= actions.length
       const resumePayload = {
         ...(startIndex > 0 ? { resumedFromIndex: startIndex } : {}),
         ...(pausedAt !== undefined
@@ -2255,6 +2307,8 @@ Supported step types: \`click\`, \`type\`, \`key\`, \`upload_files\`, \`pick_lis
         ? {
             ...connection,
             completed,
+            successCount,
+            errorCount,
             ...resumePayload,
             ...(stoppedAt !== undefined ? { stoppedAt } : {}),
             ...(fallbackRecords.length > 0 ? { fallbacks: fallbackRecords } : {}),
@@ -2356,12 +2410,13 @@ Unlike geometra_expand_section, this collapses repeated radio/button groups into
       onlyRequiredFields: z.boolean().optional().default(false).describe('Only include required fields'),
       onlyInvalidFields: z.boolean().optional().default(false).describe('Only include invalid fields'),
       includeOptions: z.boolean().optional().default(false).describe('Include explicit choice option labels'),
+      includeFormGraph: z.boolean().optional().default(false).describe('Also include FormGraph 0.1-compatible graphs for the returned forms'),
       includeContext: formSchemaContextInput(),
       sinceSchemaId: z.string().optional().describe('If the current schema matches this id, return changed=false without resending forms'),
       format: formSchemaFormatInput(),
       sessionId: sessionIdInput,
     },
-    async ({ url, pageUrl, port, headless, width, height, slowMo, stealth, browserMode, isolated, formId, maxFields, onlyRequiredFields, onlyInvalidFields, includeOptions, includeContext, sinceSchemaId, format, sessionId }) => {
+    async ({ url, pageUrl, port, headless, width, height, slowMo, stealth, browserMode, isolated, formId, maxFields, onlyRequiredFields, onlyInvalidFields, includeOptions, includeFormGraph, includeContext, sinceSchemaId, format, sessionId }) => {
       const browser = resolveBrowserStealth({ stealth, browserMode })
       if (!browser.ok) return err(browser.error)
       const resolved = await ensureToolSession(
@@ -2380,6 +2435,7 @@ Unlike geometra_expand_section, this collapses repeated radio/button groups into
         onlyRequiredFields,
         onlyInvalidFields,
         includeOptions,
+        includeFormGraph,
         includeContext,
         sinceSchemaId,
         format,
@@ -2543,7 +2599,7 @@ After clicking, returns a compact semantic delta when possible (dialogs/forms/li
         .optional()
         .default(2_500)
         .describe('Per-scroll wait timeout while revealing a semantic target (default 2500ms)'),
-      waitFor: z.object(waitConditionShape()).optional().describe('Optional semantic condition to wait for after the click'),
+      waitFor: z.object(waitConditionShape()).strict().optional().describe('Optional semantic condition to wait for after the click'),
       timeoutMs: z
         .number()
         .int()
@@ -2588,6 +2644,29 @@ After clicking, returns a compact semantic delta when possible (dialogs/forms/li
       })
       if (!resolved.ok) return err(clickFallbackErrorMessage(resolved))
 
+      const waitFilter: NodeFilter | undefined = waitFor ? {
+        id: waitFor.id,
+        role: waitFor.role,
+        name: waitFor.name,
+        text: waitFor.text,
+        contextText: waitFor.contextText,
+        promptText: waitFor.promptText,
+        sectionText: waitFor.sectionText,
+        itemText: waitFor.itemText,
+        value: waitFor.value,
+        checked: waitFor.checked,
+        disabled: waitFor.disabled,
+        focused: waitFor.focused,
+        selected: waitFor.selected,
+        expanded: waitFor.expanded,
+        invalid: waitFor.invalid,
+        required: waitFor.required,
+        busy: waitFor.busy,
+      } : undefined
+      const waitEvidenceRoot = sessionA11y(session) ?? before
+      const beforeWaitEvidence = waitFilter && waitEvidenceRoot
+        ? captureWaitEvidence(waitEvidenceRoot, waitFilter)
+        : undefined
       const wait = await sendClick(session, resolved.value.x, resolved.value.y, timeoutMs)
 
       const summary = postActionSummary(session, before, wait, detail)
@@ -2597,36 +2676,22 @@ After clicking, returns a compact semantic delta when possible (dialogs/forms/li
       const lines = [clickLine, summary]
       if (waitFor) {
         const postWait = await waitForSemanticCondition(session, {
-          filter: {
-            id: waitFor.id,
-            role: waitFor.role,
-            name: waitFor.name,
-            text: waitFor.text,
-            contextText: waitFor.contextText,
-            promptText: waitFor.promptText,
-            sectionText: waitFor.sectionText,
-            itemText: waitFor.itemText,
-            value: waitFor.value,
-            checked: waitFor.checked,
-            disabled: waitFor.disabled,
-            focused: waitFor.focused,
-            selected: waitFor.selected,
-            expanded: waitFor.expanded,
-            invalid: waitFor.invalid,
-            required: waitFor.required,
-            busy: waitFor.busy,
-          },
+          filter: waitFilter!,
           present: waitFor.present ?? true,
           timeoutMs: waitFor.timeoutMs ?? 10_000,
         })
         if (!postWait.ok) return err([...lines, postWait.error].join('\n'))
+        const fresh = waitConditionHasFreshEvidence(beforeWaitEvidence, sessionA11y(session), postWait.value)
+        if (!fresh) {
+          return err([...lines, 'Post-click condition matched only pre-existing evidence; the click outcome is unconfirmed.'].join('\n'))
+        }
         lines.push(`Post-click ${waitConditionSuccessLine(postWait.value)}`)
         const compact = {
           at: { x: resolved.value.x, y: resolved.value.y },
           ...(resolved.value.target ? { target: compactNodeReference(resolved.value.target), revealSteps: resolved.value.revealAttempts ?? 0 } : {}),
           ...waitStatusPayload(wait),
           ...(resolved.fallback ? { fallback: resolved.fallback } : {}),
-          postWait: waitConditionCompact(postWait.value),
+          postWait: { ...waitConditionCompact(postWait.value), fresh: true },
         }
         return ok(detailText(lines.filter(Boolean).join('\n'), compact, detail))
       }
@@ -2635,6 +2700,9 @@ After clicking, returns a compact semantic delta when possible (dialogs/forms/li
         ...(resolved.value.target ? { target: compactNodeReference(resolved.value.target), revealSteps: resolved.value.revealAttempts ?? 0 } : {}),
         ...waitStatusPayload(wait),
         ...(resolved.fallback ? { fallback: resolved.fallback } : {}),
+      }
+      if (wait.status === 'timed_out') {
+        return err(detailText(lines.filter(Boolean).join('\n'), { completed: false, outcome: 'unconfirmed', ...compact }, detail))
       }
       return ok(detailText(lines.filter(Boolean).join('\n'), compact, detail))
     }
@@ -2667,10 +2735,10 @@ Each character is sent as a key event through the geometry protocol. Returns a c
       const wait = await sendType(session, text, timeoutMs)
 
       const summary = postActionSummary(session, before, wait, detail)
-      return ok(detailText(`Typed "${text}".\n${summary}`, {
+      return actionWaitResponse(wait, `Typed "${text}".\n${summary}`, {
         ...compactTextValue(text),
         ...waitStatusPayload(wait),
-      }, detail))
+      }, detail)
     }
   )
 
@@ -2703,10 +2771,10 @@ Each character is sent as a key event through the geometry protocol. Returns a c
       const wait = await sendKey(session, key, { shift, ctrl, meta, alt }, timeoutMs)
 
       const summary = postActionSummary(session, before, wait, detail)
-      return ok(detailText(`Pressed ${formatKeyCombo(key, { shift, ctrl, meta, alt })}.\n${summary}`, {
+      return actionWaitResponse(wait, `Pressed ${formatKeyCombo(key, { shift, ctrl, meta, alt })}.\n${summary}`, {
         key: formatKeyCombo(key, { shift, ctrl, meta, alt }),
         ...waitStatusPayload(wait),
-      }, detail))
+      }, detail)
     }
   )
 
@@ -2747,7 +2815,8 @@ Detection is fully generic (no site branding). It refuses to run if the detected
         )
         const summary = postActionSummary(session, before, wait, detail)
         const result = wait.result as Record<string, unknown> | undefined
-        return ok(detailText(
+        return actionWaitResponse(
+          wait,
           `Filled OTP code (${value.length} chars).\n${summary}`,
           {
             ...compactTextValue(value),
@@ -2757,7 +2826,7 @@ Detection is fully generic (no site branding). It refuses to run if the detected
             ...waitStatusPayload(wait),
           },
           detail,
-        ))
+        )
       } catch (e) {
         return err((e as Error).message)
       }
@@ -2808,13 +2877,13 @@ Strategies: **auto** (default) tries chooser click if x,y given, else a labeled 
           drop: dropX !== undefined && dropY !== undefined ? { x: dropX, y: dropY } : undefined,
         }, timeoutMs ?? 8_000)
         const summary = postActionSummary(session, before, wait, detail)
-        return ok(detailText(`Uploaded ${paths.length} file(s).\n${summary}`, {
+        return actionWaitResponse(wait, `Uploaded ${paths.length} file(s).\n${summary}`, {
           fileCount: paths.length,
           ...(fieldLabel ? { fieldLabel } : {}),
           ...(strategy ? { strategy } : {}),
           ...waitStatusPayload(wait),
           ...(fieldLabel ? { readback: fieldStatePayload(session, fieldLabel) } : {}),
-        }, detail))
+        }, detail)
       } catch (e) {
         return err((e as Error).message)
       }
@@ -2831,6 +2900,8 @@ Pass \`fieldLabel\` to open a labeled dropdown semantically instead of relying o
       exact: z.boolean().optional().describe('Exact name match'),
       openX: z.number().optional().describe('Click to open dropdown'),
       openY: z.number().optional().describe('Click to open dropdown'),
+      fieldId: z.string().trim().min(1).optional().describe('Stable field id from geometra_form_schema'),
+      fieldKey: z.string().trim().min(1).optional().describe('Authored field key from geometra_form_schema for exact resolution'),
       fieldLabel: z.string().optional().describe('Field label of the dropdown/combobox to open semantically (e.g. "Location")'),
       contextText: z.string().optional().describe('Ancestor / prompt text to disambiguate repeated dropdowns with the same label'),
       sectionText: z.string().optional().describe('Containing section text to disambiguate repeated dropdowns'),
@@ -2845,31 +2916,38 @@ Pass \`fieldLabel\` to open a labeled dropdown semantically instead of relying o
       detail: detailInput(),
       sessionId: sessionIdInput,
     },
-    async ({ label, exact, openX, openY, fieldLabel, contextText: _contextText, sectionText: _sectionText, query, timeoutMs, detail, sessionId }) => {
+    async ({ label, exact, openX, openY, fieldId, fieldKey, fieldLabel, contextText, sectionText, query, timeoutMs, detail, sessionId }) => {
       const sessionResult = resolveToolSession(sessionId)
       if ('error' in sessionResult) return sessionResult.error
       const session = sessionResult.session
       const before = sessionA11y(session)
+      if (contextText || sectionText) {
+        return err('contextText/sectionText are not supported for listbox resolution; pass fieldKey from geometra_form_schema instead.')
+      }
       try {
         const wait = await sendListboxPick(session, label, {
           exact,
           open: openX !== undefined && openY !== undefined ? { x: openX, y: openY } : undefined,
+          fieldId,
+          fieldKey,
           fieldLabel,
           query,
         }, timeoutMs)
         const summary = postActionSummary(session, before, wait, detail)
-        const fieldSummary = fieldLabel ? summarizeFieldLabelState(session, fieldLabel) : undefined
+        const fieldSummary = fieldLabel ? summarizeFieldLabelState(session, fieldLabel, fieldKey) : undefined
         const summaryText = [
           `Picked listbox option "${label}".`,
           fieldSummary,
           summary,
         ].filter(Boolean).join('\n')
-        return ok(detailText(summaryText, {
+        return actionWaitResponse(wait, summaryText, {
           label,
+          ...(fieldId ? { fieldId } : {}),
+          ...(fieldKey ? { fieldKey } : {}),
           ...(fieldLabel ? { fieldLabel } : {}),
           ...waitStatusPayload(wait),
-          ...(fieldLabel ? { readback: fieldStatePayload(session, fieldLabel) } : {}),
-        }, detail))
+          ...(fieldLabel ? { readback: fieldStatePayload(session, fieldLabel, fieldKey) } : {}),
+        }, detail)
       } catch (e) {
         return err((e as Error).message)
       }
@@ -2911,55 +2989,68 @@ Custom React/Vue dropdowns are not supported here — use \`geometra_pick_listbo
       try {
         const wait = await sendSelectOption(session, x, y, { value, label, index }, timeoutMs)
         const summary = postActionSummary(session, before, wait, detail)
-        return ok(detailText(`Selected option.\n${summary}`, {
+        return actionWaitResponse(wait, `Selected option.\n${summary}`, {
           at: { x, y },
           ...(value !== undefined ? { value } : {}),
           ...(label !== undefined ? { label } : {}),
           ...(index !== undefined ? { index } : {}),
           ...waitStatusPayload(wait),
-        }, detail))
+        }, detail)
       } catch (e) {
         return err((e as Error).message)
       }
     }
   )
 
-  server.tool(
+  server.registerTool(
     'geometra_set_checked',
-    `Set a checkbox or radio by label. Requires \`@geometra/proxy\`.
-
-Prefer this over raw coordinate clicks for custom forms that keep the real input visually hidden (common on Ashby, Greenhouse custom widgets, and design-system checkboxes/radios). Uses substring label matching unless exact=true.`,
     {
-      label: z.string().describe('Accessible label or visible option text to match'),
-      checked: z.boolean().optional().default(true).describe('Desired checked state (radios only support true)'),
-      exact: z.boolean().optional().describe('Exact label match'),
-      controlType: z.enum(['checkbox', 'radio']).optional().describe('Limit matching to checkbox or radio'),
-      contextText: z.string().optional().describe('Ancestor / prompt text to disambiguate repeated checkboxes/radios'),
-      sectionText: z.string().optional().describe('Containing section text to disambiguate repeated checkboxes/radios'),
-      timeoutMs: z
-        .number()
-        .int()
-        .min(50)
-        .max(60_000)
-        .optional()
-        .describe('Optional action wait timeout'),
-      detail: detailInput(),
-      sessionId: sessionIdInput,
+      description: `Set a checkbox or radio by label. Requires \`@geometra/proxy\`.
+
+Prefer this over raw coordinate clicks for custom forms that keep the real input visually hidden (common on Ashby, Greenhouse custom widgets, and design-system checkboxes/radios). Uses substring label matching unless exact=true. Unknown parameter names are rejected.`,
+      inputSchema: z.object({
+        label: z.string().trim().min(1, 'label must not be empty').describe('Accessible label or visible option text to match'),
+        checked: z.boolean().optional().default(true).describe('Desired checked state (radios only support true)'),
+        exact: z.boolean().optional().describe('Exact label match'),
+        controlType: z.enum(['checkbox', 'radio']).optional().describe('Limit matching to checkbox or radio'),
+        fieldKey: z.string().trim().min(1).optional().describe('Authored field key from geometra_form_schema for exact resolution'),
+        contextText: z.string().trim().min(1).optional().describe('Ancestor / prompt text to disambiguate repeated checkboxes/radios'),
+        sectionText: z.string().trim().min(1).optional().describe('Containing section text to disambiguate repeated checkboxes/radios'),
+        timeoutMs: z
+          .number()
+          .int()
+          .min(50)
+          .max(60_000)
+          .optional()
+          .describe('Optional action wait timeout'),
+        detail: detailInput(),
+        sessionId: sessionIdInput,
+      }).strict(),
     },
-    async ({ label, checked, exact, controlType, contextText: _contextText, sectionText: _sectionText, timeoutMs, detail, sessionId }) => {
+    async ({ label, checked, exact, controlType, fieldKey, contextText, sectionText, timeoutMs, detail, sessionId }) => {
       const sessionResult = resolveToolSession(sessionId)
       if ('error' in sessionResult) return sessionResult.error
       const session = sessionResult.session
       const before = sessionA11y(session)
       try {
-        const wait = await sendSetChecked(session, label, { checked, exact, controlType }, timeoutMs)
+        const wait = await sendSetChecked(session, label, {
+          checked,
+          exact,
+          controlType,
+          ...(fieldKey ? { fieldKey } : {}),
+          contextText,
+          sectionText,
+        }, timeoutMs)
         const summary = postActionSummary(session, before, wait, detail)
-        return ok(detailText(`Set ${controlType ?? 'checkbox/radio'} "${label}" to ${String(checked ?? true)}.\n${summary}`, {
+        return actionWaitResponse(wait, `Set ${controlType ?? 'checkbox/radio'} "${label}" to ${String(checked ?? true)}.\n${summary}`, {
           label,
           checked: checked ?? true,
           ...(controlType ? { controlType } : {}),
+          ...(fieldKey ? { fieldKey } : {}),
+          ...(contextText ? { contextText } : {}),
+          ...(sectionText ? { sectionText } : {}),
           ...waitStatusPayload(wait),
-        }, detail))
+        }, detail)
       } catch (e) {
         return err((e as Error).message)
       }
@@ -2993,12 +3084,12 @@ Prefer this over raw coordinate clicks for custom forms that keep the real input
       try {
         const wait = await sendWheel(session, deltaY, { deltaX, x, y }, timeoutMs)
         const summary = postActionSummary(session, before, wait, detail)
-        return ok(detailText(`Wheel delta (${deltaX ?? 0}, ${deltaY}).\n${summary}`, {
+        return actionWaitResponse(wait, `Wheel delta (${deltaX ?? 0}, ${deltaY}).\n${summary}`, {
           deltaY,
           ...(deltaX !== undefined ? { deltaX } : {}),
           ...(x !== undefined && y !== undefined ? { at: { x, y } } : {}),
           ...waitStatusPayload(wait),
-        }, detail))
+        }, detail)
       } catch (e) {
         return err((e as Error).message)
       }
@@ -3401,6 +3492,7 @@ function packedFormSchemas(forms: FormSchemaModel[]): Array<Record<string, unkno
     ic: form.invalidCount,
     f: form.fields.map(field => ({
       i: field.id,
+      ...(field.fieldKey ? { fk: field.fieldKey } : {}),
       k: field.kind,
       l: field.label,
       ...(field.required ? { r: 1 } : {}),
@@ -3409,6 +3501,8 @@ function packedFormSchemas(forms: FormSchemaModel[]): Array<Record<string, unkno
       ...(field.booleanChoice ? { b: 1 } : {}),
       ...(field.controlType ? { t: field.controlType } : {}),
       ...(field.optionCount !== undefined ? { oc: field.optionCount } : {}),
+      ...(field.options ? { o: field.options } : {}),
+      ...(field.optionDetails ? { od: field.optionDetails } : {}),
       ...(field.value ? { v: field.value } : {}),
       ...(field.valueLength !== undefined ? { vl: field.valueLength } : {}),
       ...(field.checked !== undefined ? { c: field.checked ? 1 : 0 } : {}),
@@ -3423,10 +3517,13 @@ function packedFormSchemas(forms: FormSchemaModel[]): Array<Record<string, unkno
 
 function formSchemaResponsePayload(
   session: Session,
-  opts: FormSchemaBuildOptions & { sinceSchemaId?: string; format?: FormSchemaFormat },
+  opts: FormSchemaResponseOptions,
 ): Record<string, unknown> {
   const forms = getSessionFormSchemas(session, opts)
-  const schemaJson = JSON.stringify(forms)
+  const graphForms = opts.includeFormGraph && !opts.includeOptions
+    ? getSessionFormSchemas(session, { ...opts, includeOptions: true })
+    : forms
+  const schemaJson = JSON.stringify(forms) + (opts.includeFormGraph ? '|formgraph' : '')
   const schemaId = `fs:${shortHash(schemaJson)}`
   if (opts.sinceSchemaId && opts.sinceSchemaId === schemaId) {
     return {
@@ -3437,12 +3534,14 @@ function formSchemaResponsePayload(
     }
   }
 
+  const pageUrl = sessionA11y(session)?.meta?.pageUrl
   return {
     schemaId,
     changed: true,
     formCount: forms.length,
     format: opts.format ?? 'compact',
     forms: (opts.format ?? 'compact') === 'packed' ? packedFormSchemas(forms) : forms,
+    ...(opts.includeFormGraph ? { formGraphs: graphForms.map(form => formSchemaToFormGraph(form, pageUrl)) } : {}),
   }
 }
 
@@ -3512,7 +3611,7 @@ function connectResponsePayload(
     blockedSitePolicy?: BlockedSitePolicy
     manualHandoff?: boolean
     headless?: boolean
-    formSchema?: FormSchemaBuildOptions & { sinceSchemaId?: string; format?: FormSchemaFormat }
+    formSchema?: FormSchemaResponseOptions
     pageModelOptions?: { maxPrimaryActions?: number; maxSectionsPerKind?: number; blockDetection?: boolean }
   },
 ): Record<string, unknown> {
@@ -3777,6 +3876,41 @@ interface SessionSignals {
   }>
 }
 
+function formNodeAtPath(root: A11yNode, path: number[]): A11yNode | undefined {
+  const node = findNodeByPath(root, path)
+  return node?.role === 'form' ? node : undefined
+}
+
+function resolveSubmitFormNode(
+  root: A11yNode,
+  formId: string | undefined,
+  submitPath: number[] | undefined,
+): A11yNode | undefined {
+  const parsedForm = formId ? parseSectionId(formId) : null
+  if (parsedForm?.kind === 'form') {
+    const explicit = formNodeAtPath(root, parsedForm.path)
+    if (explicit) return explicit
+  }
+  if (!submitPath) return undefined
+  for (let length = submitPath.length; length >= 0; length--) {
+    const candidate = formNodeAtPath(root, submitPath.slice(0, length))
+    if (candidate) return candidate
+  }
+  return undefined
+}
+
+function scopeSessionSignalsToForm(
+  pageRoot: A11yNode,
+  formNode: A11yNode | undefined,
+  targetFormWasKnown = false,
+): SessionSignals {
+  const pageSignals = collectSessionSignals(pageRoot)
+  if (formNode) {
+    return { ...pageSignals, invalidFields: collectSessionSignals(formNode).invalidFields }
+  }
+  return targetFormWasKnown ? { ...pageSignals, invalidFields: [] } : pageSignals
+}
+
 function collectSessionSignals(root: A11yNode): SessionSignals {
   const signals: SessionSignals = {
     ...(root.meta?.pageUrl ? { pageUrl: root.meta.pageUrl } : {}),
@@ -3790,6 +3924,17 @@ function collectSessionSignals(root: A11yNode): SessionSignals {
 
   const seenAlerts = new Set<string>()
   const seenInvalidIds = new Set<string>()
+  const formControlRoles = new Set([
+    'textbox',
+    'combobox',
+    'checkbox',
+    'radio',
+    'spinbutton',
+    'listbox',
+    'searchbox',
+    'slider',
+    'switch',
+  ])
 
   const captchaPattern = /recaptcha|g-recaptcha|hcaptcha|h-captcha|turnstile|cf-turnstile|captcha/i
   const captchaTypes: Record<string, string> = {
@@ -3816,7 +3961,11 @@ function collectSessionSignals(root: A11yNode): SessionSignals {
         signals.alerts.push(text)
       }
     }
-    if ((node.role === 'textbox' || node.role === 'combobox' || node.role === 'checkbox' || node.role === 'radio') && node.state?.invalid) {
+    const isFormControl = formControlRoles.has(node.role) ||
+      node.meta?.controlTag === 'input' ||
+      node.meta?.controlTag === 'textarea' ||
+      node.meta?.controlTag === 'select'
+    if (isFormControl && (node.state?.invalid === true || Boolean(node.validation?.error))) {
       const id = nodeIdForPath(node.path)
       if (!seenInvalidIds.has(id)) {
         seenInvalidIds.add(id)
@@ -3925,19 +4074,29 @@ function compactTextValue(value: string, inlineLimit = 48): { value?: string; va
     : { valueLength: value.length }
 }
 
-function fieldStatePayload(session: Session, fieldLabel: string): FieldStatePayload | undefined {
+function fieldReadbackNodes(
+  a11y: A11yNode,
+  fieldLabel: string,
+  roles: string[],
+  fieldKey?: string,
+): A11yNode[] {
+  if (fieldKey) {
+    const matches: A11yNode[] = []
+    const allowedRoles = new Set(roles)
+    const walk = (node: A11yNode) => {
+      if (allowedRoles.has(node.role) && node.meta?.controlKey === fieldKey) matches.push(node)
+      for (const child of node.children) walk(child)
+    }
+    walk(a11y)
+    return matches
+  }
+  return roles.flatMap(role => findNodes(a11y, { name: fieldLabel, role }))
+}
+
+function fieldStatePayload(session: Session, fieldLabel: string, fieldKey?: string): FieldStatePayload | undefined {
   const a11y = sessionA11y(session)
   if (!a11y) return undefined
-  const matches = findNodes(a11y, {
-    name: fieldLabel,
-    role: 'combobox',
-  })
-  if (matches.length === 0) {
-    matches.push(...findNodes(a11y, { name: fieldLabel, role: 'textbox' }))
-  }
-  if (matches.length === 0) {
-    matches.push(...findNodes(a11y, { name: fieldLabel, role: 'button' }))
-  }
+  const matches = fieldReadbackNodes(a11y, fieldLabel, ['combobox', 'textbox', 'button'], fieldKey)
   const match = matches[0]
   if (!match) return undefined
 
@@ -4033,6 +4192,54 @@ function waitConditionCompact(result: WaitConditionResult): Record<string, unkno
     filter: compactFilterPayload(result.filter),
     ...(result.present ? { matchCount: result.matchCount } : {}),
   }
+}
+
+interface WaitEvidenceSnapshot {
+  matchCount: number
+  fingerprints: Set<string>
+}
+
+function waitEvidenceNodeSnapshot(node: A11yNode, filter: NodeFilter): Record<string, unknown> {
+  const relevantState = {
+    ...(filter.checked !== undefined ? { checked: node.state?.checked } : {}),
+    ...(filter.disabled !== undefined ? { disabled: node.state?.disabled } : {}),
+    ...(filter.focused !== undefined ? { focused: node.state?.focused } : {}),
+    ...(filter.selected !== undefined ? { selected: node.state?.selected } : {}),
+    ...(filter.expanded !== undefined ? { expanded: node.state?.expanded } : {}),
+    ...(filter.invalid !== undefined ? { invalid: node.state?.invalid } : {}),
+    ...(filter.required !== undefined ? { required: node.state?.required } : {}),
+    ...(filter.busy !== undefined ? { busy: node.state?.busy } : {}),
+  }
+  return {
+    role: node.role,
+    name: node.name,
+    value: node.value,
+    validation: node.validation,
+    ...(Object.keys(relevantState).length > 0 ? { state: relevantState } : {}),
+  }
+}
+
+function captureWaitEvidence(root: A11yNode, filter: NodeFilter): WaitEvidenceSnapshot {
+  const matches = findNodes(root, filter)
+  return {
+    matchCount: matches.length,
+    fingerprints: new Set(matches.map(node => JSON.stringify(waitEvidenceNodeSnapshot(node, filter)))),
+  }
+}
+
+function waitConditionHasFreshEvidence(
+  before: WaitEvidenceSnapshot | undefined,
+  after: A11yNode | null | undefined,
+  result: WaitConditionResult,
+): boolean {
+  if (!before || !after) return false
+  const current = captureWaitEvidence(after, result.filter)
+  if (!result.present) {
+    return before.matchCount > 0 && current.matchCount === 0
+  }
+  if (current.matchCount === 0) return false
+  if (before.matchCount === 0) return true
+  return [...current.fingerprints].some(fingerprint => !before.fingerprints.has(fingerprint))
 }
 
 function inferRevealStepBudget(
@@ -4335,6 +4542,22 @@ function detailText(summary: string, compact: Record<string, unknown>, detail: R
   return detail === 'terse' ? JSON.stringify(compact) : summary
 }
 
+function actionWaitResponse(
+  wait: UpdateWaitResult,
+  summary: string,
+  compact: Record<string, unknown>,
+  detail: ResponseDetail,
+) {
+  if (wait.status === 'timed_out') {
+    return err(detailText(summary, {
+      completed: false,
+      outcome: 'unconfirmed',
+      ...compact,
+    }, detail))
+  }
+  return ok(detailText(summary, compact, detail))
+}
+
 function normalizeLookupKey(value: string): string {
   return value.replace(/\s+/g, ' ').trim().toLowerCase()
 }
@@ -4384,6 +4607,62 @@ function coerceChoiceValue(field: FormSchemaField, value: FormValueInput): strin
   const desired = value ? 'yes' : 'no'
   const option = field.options?.find(option => normalizeLookupKey(option) === desired)
   return option ?? (value ? 'Yes' : 'No')
+}
+
+function resolveNativeChoiceValue(
+  field: FormSchemaField,
+  value: string,
+): { ok: true; value: string; optionIndex?: number; expectedReadback?: string } | { ok: false; error: string } {
+  const options = field.optionDetails
+  if (!options || options.length === 0) return { ok: true, value }
+  const resolved = (option: NonNullable<FormSchemaField['optionDetails']>[number]) => ({
+    ok: true as const,
+    value: option.value,
+    optionIndex: option.index,
+    expectedReadback: option.label,
+  })
+
+  const enabled = options.filter(option => !option.disabled)
+  const exactValue = enabled.filter(option => option.value === value)
+  if (exactValue.length > 0) return resolved(exactValue[0]!)
+
+  const lookup = normalizeLookupKey(value)
+  const normalizedValues = enabled.filter(option => normalizeLookupKey(option.value) === lookup)
+  if (normalizedValues.length === 1) return resolved(normalizedValues[0]!)
+  if (normalizedValues.length > 1) {
+    const distinct = new Set(normalizedValues.map(option => option.value))
+    if (distinct.size === 1) return resolved(normalizedValues[0]!)
+    return {
+      ok: false,
+      error: `Option value "${value}" is ambiguous for field "${field.label}". Use an exact option value from optionDetails.`,
+    }
+  }
+
+  const labelMatches = enabled.filter(option => normalizeLookupKey(option.label) === lookup)
+  if (labelMatches.length === 1) return resolved(labelMatches[0]!)
+  if (labelMatches.length > 1) {
+    const distinctValues = new Set(labelMatches.map(option => option.value))
+    if (distinctValues.size === 1) return resolved(labelMatches[0]!)
+    return {
+      ok: false,
+      error: `Option label "${value}" maps to multiple submitted values for field "${field.label}". Use an exact option value from optionDetails.`,
+    }
+  }
+
+  const disabledMatch = options.some(option => option.disabled && (
+    option.value === value ||
+    normalizeLookupKey(option.value) === lookup ||
+    normalizeLookupKey(option.label) === lookup
+  ))
+  if (disabledMatch) {
+    return { ok: false, error: `Option "${value}" is disabled for field "${field.label}".` }
+  }
+
+  const available = enabled.slice(0, 12).map(option => `${option.label} (${option.value})`)
+  return {
+    ok: false,
+    error: `Unknown option "${value}" for field "${field.label}".${available.length > 0 ? ` Available options: ${available.join(', ')}.` : ''}`,
+  }
 }
 
 /**
@@ -4467,24 +4746,45 @@ function plannedFillInputsForField(field: FormSchemaField, value: FormValueInput
   if (field.kind === 'text') {
     if (typeof value !== 'string') return { error: `Field "${field.label}" expects a string value` }
     const normalized = normalizeFieldValue(value, field.format)
-    return [{ kind: 'text', fieldId: field.id, fieldLabel: field.label, value: normalized }]
+    return [{
+      kind: 'text',
+      fieldId: field.id,
+      ...(field.fieldKey ? { fieldKey: field.fieldKey } : {}),
+      fieldLabel: field.label,
+      value: normalized,
+    }]
   }
 
   if (field.kind === 'choice') {
     const coerced = coerceChoiceValue(field, value)
-    if (!coerced) return { error: `Field "${field.label}" expects a string value` }
+    if (coerced === null) return { error: `Field "${field.label}" expects a string value` }
+    const resolvedChoice = field.choiceType === 'select'
+      ? resolveNativeChoiceValue(field, coerced)
+      : { ok: true as const, value: coerced }
+    if (!resolvedChoice.ok) return { error: resolvedChoice.error }
     return [{
       kind: 'choice',
       fieldId: field.id,
+      ...(field.fieldKey ? { fieldKey: field.fieldKey } : {}),
       fieldLabel: field.label,
-      value: coerced,
+      value: resolvedChoice.value,
+      ...(resolvedChoice.optionIndex !== undefined ? { optionIndex: resolvedChoice.optionIndex } : {}),
+      ...(resolvedChoice.expectedReadback !== undefined ? { expectedReadback: resolvedChoice.expectedReadback } : {}),
+      ...(field.choiceType === 'select' && field.optionDetails?.length ? { exact: true } : {}),
       ...(field.choiceType ? { choiceType: field.choiceType } : {}),
     }]
   }
 
   if (field.kind === 'toggle') {
     if (typeof value !== 'boolean') return { error: `Field "${field.label}" expects a boolean value` }
-    return [{ kind: 'toggle', fieldId: field.id, label: field.label, checked: value, controlType: field.controlType }]
+    return [{
+      kind: 'toggle',
+      fieldId: field.id,
+      ...(field.fieldKey ? { fieldKey: field.fieldKey } : {}),
+      label: field.label,
+      checked: value,
+      controlType: field.controlType,
+    }]
   }
 
   const selected = Array.isArray(value) ? value : typeof value === 'string' ? [value] : null
@@ -4496,6 +4796,7 @@ function plannedFillInputsForField(field: FormSchemaField, value: FormValueInput
   return field.options.map(option => ({
     kind: 'toggle',
     fieldId: field.id,
+    ...(field.fieldKey ? { fieldKey: field.fieldKey } : {}),
     label: option,
     checked: selectedKeys.has(normalizeLookupKey(option)),
     controlType: 'checkbox',
@@ -4508,12 +4809,29 @@ interface PlannedFillField {
   matchMethod: 'id' | 'label-exact' | 'label-normalized'
 }
 
+function unkeyedSchemaFieldIsAmbiguous(field: FormSchemaField, schemas: FormSchemaModel[]): boolean {
+  if (field.fieldKey) return false
+  const matchingIds = new Set<string>()
+  const label = normalizeLookupKey(field.label)
+  for (const schema of schemas) {
+    for (const candidate of schema.fields) {
+      if (normalizeLookupKey(candidate.label) === label) matchingIds.add(candidate.id)
+    }
+  }
+  return matchingIds.size > 1
+}
+
+function ambiguousFieldIdentityError(field: FormSchemaField): string {
+  return `Field "${field.label}" has no unique authored identity and shares its label with another control. Geometra refused to guess; refresh the schema or use a contextual recovery action.`
+}
+
 function planFormFill(
   schema: FormSchemaModel,
   opts: {
     valuesById?: Record<string, FormValueInput>
     valuesByLabel?: Record<string, FormValueInput>
   },
+  pageSchemas: FormSchemaModel[] = [schema],
 ): { ok: true; fields: ResolvedFillFieldInput[]; planned: PlannedFillField[] } | { ok: false; error: string } {
   const fieldById = new Map(schema.fields.map(field => [field.id, field]))
   const fieldsByLabel = new Map<string, FormSchemaField[]>()
@@ -4530,6 +4848,9 @@ function planFormFill(
   for (const [fieldId, value] of Object.entries(opts.valuesById ?? {})) {
     const field = fieldById.get(fieldId)
     if (!field) return { ok: false, error: `Unknown form field id ${fieldId}. Refresh geometra_form_schema and try again.` }
+    if (unkeyedSchemaFieldIsAmbiguous(field, pageSchemas)) {
+      return { ok: false, error: ambiguousFieldIdentityError(field) }
+    }
     const next = plannedFillInputsForField(field, value)
     if ('error' in next) return { ok: false, error: next.error }
     for (const n of next) allPlanned.push({ field: n, confidence: 1.0, matchMethod: 'id' })
@@ -4543,6 +4864,9 @@ function planFormFill(
       return { ok: false, error: `Label "${label}" is ambiguous in form ${schema.formId}. Use valuesById for this field.` }
     }
     const field = matches[0]!
+    if (unkeyedSchemaFieldIsAmbiguous(field, pageSchemas)) {
+      return { ok: false, error: ambiguousFieldIdentityError(field) }
+    }
     if (seenFieldIds.has(field.id)) {
       return { ok: false, error: `Field "${label}" was provided in both valuesById and valuesByLabel` }
     }
@@ -4568,35 +4892,76 @@ function resolveFillFieldInputs(
   fields: FillFieldInput[],
 ): { ok: true; fields: ResolvedFillFieldInput[] } | { ok: false; error: string } {
   const unresolved = fields.filter(field => !isResolvedFillFieldInput(field))
-  if (unresolved.length === 0) {
+  const a11y = sessionA11y(session)
+  if (unresolved.length === 0 && !a11y) {
     return { ok: true, fields: fields as ResolvedFillFieldInput[] }
   }
 
-  const a11y = sessionA11y(session)
-  if (!a11y) return { ok: false, error: 'No UI tree available to resolve fieldId entries from geometra_form_schema' }
+  if (!a11y) {
+    if (unresolved.length === 0) return { ok: true, fields: fields as ResolvedFillFieldInput[] }
+    return { ok: false, error: 'No UI tree available to resolve fieldId entries from geometra_form_schema' }
+  }
 
+  const schemas = buildFormSchemas(a11y, { includeOptions: true, includeContext: 'always' })
   const fieldById = new Map<string, FormSchemaField>()
-  for (const schema of buildFormSchemas(a11y, { includeOptions: true, includeContext: 'always' })) {
+  for (const schema of schemas) {
     for (const field of schema.fields) fieldById.set(field.id, field)
   }
 
   const resolved: ResolvedFillFieldInput[] = []
   for (const field of fields) {
     if (isResolvedFillFieldInput(field)) {
-      if (field.kind === 'choice' && field.fieldId && field.choiceType === undefined) {
-        const schemaField = fieldById.get(field.fieldId)
+      const schemaField = field.fieldId ? fieldById.get(field.fieldId) : undefined
+      if (field.fieldId && !schemaField) {
+        return { ok: false, error: `Unknown form field id ${field.fieldId}. Refresh geometra_form_schema and try again.` }
+      }
+      if (schemaField) {
+        const expectedKind = field.kind === 'file' ? 'file' : field.kind
+        if (field.kind !== 'file' && schemaField.kind !== expectedKind) {
+          return { ok: false, error: `Field id ${field.fieldId} resolves to kind "${schemaField.kind}", not ${field.kind}.` }
+        }
+      }
+      const suppliedLabel = field.kind === 'toggle' ? field.label : field.fieldLabel
+      const distinctLabelMatches = new Map<string, FormSchemaField>()
+      for (const candidate of fieldById.values()) {
+        if (normalizeLookupKey(candidate.label) === normalizeLookupKey(suppliedLabel)) {
+          distinctLabelMatches.set(candidate.id, candidate)
+        }
+      }
+      const effectiveFieldKey = field.fieldKey ?? schemaField?.fieldKey
+      if (!effectiveFieldKey && distinctLabelMatches.size > 1) {
+        return {
+          ok: false,
+          error: schemaField
+            ? ambiguousFieldIdentityError(schemaField)
+            : `Field label "${suppliedLabel}" is ambiguous and no exact field identity was supplied. Geometra refused to guess.`,
+        }
+      }
+      if (field.kind === 'choice' && schemaField?.kind === 'choice') {
+        const resolvedChoice = schemaField.choiceType === 'select'
+          ? resolveNativeChoiceValue(schemaField, field.value)
+          : { ok: true as const, value: field.value }
+        if (!resolvedChoice.ok) return { ok: false, error: resolvedChoice.error }
         resolved.push({
           ...field,
-          ...(schemaField?.kind === 'choice' && schemaField.choiceType ? { choiceType: schemaField.choiceType } : {}),
+          value: resolvedChoice.value,
+          ...(resolvedChoice.optionIndex !== undefined ? { optionIndex: resolvedChoice.optionIndex } : {}),
+          ...(resolvedChoice.expectedReadback !== undefined ? { expectedReadback: resolvedChoice.expectedReadback } : {}),
+          ...(schemaField.fieldKey ? { fieldKey: schemaField.fieldKey } : {}),
+          ...(field.choiceType === undefined && schemaField.choiceType ? { choiceType: schemaField.choiceType } : {}),
+          ...(schemaField.choiceType === 'select' && schemaField.optionDetails?.length ? { exact: true } : {}),
         })
-      } else if (field.kind === 'toggle' && field.fieldId && field.controlType === undefined) {
-        const schemaField = fieldById.get(field.fieldId)
+      } else if (field.kind === 'toggle' && schemaField?.kind === 'toggle') {
         resolved.push({
           ...field,
-          ...(schemaField?.kind === 'toggle' && schemaField.controlType ? { controlType: schemaField.controlType } : {}),
+          ...(schemaField.fieldKey ? { fieldKey: schemaField.fieldKey } : {}),
+          ...(field.controlType === undefined && schemaField.controlType ? { controlType: schemaField.controlType } : {}),
         })
       } else {
-        resolved.push(field)
+        resolved.push({
+          ...field,
+          ...(schemaField?.fieldKey ? { fieldKey: schemaField.fieldKey } : {}),
+        })
       }
       continue
     }
@@ -4615,12 +4980,19 @@ function resolveFillFieldInputs(
     if (!schemaField) {
       return { ok: false, error: `Unknown form field id ${field.fieldId}. Refresh geometra_form_schema and try again.` }
     }
+    if (unkeyedSchemaFieldIsAmbiguous(schemaField, schemas)) {
+      return { ok: false, error: ambiguousFieldIdentityError(schemaField) }
+    }
 
     if (field.kind === 'text') {
       if (schemaField.kind !== 'text') {
         return { ok: false, error: `Field id ${field.fieldId} resolves to kind "${schemaField.kind}", not text.` }
       }
-      resolved.push({ ...field, fieldLabel: schemaField.label })
+      resolved.push({
+        ...field,
+        ...(schemaField.fieldKey ? { fieldKey: schemaField.fieldKey } : {}),
+        fieldLabel: schemaField.label,
+      })
       continue
     }
 
@@ -4628,10 +5000,19 @@ function resolveFillFieldInputs(
       if (schemaField.kind !== 'choice') {
         return { ok: false, error: `Field id ${field.fieldId} resolves to kind "${schemaField.kind}", not choice.` }
       }
+      const resolvedChoice = schemaField.choiceType === 'select'
+        ? resolveNativeChoiceValue(schemaField, field.value)
+        : { ok: true as const, value: field.value }
+      if (!resolvedChoice.ok) return { ok: false, error: resolvedChoice.error }
       resolved.push({
         ...field,
+        ...(schemaField.fieldKey ? { fieldKey: schemaField.fieldKey } : {}),
         fieldLabel: schemaField.label,
+        value: resolvedChoice.value,
+        ...(resolvedChoice.optionIndex !== undefined ? { optionIndex: resolvedChoice.optionIndex } : {}),
+        ...(resolvedChoice.expectedReadback !== undefined ? { expectedReadback: resolvedChoice.expectedReadback } : {}),
         ...(field.choiceType === undefined && schemaField.choiceType ? { choiceType: schemaField.choiceType } : {}),
+        ...(schemaField.choiceType === 'select' && schemaField.optionDetails?.length ? { exact: true } : {}),
       })
       continue
     }
@@ -4642,6 +5023,7 @@ function resolveFillFieldInputs(
       }
       resolved.push({
         ...field,
+        ...(schemaField.fieldKey ? { fieldKey: schemaField.fieldKey } : {}),
         label: schemaField.label,
         ...(field.controlType === undefined && schemaField.controlType ? { controlType: schemaField.controlType } : {}),
       })
@@ -4708,19 +5090,6 @@ function parseProxyFillAckResult(value: unknown): ProxyFillAckResult | undefined
   }
 }
 
-function directLabelBatchFields(
-  valuesByLabel: Record<string, FormValueInput> | undefined,
-): Array<{ kind: 'auto'; fieldLabel: string; value: string | boolean }> | null {
-  const entries = Object.entries(valuesByLabel ?? {})
-  if (entries.length === 0) return null
-  const fields: Array<{ kind: 'auto'; fieldLabel: string; value: string | boolean }> = []
-  for (const [fieldLabel, value] of entries) {
-    if (typeof value !== 'string' && typeof value !== 'boolean') return null
-    fields.push({ kind: 'auto', fieldLabel, value })
-  }
-  return fields
-}
-
 async function tryBatchedResolvedFields(
   session: Session,
   fields: ResolvedFillFieldInput[],
@@ -4732,7 +5101,8 @@ async function tryBatchedResolvedFields(
   let batchAckResult: ProxyFillAckResult | undefined
   try {
     const startRevision = session.updateRevision
-    const wait = await sendFillFields(session, fields)
+    const wait = await sendFillFields(session, toProxyFillFields(fields))
+    if (wait.status === 'timed_out') return { ok: false }
     const ackResult = parseProxyFillAckResult(wait.result)
     batchAckResult = ackResult
     if (ackResult && ackResult.invalidCount === 0) {
@@ -4786,26 +5156,37 @@ async function waitForBatchFieldReadback(session: Session, fields: ResolvedFillF
 function batchFieldReadbackMatches(a11y: A11yNode, field: ResolvedFillFieldInput): boolean {
   switch (field.kind) {
     case 'text': {
-      const matches = findNodes(a11y, { name: field.fieldLabel, role: 'textbox' })
+      const matches = fieldReadbackNodes(a11y, field.fieldLabel, ['textbox'], field.fieldKey)
       return matches.some(match => normalizeLookupKey(match.value ?? '') === normalizeLookupKey(field.value))
     }
     case 'choice': {
-      const directMatches = [
-        ...findNodes(a11y, { name: field.fieldLabel, role: 'combobox' }),
-        ...findNodes(a11y, { name: field.fieldLabel, role: 'textbox' }),
-        ...findNodes(a11y, { name: field.fieldLabel, role: 'button' }),
-      ]
-      if (directMatches.length === 0) return true
-      return directMatches.some(match => normalizeLookupKey(match.value ?? '') === normalizeLookupKey(field.value))
+      const directMatches = fieldReadbackNodes(
+        a11y,
+        field.fieldLabel,
+        ['combobox', 'textbox', 'button'],
+        field.fieldKey,
+      )
+      if (directMatches.length === 0) return field.fieldKey === undefined
+      if (field.optionIndex !== undefined) {
+        return directMatches.some(match => {
+          const selected = match.meta?.options?.find(option => option.selected)
+          return selected
+            ? selected.index === field.optionIndex && selected.value === field.value
+            : false
+        })
+      }
+      const expected = [field.value, field.expectedReadback]
+        .filter((value): value is string => value !== undefined)
+        .map(normalizeLookupKey)
+      return directMatches.some(match => expected.includes(normalizeLookupKey(match.value ?? '')))
     }
     case 'toggle':
       return true
     case 'file': {
-      const matches = [
-        ...findNodes(a11y, { name: field.fieldLabel, role: 'textbox' }),
-        ...findNodes(a11y, { name: field.fieldLabel, role: 'button' }),
-      ]
-      return matches.length === 0 || matches.some(match => Boolean(match.value && match.value.trim()))
+      const matches = fieldReadbackNodes(a11y, field.fieldLabel, ['textbox', 'button'], field.fieldKey)
+      return field.fieldKey
+        ? matches.some(match => Boolean(match.value && match.value.trim()))
+        : matches.length === 0 || matches.some(match => Boolean(match.value && match.value.trim()))
     }
   }
 }
@@ -4826,6 +5207,16 @@ function canDeferInitialFrameForRunActions(actions: BatchAction[]): boolean {
   const first = actions[0]
   if (!first) return false
   return first.type === 'fill_fields'
+}
+
+function assertBatchActionConfirmed(actionType: BatchAction['type'], wait: UpdateWaitResult): void {
+  assertActionWaitConfirmed(`${actionType} action`, wait)
+}
+
+function assertActionWaitConfirmed(actionName: string, wait: UpdateWaitResult): void {
+  if (wait.status === 'timed_out') {
+    throw new Error(`${actionName} timed out after ${wait.timeoutMs}ms; its outcome is unconfirmed.`)
+  }
 }
 
 async function executeBatchAction(
@@ -4866,7 +5257,32 @@ async function executeBatchAction(
       })
       if (!resolved.ok) throw new Error(clickFallbackErrorMessage(resolved))
 
+      const waitFilter: NodeFilter | undefined = action.waitFor ? {
+        id: action.waitFor.id,
+        role: action.waitFor.role,
+        name: action.waitFor.name,
+        text: action.waitFor.text,
+        contextText: action.waitFor.contextText,
+        promptText: action.waitFor.promptText,
+        sectionText: action.waitFor.sectionText,
+        itemText: action.waitFor.itemText,
+        value: action.waitFor.value,
+        checked: action.waitFor.checked,
+        disabled: action.waitFor.disabled,
+        focused: action.waitFor.focused,
+        selected: action.waitFor.selected,
+        expanded: action.waitFor.expanded,
+        invalid: action.waitFor.invalid,
+        required: action.waitFor.required,
+        busy: action.waitFor.busy,
+      } : undefined
+      const waitEvidenceRoot = sessionA11y(session) ?? before
+      const beforeWaitEvidence = waitFilter && waitEvidenceRoot
+        ? captureWaitEvidence(waitEvidenceRoot, waitFilter)
+        : undefined
+
       const wait = await sendClick(session, resolved.value.x, resolved.value.y, action.timeoutMs)
+      assertBatchActionConfirmed(action.type, wait)
       const targetSummary = resolved.value.target
         ? `Clicked ${describeFormattedNode(resolved.value.target)} at (${resolved.value.x}, ${resolved.value.y}).`
         : `Clicked at (${resolved.value.x}, ${resolved.value.y}).`
@@ -4874,33 +5290,19 @@ async function executeBatchAction(
       let postWaitCompact: Record<string, unknown> | undefined
       if (action.waitFor) {
         const postWait = await waitForSemanticCondition(session, {
-          filter: {
-            id: action.waitFor.id,
-            role: action.waitFor.role,
-            name: action.waitFor.name,
-            text: action.waitFor.text,
-            contextText: action.waitFor.contextText,
-            promptText: action.waitFor.promptText,
-            sectionText: action.waitFor.sectionText,
-            itemText: action.waitFor.itemText,
-            value: action.waitFor.value,
-            checked: action.waitFor.checked,
-            disabled: action.waitFor.disabled,
-            focused: action.waitFor.focused,
-            selected: action.waitFor.selected,
-            expanded: action.waitFor.expanded,
-            invalid: action.waitFor.invalid,
-            required: action.waitFor.required,
-            busy: action.waitFor.busy,
-          },
+          filter: waitFilter!,
           present: action.waitFor.present ?? true,
           timeoutMs: action.waitFor.timeoutMs ?? 10_000,
         })
         if (!postWait.ok) {
           throw new Error(`Post-click wait failed after ${targetSummary.toLowerCase()}\n${postWait.error}`)
         }
+        const fresh = waitConditionHasFreshEvidence(beforeWaitEvidence, sessionA11y(session), postWait.value)
+        if (!fresh) {
+          throw new Error(`Post-click wait matched only pre-existing evidence after ${targetSummary.toLowerCase()}; the click outcome is unconfirmed.`)
+        }
         postWaitSummary = `Post-click ${waitConditionSuccessLine(postWait.value)}`
-        postWaitCompact = waitConditionCompact(postWait.value)
+        postWaitCompact = { ...waitConditionCompact(postWait.value), fresh: true }
       }
       return {
         summary: [targetSummary, postActionSummary(session, before, wait, detail), postWaitSummary].filter(Boolean).join('\n'),
@@ -4916,6 +5318,7 @@ async function executeBatchAction(
     case 'type': {
       const before = sessionA11y(session)
       const wait = await sendType(session, action.text, action.timeoutMs)
+      assertBatchActionConfirmed(action.type, wait)
       return {
         summary: `Typed "${action.text}".\n${postActionSummary(session, before, wait, detail)}`,
         compact: {
@@ -4932,6 +5335,7 @@ async function executeBatchAction(
         { shift: action.shift, ctrl: action.ctrl, meta: action.meta, alt: action.alt },
         action.timeoutMs,
       )
+      assertBatchActionConfirmed(action.type, wait)
       return {
         summary: `Pressed ${formatKeyCombo(action.key, action)}.\n${postActionSummary(session, before, wait, detail)}`,
         compact: {
@@ -4949,6 +5353,7 @@ async function executeBatchAction(
         strategy: action.strategy,
         drop: action.dropX !== undefined && action.dropY !== undefined ? { x: action.dropX, y: action.dropY } : undefined,
       }, action.timeoutMs ?? 8_000)
+      assertBatchActionConfirmed(action.type, wait)
       return {
         summary: `Uploaded ${action.paths.length} file(s).\n${postActionSummary(session, before, wait, detail)}`,
         compact: {
@@ -4965,18 +5370,25 @@ async function executeBatchAction(
       const wait = await sendListboxPick(session, action.label, {
         exact: action.exact,
         open: action.openX !== undefined && action.openY !== undefined ? { x: action.openX, y: action.openY } : undefined,
+        fieldId: action.fieldId,
+        fieldKey: action.fieldKey,
         fieldLabel: action.fieldLabel,
         query: action.query,
       }, action.timeoutMs)
+      assertBatchActionConfirmed(action.type, wait)
       const summary = postActionSummary(session, before, wait, detail)
-      const fieldSummary = action.fieldLabel ? summarizeFieldLabelState(session, action.fieldLabel) : undefined
+      const fieldSummary = action.fieldLabel
+        ? summarizeFieldLabelState(session, action.fieldLabel, action.fieldKey)
+        : undefined
       return {
         summary: [`Picked listbox option "${action.label}".`, fieldSummary, summary].filter(Boolean).join('\n'),
         compact: {
           label: action.label,
+          ...(action.fieldId ? { fieldId: action.fieldId } : {}),
+          ...(action.fieldKey ? { fieldKey: action.fieldKey } : {}),
           ...(action.fieldLabel ? { fieldLabel: action.fieldLabel } : {}),
           ...waitStatusPayload(wait),
-          ...(action.fieldLabel ? { readback: fieldStatePayload(session, action.fieldLabel) } : {}),
+          ...(action.fieldLabel ? { readback: fieldStatePayload(session, action.fieldLabel, action.fieldKey) } : {}),
         },
       }
     }
@@ -4990,6 +5402,7 @@ async function executeBatchAction(
         label: action.label,
         index: action.index,
       }, action.timeoutMs)
+      assertBatchActionConfirmed(action.type, wait)
       return {
         summary: `Selected option.\n${postActionSummary(session, before, wait, detail)}`,
         compact: {
@@ -5007,13 +5420,20 @@ async function executeBatchAction(
         checked: action.checked,
         exact: action.exact,
         controlType: action.controlType,
+        ...(action.fieldKey ? { fieldKey: action.fieldKey } : {}),
+        contextText: action.contextText,
+        sectionText: action.sectionText,
       }, action.timeoutMs)
+      assertBatchActionConfirmed(action.type, wait)
       return {
         summary: `Set ${action.controlType ?? 'checkbox/radio'} "${action.label}" to ${String(action.checked ?? true)}.\n${postActionSummary(session, before, wait, detail)}`,
         compact: {
           label: action.label,
           checked: action.checked ?? true,
           ...(action.controlType ? { controlType: action.controlType } : {}),
+          ...(action.fieldKey ? { fieldKey: action.fieldKey } : {}),
+          ...(action.contextText ? { contextText: action.contextText } : {}),
+          ...(action.sectionText ? { sectionText: action.sectionText } : {}),
           ...waitStatusPayload(wait),
         },
       }
@@ -5025,6 +5445,7 @@ async function executeBatchAction(
         x: action.x,
         y: action.y,
       }, action.timeoutMs)
+      assertBatchActionConfirmed(action.type, wait)
       return {
         summary: `Wheel delta (${action.deltaX ?? 0}, ${action.deltaY}).\n${postActionSummary(session, before, wait, detail)}`,
         compact: {
@@ -5302,13 +5723,31 @@ function verifyFormFills(
   for (const p of planned) {
     if (p.field.kind === 'toggle' || p.field.kind === 'file') continue
     const label = p.field.fieldLabel
-    const expected = p.field.kind === 'text' ? p.field.value : p.field.value
-    const matches = [
-      ...findNodes(a11y, { name: label, role: 'textbox' }),
-      ...findNodes(a11y, { name: label, role: 'combobox' }),
-    ]
+    const expected = p.field.kind === 'choice'
+      ? p.field.expectedReadback ?? p.field.value
+      : p.field.value
+    const matches = fieldReadbackNodes(
+      a11y,
+      label,
+      ['textbox', 'combobox'],
+      p.field.fieldKey,
+    )
     const match = matches[0]
     const actual = match?.value?.trim()
+    if (p.field.kind === 'choice' && p.field.optionIndex !== undefined && match?.meta?.options) {
+      const selected = match.meta.options.find(option => option.selected)
+      if (selected?.index === p.field.optionIndex && selected.value === p.field.value) {
+        verified++
+      } else {
+        mismatches.push({
+          fieldLabel: label,
+          expected,
+          actual: selected?.label ?? actual,
+          ...(p.field.fieldId ? { fieldId: p.field.fieldId } : {}),
+        })
+      }
+      continue
+    }
     if (!actual || !expected) {
       mismatches.push({ fieldLabel: label, expected, actual, ...(p.field.fieldId ? { fieldId: p.field.fieldId } : {}) })
     } else if (!valuesEquivalent(expected, actual)) {
@@ -5332,12 +5771,14 @@ async function executeFillField(session: Session, field: ResolvedFillFieldInput,
         {
           exact: field.exact,
           fieldId: field.fieldId,
+          ...(field.fieldKey ? { fieldKey: field.fieldKey } : {}),
           typingDelayMs: field.typingDelayMs,
           imeFriendly: field.imeFriendly,
         },
         field.timeoutMs,
       )
-      const fieldSummary = summarizeFieldLabelState(session, field.fieldLabel)
+      assertActionWaitConfirmed(`Text fill for "${field.fieldLabel}"`, wait)
+      const fieldSummary = summarizeFieldLabelState(session, field.fieldLabel, field.fieldKey)
       return {
         summary: [
           `Filled text field "${field.fieldLabel}".`,
@@ -5346,10 +5787,11 @@ async function executeFillField(session: Session, field: ResolvedFillFieldInput,
         ].filter(Boolean).join('\n'),
         compact: {
           ...(field.fieldId ? { fieldId: field.fieldId } : {}),
+          ...(field.fieldKey ? { fieldKey: field.fieldKey } : {}),
           fieldLabel: field.fieldLabel,
           ...compactTextValue(field.value),
           ...waitStatusPayload(wait),
-          readback: fieldStatePayload(session, field.fieldLabel),
+          readback: fieldStatePayload(session, field.fieldLabel, field.fieldKey),
         },
       }
     }
@@ -5359,10 +5801,18 @@ async function executeFillField(session: Session, field: ResolvedFillFieldInput,
         session,
         field.fieldLabel,
         field.value,
-        { exact: field.exact, query: field.query, choiceType: field.choiceType, fieldId: field.fieldId },
+        {
+          exact: field.exact,
+          query: field.query,
+          choiceType: field.choiceType,
+          fieldId: field.fieldId,
+          ...(field.fieldKey ? { fieldKey: field.fieldKey } : {}),
+          ...(field.optionIndex !== undefined ? { optionIndex: field.optionIndex } : {}),
+        },
         field.timeoutMs,
       )
-      const fieldSummary = summarizeFieldLabelState(session, field.fieldLabel)
+      assertActionWaitConfirmed(`Choice fill for "${field.fieldLabel}"`, wait)
+      const fieldSummary = summarizeFieldLabelState(session, field.fieldLabel, field.fieldKey)
       return {
         summary: [
           `Set choice field "${field.fieldLabel}" to "${field.value}".`,
@@ -5371,11 +5821,13 @@ async function executeFillField(session: Session, field: ResolvedFillFieldInput,
         ].filter(Boolean).join('\n'),
         compact: {
           ...(field.fieldId ? { fieldId: field.fieldId } : {}),
+          ...(field.fieldKey ? { fieldKey: field.fieldKey } : {}),
           fieldLabel: field.fieldLabel,
           value: field.value,
+          ...(field.optionIndex !== undefined ? { optionIndex: field.optionIndex } : {}),
           ...(field.choiceType ? { choiceType: field.choiceType } : {}),
           ...waitStatusPayload(wait),
-          readback: fieldStatePayload(session, field.fieldLabel),
+          readback: fieldStatePayload(session, field.fieldLabel, field.fieldKey),
         },
       }
     }
@@ -5384,13 +5836,21 @@ async function executeFillField(session: Session, field: ResolvedFillFieldInput,
       const wait = await sendSetChecked(
         session,
         field.label,
-        { checked: field.checked, exact: field.exact, controlType: field.controlType },
+        {
+          checked: field.checked,
+          exact: field.exact,
+          controlType: field.controlType,
+          ...(field.fieldKey ? { fieldKey: field.fieldKey } : {}),
+        },
         field.timeoutMs,
       )
+      assertActionWaitConfirmed(`Toggle fill for "${field.label}"`, wait)
       return {
         summary: `Set ${field.controlType ?? 'checkbox/radio'} "${field.label}" to ${String(field.checked ?? true)}.\n${postActionSummary(session, before, wait, detail)}`,
         compact: {
           label: field.label,
+          ...(field.fieldId ? { fieldId: field.fieldId } : {}),
+          ...(field.fieldKey ? { fieldKey: field.fieldKey } : {}),
           checked: field.checked ?? true,
           ...(field.controlType ? { controlType: field.controlType } : {}),
           ...waitStatusPayload(wait),
@@ -5402,10 +5862,16 @@ async function executeFillField(session: Session, field: ResolvedFillFieldInput,
       const wait = await sendFileUpload(
         session,
         field.paths,
-        { fieldLabel: field.fieldLabel, exact: field.exact },
+        {
+          ...(field.fieldId ? { fieldId: field.fieldId } : {}),
+          ...(field.fieldKey ? { fieldKey: field.fieldKey } : {}),
+          fieldLabel: field.fieldLabel,
+          exact: field.exact,
+        },
         field.timeoutMs ?? 8_000,
       )
-      const fieldSummary = summarizeFieldLabelState(session, field.fieldLabel)
+      assertActionWaitConfirmed(`File fill for "${field.fieldLabel}"`, wait)
+      const fieldSummary = summarizeFieldLabelState(session, field.fieldLabel, field.fieldKey)
       return {
         summary: [
           `Uploaded ${field.paths.length} file(s) to "${field.fieldLabel}".`,
@@ -5414,9 +5880,11 @@ async function executeFillField(session: Session, field: ResolvedFillFieldInput,
         ].filter(Boolean).join('\n'),
         compact: {
           fieldLabel: field.fieldLabel,
+          ...(field.fieldId ? { fieldId: field.fieldId } : {}),
+          ...(field.fieldKey ? { fieldKey: field.fieldKey } : {}),
           fileCount: field.paths.length,
           ...waitStatusPayload(wait),
-          readback: fieldStatePayload(session, field.fieldLabel),
+          readback: fieldStatePayload(session, field.fieldLabel, field.fieldKey),
         },
       }
     }
@@ -5599,8 +6067,8 @@ export function findNodes(node: A11yNode, filter: NodeFilter): A11yNode[] {
   return matches
 }
 
-function summarizeFieldLabelState(session: Session, fieldLabel: string): string | undefined {
-  const payload = fieldStatePayload(session, fieldLabel)
+function summarizeFieldLabelState(session: Session, fieldLabel: string, fieldKey?: string): string | undefined {
+  const payload = fieldStatePayload(session, fieldLabel, fieldKey)
   if (!payload) return undefined
   const parts = [`Field "${fieldLabel}"`]
   if (payload.role) parts.push(`role=${String(payload.role)}`)

@@ -42,6 +42,17 @@ export interface A11yNode {
     scrollX?: number
     scrollY?: number
     controlTag?: string
+    /** Stable authored DOM identity emitted by the proxy extractor (`id:` or `name:`). */
+    controlKey?: string
+    controlId?: string
+    controlName?: string
+    options?: Array<{
+      value: string
+      label: string
+      disabled: boolean
+      selected: boolean
+      index: number
+    }>
     placeholder?: string
     inputPattern?: string
     inputType?: string
@@ -266,8 +277,20 @@ export type FormSchemaFieldKind = 'text' | 'choice' | 'toggle' | 'multi_choice'
 export type FormSchemaChoiceType = 'select' | 'group' | 'listbox'
 export type FormSchemaContextMode = 'auto' | 'always' | 'none'
 
+export interface FormSchemaOption {
+  /** Stable within the authored control identity; index disambiguates duplicate values/labels. */
+  id: string
+  value: string
+  label: string
+  index: number
+  disabled?: boolean
+  selected?: boolean
+}
+
 export interface FormSchemaField {
   id: string
+  /** Authored DOM identity used for exact proxy-side resolution before accessible-label fallback. */
+  fieldKey?: string
   kind: FormSchemaFieldKind
   label: string
   required?: boolean
@@ -281,6 +304,7 @@ export interface FormSchemaField {
   values?: string[]
   optionCount?: number
   options?: string[]
+  optionDetails?: FormSchemaOption[]
   aliases?: Record<string, string[]>
   format?: { placeholder?: string; pattern?: string; inputType?: string; autocomplete?: string }
   context?: NodeContextModel
@@ -322,6 +346,59 @@ export interface FormSchemaBuildOptions {
   onlyInvalidFields?: boolean
   includeOptions?: boolean
   includeContext?: FormSchemaContextMode
+}
+
+export interface FormGraphSource {
+  id: string
+  kind: 'html'
+  title?: string
+  url?: string
+}
+
+export interface FormGraphSourceAnchor {
+  sourceId: string
+  kind: 'html'
+  fieldName?: string
+  pointer?: string
+}
+
+export interface FormGraphField {
+  id: string
+  path: string
+  label: string
+  kind: 'boolean' | 'enum' | 'text' | 'textarea' | 'email' | 'phone' | 'date' | 'number'
+  required?: boolean
+  reviewRequired?: boolean
+  aliases?: string[]
+  options?: Array<{ value: string; label: string }>
+  constraints?: { pattern?: string }
+  sourceAnchors?: FormGraphSourceAnchor[]
+  metadata?: Record<string, unknown>
+}
+
+export interface FormGraphModel {
+  formgraph: '0.1'
+  id: string
+  title: string
+  description?: string
+  sources: FormGraphSource[]
+  fields: FormGraphField[]
+  evidence: []
+  dependencies: []
+  review: {
+    autoSubmitAllowed: false
+    requiredBeforeSubmit: true
+  }
+  metadata: {
+    producer: 'geometra'
+    geometra: {
+      formId: string
+      fieldCount: number
+      requiredCount: number
+      invalidCount: number
+      sections?: FormSchemaSection[]
+    }
+  }
 }
 
 export interface UiNodeUpdate {
@@ -504,22 +581,24 @@ const FILL_BATCH_TOGGLE_FIELD_TIMEOUT_MS = 225
 const FILL_BATCH_FILE_FIELD_TIMEOUT_MS = 5000
 const FILL_BATCH_MAX_TIMEOUT_MS = 60_000
 const SESSION_RECONNECT_TIMEOUT_MS = 5_000
+const PROXY_PROTOCOL_VERSION = 2
 let nextRequestSequence = 0
 
 export type ProxyFillField =
-  | { kind: 'auto'; fieldId?: string; fieldLabel: string; value: string | boolean; exact?: boolean }
+  | { kind: 'auto'; fieldId?: string; fieldKey?: string; fieldLabel: string; value: string | boolean; exact?: boolean }
   | {
       kind: 'text'
       fieldId?: string
+      fieldKey?: string
       fieldLabel: string
       value: string
       exact?: boolean
       typingDelayMs?: number
       imeFriendly?: boolean
     }
-  | { kind: 'choice'; fieldId?: string; fieldLabel: string; value: string; query?: string; exact?: boolean; choiceType?: FormSchemaChoiceType }
-  | { kind: 'toggle'; label: string; checked?: boolean; exact?: boolean; controlType?: 'checkbox' | 'radio' }
-  | { kind: 'file'; fieldId?: string; fieldLabel: string; paths: string[]; exact?: boolean }
+  | { kind: 'choice'; fieldId?: string; fieldKey?: string; fieldLabel: string; value: string; optionIndex?: number; query?: string; exact?: boolean; choiceType?: FormSchemaChoiceType }
+  | { kind: 'toggle'; fieldId?: string; fieldKey?: string; label: string; checked?: boolean; exact?: boolean; controlType?: 'checkbox' | 'radio' }
+  | { kind: 'file'; fieldId?: string; fieldKey?: string; fieldLabel: string; paths: string[]; exact?: boolean }
 
 function invalidateSessionCaches(session: Session): void {
   session.cachedA11y = null
@@ -1456,7 +1535,7 @@ export function connect(
       if (!opts?.skipInitialResize) {
         const width = opts?.width ?? 1024
         const height = opts?.height ?? 768
-        ws.send(JSON.stringify({ type: 'resize', width, height }))
+        ws.send(JSON.stringify({ type: 'resize', width, height, protocolVersion: PROXY_PROTOCOL_VERSION }))
       }
       if (opts?.awaitInitialFrame === false && !resolved) {
         resolved = true
@@ -1944,7 +2023,7 @@ async function sendResizeAndWaitForUpdate(
 ): Promise<UpdateWaitResult> {
   await ensureSessionConnected(session)
   const startRevision = session.updateRevision
-  session.ws.send(JSON.stringify({ type: 'resize', width, height }))
+  session.ws.send(JSON.stringify({ type: 'resize', width, height, protocolVersion: PROXY_PROTOCOL_VERSION }))
   return await waitForNextUpdate(session, timeoutMs, undefined, startRevision)
 }
 
@@ -1971,6 +2050,7 @@ export function sendType(session: Session, text: string, timeoutMs?: number): Pr
     for (const char of text) {
       const keyEvent = {
         type: 'key',
+        protocolVersion: PROXY_PROTOCOL_VERSION,
         eventType: 'onKeyDown',
         key: char,
         code: `Key${char.toUpperCase()}`,
@@ -2018,6 +2098,8 @@ export function sendFileUpload(
   paths: string[],
   opts?: {
     click?: { x: number; y: number }
+    fieldId?: string
+    fieldKey?: string
     fieldLabel?: string
     exact?: boolean
     strategy?: 'auto' | 'chooser' | 'hidden' | 'drop'
@@ -2031,6 +2113,8 @@ export function sendFileUpload(
     payload.y = opts.click.y
   }
   if (opts?.fieldLabel) payload.fieldLabel = opts.fieldLabel
+  if (opts?.fieldId) payload.fieldId = opts.fieldId
+  if (opts?.fieldKey) payload.fieldKey = opts.fieldKey
   if (opts?.exact !== undefined) payload.exact = opts.exact
   if (opts?.strategy) payload.strategy = opts.strategy
   if (opts?.drop) {
@@ -2045,7 +2129,7 @@ export function sendFieldText(
   session: Session,
   fieldLabel: string,
   value: string,
-  opts?: { exact?: boolean; fieldId?: string; typingDelayMs?: number; imeFriendly?: boolean },
+  opts?: { exact?: boolean; fieldId?: string; fieldKey?: string; typingDelayMs?: number; imeFriendly?: boolean },
   timeoutMs?: number,
 ): Promise<UpdateWaitResult> {
   const payload: Record<string, unknown> = {
@@ -2055,6 +2139,7 @@ export function sendFieldText(
   }
   if (opts?.exact !== undefined) payload.exact = opts.exact
   if (opts?.fieldId) payload.fieldId = opts.fieldId
+  if (opts?.fieldKey) payload.fieldKey = opts.fieldKey
   if (opts?.typingDelayMs !== undefined) payload.typingDelayMs = opts.typingDelayMs
   if (opts?.imeFriendly !== undefined) payload.imeFriendly = opts.imeFriendly
   return sendAndWaitForUpdate(session, payload, timeoutMs)
@@ -2065,7 +2150,7 @@ export function sendFieldChoice(
   session: Session,
   fieldLabel: string,
   value: string,
-  opts?: { exact?: boolean; query?: string; choiceType?: FormSchemaChoiceType; fieldId?: string },
+  opts?: { exact?: boolean; query?: string; choiceType?: FormSchemaChoiceType; fieldId?: string; fieldKey?: string; optionIndex?: number },
   timeoutMs = LISTBOX_UPDATE_TIMEOUT_MS,
 ): Promise<UpdateWaitResult> {
   const payload: Record<string, unknown> = {
@@ -2077,6 +2162,8 @@ export function sendFieldChoice(
   if (opts?.query) payload.query = opts.query
   if (opts?.choiceType) payload.choiceType = opts.choiceType
   if (opts?.fieldId) payload.fieldId = opts.fieldId
+  if (opts?.fieldKey) payload.fieldKey = opts.fieldKey
+  if (opts?.optionIndex !== undefined) payload.optionIndex = opts.optionIndex
   return sendAndWaitForUpdate(session, payload, timeoutMs)
 }
 
@@ -2116,7 +2203,7 @@ export function sendFillOtp(
 export function sendListboxPick(
   session: Session,
   label: string,
-  opts?: { exact?: boolean; open?: { x: number; y: number }; fieldLabel?: string; query?: string },
+  opts?: { exact?: boolean; open?: { x: number; y: number }; fieldLabel?: string; query?: string; fieldId?: string; fieldKey?: string },
   timeoutMs = LISTBOX_UPDATE_TIMEOUT_MS,
 ): Promise<UpdateWaitResult> {
   const payload: Record<string, unknown> = { type: 'listboxPick', label }
@@ -2127,6 +2214,8 @@ export function sendListboxPick(
   }
   if (opts?.fieldLabel) payload.fieldLabel = opts.fieldLabel
   if (opts?.query) payload.query = opts.query
+  if (opts?.fieldId) payload.fieldId = opts.fieldId
+  if (opts?.fieldKey) payload.fieldKey = opts.fieldKey
   return sendAndWaitForUpdate(session, payload, timeoutMs)
 }
 
@@ -2150,13 +2239,23 @@ export function sendSelectOption(
 export function sendSetChecked(
   session: Session,
   label: string,
-  opts?: { checked?: boolean; exact?: boolean; controlType?: 'checkbox' | 'radio' },
+  opts?: {
+    checked?: boolean
+    exact?: boolean
+    controlType?: 'checkbox' | 'radio'
+    fieldKey?: string
+    contextText?: string
+    sectionText?: string
+  },
   timeoutMs?: number,
 ): Promise<UpdateWaitResult> {
   const payload: Record<string, unknown> = { type: 'setChecked', label }
   if (opts?.checked !== undefined) payload.checked = opts.checked
   if (opts?.exact !== undefined) payload.exact = opts.exact
   if (opts?.controlType) payload.controlType = opts.controlType
+  if (opts?.fieldKey) payload.fieldKey = opts.fieldKey
+  if (opts?.contextText) payload.contextText = opts.contextText
+  if (opts?.sectionText) payload.sectionText = opts.sectionText
   return sendAndWaitForUpdate(session, payload, timeoutMs)
 }
 
@@ -2998,6 +3097,26 @@ function buildFieldFormat(node: A11yNode): FormSchemaField['format'] {
   return Object.keys(format).length > 0 ? format : undefined
 }
 
+function nativeSchemaOptions(node: A11yNode, fieldIdentity: string): FormSchemaOption[] | undefined {
+  const options = node.meta?.options
+  if (!options) return undefined
+  return options.map(option => ({
+    id: `${fieldIdentity}:option:${option.index}`,
+    value: option.value,
+    label: option.label,
+    index: option.index,
+    ...(option.disabled ? { disabled: true } : {}),
+    ...(option.selected ? { selected: true } : {}),
+  }))
+}
+
+function uniqueSchemaFieldKey(root: A11yNode, node: A11yNode): string | undefined {
+  const fieldKey = node.meta?.controlKey
+  if (!fieldKey) return undefined
+  const matches = collectDescendants(root, candidate => candidate.meta?.controlKey === fieldKey)
+  return matches.length === 1 ? fieldKey : undefined
+}
+
 function simpleSchemaField(root: A11yNode, node: A11yNode): FormSchemaField | null {
   const context = nodeContextForNode(root, node)
   const label = fieldLabel(node) ?? sanitizeInlineName(node.name, 80) ?? context?.prompt
@@ -3028,15 +3147,25 @@ function simpleSchemaField(root: A11yNode, node: A11yNode): FormSchemaField | nu
         : 'listbox'
       : undefined
 
+  const fieldKey = uniqueSchemaFieldKey(root, node)
+  const id = fieldKey ?? formFieldIdForPath(node.path)
   const format = buildFieldFormat(node)
+  const optionDetails = classifiedChoiceType === 'select' ? nativeSchemaOptions(node, id) : undefined
+  const enabledOptions = optionDetails
+    ? dedupeStrings(optionDetails.filter(option => !option.disabled).map(option => option.label), 64)
+    : undefined
   return {
-    id: formFieldIdForPath(node.path),
+    id,
+    ...(fieldKey ? { fieldKey } : {}),
     kind: classifiedRole === 'combobox' ? 'choice' : 'text',
     label,
     ...(classifiedChoiceType ? { choiceType: classifiedChoiceType } : {}),
     ...(node.state?.required ? { required: true } : {}),
     ...(node.state?.invalid ? { invalid: true } : {}),
     ...compactSchemaValue(node.value, 72),
+    ...(optionDetails ? { optionCount: optionDetails.length, optionDetails } : {}),
+    ...(enabledOptions && enabledOptions.length > 0 ? { options: enabledOptions } : {}),
+    ...(enabledOptions && computeOptionAliases(enabledOptions) ? { aliases: computeOptionAliases(enabledOptions) } : {}),
     ...(format ? { format } : {}),
     ...(compactSchemaContext(context, label) ? { context: compactSchemaContext(context, label) } : {}),
   }
@@ -3090,8 +3219,10 @@ function toggleSchemaField(root: A11yNode, node: A11yNode): FormSchemaField | nu
   if (!label) return null
   const context = nodeContextForNode(root, node)
   const controlType = node.role === 'radio' ? 'radio' : 'checkbox'
+  const fieldKey = uniqueSchemaFieldKey(root, node)
   return {
-    id: formFieldIdForPath(node.path),
+    id: fieldKey ?? formFieldIdForPath(node.path),
+    ...(fieldKey ? { fieldKey } : {}),
     kind: 'toggle',
     label,
     controlType,
@@ -3118,7 +3249,10 @@ function detectFormSections(formNode: A11yNode, fields: FormSchemaField[]): Form
 
   const fieldIdToPath = new Map<string, number[]>()
   for (const field of fields) {
-    const parsed = parseFormFieldId(field.id)
+    const authoredMatches = field.fieldKey
+      ? collectDescendants(formNode, node => node.meta?.controlKey === field.fieldKey)
+      : []
+    const parsed = authoredMatches.length === 1 ? authoredMatches[0]!.path : parseFormFieldId(field.id)
     if (parsed) fieldIdToPath.set(field.id, parsed)
   }
 
@@ -3233,6 +3367,7 @@ function presentFormSchemaFields(
     if (booleanChoice) next.booleanChoice = true
     if (!includeOptions) {
       delete next.options
+      delete next.optionDetails
       delete next.aliases
     }
 
@@ -3609,6 +3744,146 @@ export function buildFormSchemas(
     .map(form => buildFormSchemaForNode(root, form, options))
 }
 
+export function buildFormGraphs(
+  root: A11yNode,
+  options?: FormSchemaBuildOptions,
+): FormGraphModel[] {
+  const pageUrl = typeof root.meta?.pageUrl === 'string' && root.meta.pageUrl.length > 0 ? root.meta.pageUrl : undefined
+  return buildFormSchemas(root, {
+    ...options,
+    includeOptions: true,
+  }).map(schema => formSchemaToFormGraph(schema, pageUrl))
+}
+
+export function formSchemaToFormGraph(schema: FormSchemaModel, pageUrl?: string): FormGraphModel {
+  const sourceId = 'geometra-page'
+  const formSlug = slugPathSegment(schema.name ?? schema.formId)
+  const pathCounts = new Map<string, number>()
+
+  return {
+    formgraph: '0.1',
+    id: `geometra:${schema.formId}`,
+    title: schema.name ?? `Geometra form ${schema.formId}`,
+    description: 'FormGraph-compatible projection of a Geometra form schema.',
+    sources: [
+      {
+        id: sourceId,
+        kind: 'html',
+        title: schema.name ?? 'Geometra-discovered web form',
+        ...(pageUrl ? { url: pageUrl } : {}),
+      },
+    ],
+    fields: schema.fields.map(field => formSchemaFieldToFormGraphField(field, {
+      formSlug,
+      sourceId,
+      pathCounts,
+    })),
+    evidence: [],
+    dependencies: [],
+    review: {
+      autoSubmitAllowed: false,
+      requiredBeforeSubmit: true,
+    },
+    metadata: {
+      producer: 'geometra',
+      geometra: {
+        formId: schema.formId,
+        fieldCount: schema.fieldCount,
+        requiredCount: schema.requiredCount,
+        invalidCount: schema.invalidCount,
+        ...(schema.sections ? { sections: schema.sections } : {}),
+      },
+    },
+  }
+}
+
+function formSchemaFieldToFormGraphField(
+  field: FormSchemaField,
+  opts: {
+    formSlug: string
+    sourceId: string
+    pathCounts: Map<string, number>
+  },
+): FormGraphField {
+  const basePath = `web.forms.${opts.formSlug}.${slugPathSegment(field.label || field.id)}`
+  const path = uniquePath(basePath, opts.pathCounts)
+  const aliases = fieldAliases(field)
+  const options = field.optionDetails
+    ?.filter(option => !option.disabled)
+    .map(option => ({ value: option.value, label: option.label }))
+    ?? field.options?.map(option => ({ value: option, label: option }))
+  const inputType = field.format?.inputType?.toLowerCase()
+  const metadata: Record<string, unknown> = {
+    geometra: {
+      fieldId: field.id,
+      ...(field.fieldKey ? { fieldKey: field.fieldKey } : {}),
+      kind: field.kind,
+      ...(field.choiceType ? { choiceType: field.choiceType } : {}),
+      ...(field.controlType ? { controlType: field.controlType } : {}),
+      ...(field.booleanChoice ? { booleanChoice: true } : {}),
+      ...(field.invalid ? { invalid: true } : {}),
+      ...(field.context ? { context: field.context } : {}),
+      ...(field.optionDetails ? { optionDetails: field.optionDetails } : {}),
+    },
+  }
+
+  return {
+    id: field.fieldKey ?? field.id,
+    path,
+    label: field.label,
+    kind: formGraphFieldKind(field),
+    ...(field.required ? { required: true } : {}),
+    ...(field.invalid ? { reviewRequired: true } : {}),
+    ...(aliases.length > 0 ? { aliases } : {}),
+    ...(options && options.length > 0 ? { options } : {}),
+    ...(field.format?.pattern ? { constraints: { pattern: field.format.pattern } } : {}),
+    sourceAnchors: [
+      {
+        sourceId: opts.sourceId,
+        kind: 'html',
+        fieldName: field.fieldKey ?? field.id,
+        pointer: `geometra:${field.fieldKey ?? field.id}`,
+      },
+    ],
+    ...(inputType ? { metadata: { ...metadata, inputType } } : { metadata }),
+  }
+}
+
+function formGraphFieldKind(field: FormSchemaField): FormGraphField['kind'] {
+  if (field.kind === 'toggle' || field.booleanChoice) return 'boolean'
+  if (field.kind === 'choice' || field.kind === 'multi_choice') return 'enum'
+  const inputType = field.format?.inputType?.toLowerCase()
+  if (inputType === 'email') return 'email'
+  if (inputType === 'tel' || inputType === 'phone') return 'phone'
+  if (inputType === 'date') return 'date'
+  if (inputType === 'number') return 'number'
+  if (field.valueLength !== undefined && field.valueLength > 120) return 'textarea'
+  return 'text'
+}
+
+function fieldAliases(field: FormSchemaField): string[] {
+  const values = new Set<string>()
+  if (field.format?.placeholder) values.add(field.format.placeholder)
+  if (field.context?.prompt && normalizeUiText(field.context.prompt) !== normalizeUiText(field.label)) {
+    values.add(field.context.prompt)
+  }
+  return [...values].filter(value => value.trim().length > 0)
+}
+
+function uniquePath(basePath: string, seen: Map<string, number>): string {
+  const count = seen.get(basePath) ?? 0
+  seen.set(basePath, count + 1)
+  return count === 0 ? basePath : `${basePath}.${count + 1}`
+}
+
+function slugPathSegment(value: string): string {
+  const normalized = normalizeUiText(value)
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, '.')
+    .replace(/^\.+|\.+$/g, '')
+  return normalized || 'field'
+}
+
 /**
  * Required-field snapshot for automation: every required field in a form, including
  * offscreen entries, annotated with visibility and scroll hints so agents do not
@@ -3631,7 +3906,10 @@ export function buildFormRequiredSnapshot(
     const formNode = parsedForm ? findNodeByPath(root, parsedForm.path) : null
     const fields = schema.fields
       .map(field => {
-        const fieldPath = parseFormFieldId(field.id)
+        const authoredMatches = field.fieldKey && formNode
+          ? collectDescendants(formNode, node => node.meta?.controlKey === field.fieldKey)
+          : []
+        const fieldPath = authoredMatches.length === 1 ? authoredMatches[0]!.path : parseFormFieldId(field.id)
         const target = fieldPath ? findNodeByPath(root, fieldPath) ?? formNode : formNode
         if (!target) return null
         return {
@@ -4118,6 +4396,28 @@ function normalizeCheckedState(value: unknown): boolean | 'mixed' | undefined {
   return undefined
 }
 
+function normalizeSemanticOptions(value: unknown): NonNullable<A11yNode['meta']>['options'] | undefined {
+  if (!Array.isArray(value)) return undefined
+  const options: NonNullable<NonNullable<A11yNode['meta']>['options']> = []
+  const seenIndices = new Set<number>()
+  for (const entry of value.slice(0, 500)) {
+    if (!entry || typeof entry !== 'object') continue
+    const record = entry as Record<string, unknown>
+    if (typeof record.value !== 'string' || typeof record.label !== 'string') continue
+    if (typeof record.index !== 'number' || !Number.isInteger(record.index) || record.index < 0) continue
+    if (seenIndices.has(record.index)) continue
+    seenIndices.add(record.index)
+    options.push({
+      value: record.value,
+      label: record.label,
+      disabled: record.disabled === true,
+      selected: record.selected === true,
+      index: record.index,
+    })
+  }
+  return options
+}
+
 function normalizeA11yRoleHint(value: unknown): string | undefined {
   if (typeof value !== 'string') return undefined
   const normalized = value.trim().toLowerCase()
@@ -4167,6 +4467,11 @@ function walkNode(element: Record<string, unknown>, layout: Record<string, unkno
   if (typeof semantic?.scrollX === 'number' && Number.isFinite(semantic.scrollX)) meta.scrollX = semantic.scrollX
   if (typeof semantic?.scrollY === 'number' && Number.isFinite(semantic.scrollY)) meta.scrollY = semantic.scrollY
   if (typeof semantic?.tag === 'string' && semantic.tag.trim().length > 0) meta.controlTag = semantic.tag
+  if (typeof semantic?.controlKey === 'string' && semantic.controlKey.trim().length > 0) meta.controlKey = semantic.controlKey.trim()
+  if (typeof semantic?.controlId === 'string' && semantic.controlId.trim().length > 0) meta.controlId = semantic.controlId.trim()
+  if (typeof semantic?.controlName === 'string' && semantic.controlName.trim().length > 0) meta.controlName = semantic.controlName.trim()
+  const semanticOptions = normalizeSemanticOptions(semantic?.options)
+  if (semanticOptions) meta.options = semanticOptions
   if (typeof semantic?.placeholder === 'string') meta.placeholder = semantic.placeholder
   if (typeof semantic?.inputPattern === 'string') meta.inputPattern = semantic.inputPattern
   if (typeof semantic?.inputType === 'string') meta.inputType = semantic.inputType
@@ -4263,13 +4568,21 @@ async function sendAndWaitForUpdate(
   session: Session,
   message: Record<string, unknown>,
   timeoutMs = ACTION_UPDATE_TIMEOUT_MS,
-  opts?: { requireUpdateOnAck?: boolean },
+  opts?: { requireUpdateOnAck?: boolean; requiredProtocolVersion?: number },
 ): Promise<UpdateWaitResult> {
   await ensureSessionConnected(session)
   const requestId = `req-${++nextRequestSequence}`
   const startRevision = session.updateRevision
-  session.ws.send(JSON.stringify({ ...message, requestId }))
-  return await waitForNextUpdate(session, timeoutMs, requestId, startRevision, opts)
+  session.ws.send(JSON.stringify({ ...message, requestId, protocolVersion: PROXY_PROTOCOL_VERSION }))
+  const requiresExactFieldIdentity = typeof message.fieldKey === 'string' || (
+    message.type === 'fillFields' &&
+    Array.isArray(message.fields) &&
+    message.fields.some(field => typeof field === 'object' && field !== null && typeof (field as { fieldKey?: unknown }).fieldKey === 'string')
+  )
+  return await waitForNextUpdate(session, timeoutMs, requestId, startRevision, {
+    ...opts,
+    ...(requiresExactFieldIdentity ? { requiredProtocolVersion: PROXY_PROTOCOL_VERSION } : {}),
+  })
 }
 
 function waitForNextUpdate(
@@ -4277,7 +4590,7 @@ function waitForNextUpdate(
   timeoutMs = ACTION_UPDATE_TIMEOUT_MS,
   requestId?: string,
   startRevision = session.updateRevision,
-  opts?: { requireUpdateOnAck?: boolean },
+  opts?: { requireUpdateOnAck?: boolean; requiredProtocolVersion?: number },
 ): Promise<UpdateWaitResult> {
   return new Promise((resolve, reject) => {
     let ackSeen = false
@@ -4308,6 +4621,16 @@ function waitForNextUpdate(
             return
           }
           if (msg.type === 'ack' && messageRequestId === requestId) {
+            const peerProtocolVersion = typeof msg.protocolVersion === 'number' ? msg.protocolVersion : undefined
+            if (opts?.requiredProtocolVersion !== undefined && (
+              peerProtocolVersion === undefined || peerProtocolVersion < opts.requiredProtocolVersion
+            )) {
+              cleanup()
+              reject(new Error(
+                `Proxy protocol ${peerProtocolVersion ?? 'unknown'} cannot guarantee exact field identity; protocol ${opts.requiredProtocolVersion}+ is required. Update and reconnect the Geometra proxy.`,
+              ))
+              return
+            }
             ackSeen = true
             ackResult = msg.result
             if (!opts?.requireUpdateOnAck || session.updateRevision > startRevision) {

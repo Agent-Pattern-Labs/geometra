@@ -21,6 +21,7 @@ import { coalescePatches, diffLayout } from './diff-layout.js'
 import { extractGeometry, type ExtractGeometryTrace } from './extractor.js'
 import type { ClientKeyMessage, GeometrySnapshot, LayoutSnapshot, ParsedClientMessage } from './types.js'
 import {
+  clientMessageValidationError,
   isClickEventMessage,
   isCompositionMessage,
   isFillFieldsMessage,
@@ -86,6 +87,12 @@ interface PendingInputAck {
   ws: WebSocket
   requestId?: string
   result?: unknown
+  /**
+   * Extraction sequence that was already in flight (or most recently
+   * completed) when the action finished. The ack must wait for a strictly
+   * newer extraction so callers never treat a pre-action snapshot as fresh.
+   */
+  afterExtractSequence: number
 }
 
 function isProtocolCompatible(peerVersion: number | undefined): boolean {
@@ -139,7 +146,7 @@ async function applyKeyPhase(page: Page, msg: ClientKeyMessage): Promise<void> {
   if (msg.shiftKey) await page.keyboard.up('Shift')
 }
 
-async function handleClientMessage(
+export async function handleClientMessage(
   waitForPage: () => Promise<Page>,
   ws: WebSocket,
   raw: unknown,
@@ -148,36 +155,41 @@ async function handleClientMessage(
   onViewportOrInput: (kind: 'resize' | 'input', requestId?: string, result?: unknown) => void,
   onHandlerError: (err: unknown) => void,
 ): Promise<void> {
-  let msg: ParsedClientMessage
-  try {
-    msg = JSON.parse(String(raw)) as ParsedClientMessage
-  } catch {
-    return
-  }
-  if (typeof msg !== 'object' || msg === null || typeof msg.type !== 'string') return
-  const pv = 'protocolVersion' in msg ? msg.protocolVersion : undefined
-  const requestId = typeof (msg as { requestId?: unknown }).requestId === 'string'
-    ? (msg as { requestId?: string }).requestId
-    : undefined
-  if (!isProtocolCompatible(pv)) {
-    ws.send(
-      JSON.stringify({
-        type: 'error',
-        message: `Client protocol ${String(pv)} is newer than proxy protocol ${PROXY_PROTOCOL_VERSION}`,
-        ...(requestId ? { requestId } : {}),
-        protocolVersion: PROXY_PROTOCOL_VERSION,
-      }),
-    )
-    return
-  }
-
-  const wireError = (message: string) => {
+  const sendWireError = (message: string, requestId?: string) => {
     ws.send(JSON.stringify({
       type: 'error',
       message,
       ...(requestId ? { requestId } : {}),
       protocolVersion: PROXY_PROTOCOL_VERSION,
     }))
+  }
+
+  let parsed: unknown
+  try {
+    parsed = JSON.parse(String(raw)) as unknown
+  } catch {
+    sendWireError('Invalid client message: expected valid JSON')
+    return
+  }
+  const requestId = typeof parsed === 'object' && parsed !== null &&
+    typeof (parsed as { requestId?: unknown }).requestId === 'string'
+    ? (parsed as { requestId: string }).requestId
+    : undefined
+  if (typeof parsed !== 'object' || parsed === null || typeof (parsed as { type?: unknown }).type !== 'string') {
+    sendWireError('Invalid client message: expected an object with a string type', requestId)
+    return
+  }
+  const msg = parsed as ParsedClientMessage
+  const pv = 'protocolVersion' in msg ? msg.protocolVersion : undefined
+  if (!isProtocolCompatible(pv)) {
+    sendWireError(`Client protocol ${String(pv)} is newer than proxy protocol ${PROXY_PROTOCOL_VERSION}`, requestId)
+    return
+  }
+
+  const validationError = clientMessageValidationError(msg)
+  if (validationError) {
+    sendWireError(validationError, requestId)
+    return
   }
 
   try {
@@ -222,9 +234,9 @@ async function handleClientMessage(
         try {
           urlAfter = page.url()
         } catch {
-          // If page.url() throws, the page is gone — emit a minimal nav
-          // signal so the caller knows the click did *something*.
-          onViewportOrInput('input', requestId, { navigated: true, pageUrl: undefined })
+          // A disappeared page may have navigated, crashed, or been closed.
+          // Do not promote that ambiguity to a successful submission.
+          onViewportOrInput('input', requestId, { pageUnavailable: true, urlBefore })
           return
         }
         if (urlAfter !== urlBefore) {
@@ -260,6 +272,7 @@ async function handleClientMessage(
         clickX: msg.x,
         clickY: msg.y,
         fieldId: msg.fieldId,
+        fieldKey: msg.fieldKey,
         fieldLabel: msg.fieldLabel,
         exact: msg.exact,
         strategy: msg.strategy,
@@ -273,6 +286,7 @@ async function handleClientMessage(
     if (isSetFieldTextMessage(msg)) {
       await setFieldText(page, msg.fieldLabel, msg.value, {
         fieldId: msg.fieldId,
+        fieldKey: msg.fieldKey,
         exact: msg.exact,
         cache: fieldLookupCache,
         typingDelayMs: msg.typingDelayMs,
@@ -285,7 +299,9 @@ async function handleClientMessage(
     if (isSetFieldChoiceMessage(msg)) {
       await setFieldChoice(page, msg.fieldLabel, msg.value, {
         fieldId: msg.fieldId,
+        fieldKey: msg.fieldKey,
         exact: msg.exact,
+        optionIndex: msg.optionIndex,
         query: msg.query,
         choiceType: msg.choiceType,
         cache: fieldLookupCache,
@@ -320,6 +336,7 @@ async function handleClientMessage(
         openX: msg.openX,
         openY: msg.openY,
         fieldId: msg.fieldId,
+        fieldKey: msg.fieldKey,
         fieldLabel: msg.fieldLabel,
         query: msg.query,
         cache: fieldLookupCache,
@@ -340,9 +357,12 @@ async function handleClientMessage(
 
     if (isSetCheckedMessage(msg)) {
       await setCheckedControl(page, msg.label, {
+        fieldKey: msg.fieldKey,
         checked: msg.checked,
         exact: msg.exact,
         controlType: msg.controlType,
+        contextText: msg.contextText,
+        sectionText: msg.sectionText,
       })
       onViewportOrInput('input', requestId)
       return
@@ -384,10 +404,13 @@ async function handleClientMessage(
       })
       const base64 = buffer.toString('base64')
       onViewportOrInput('input', requestId, { pdf: base64, pageUrl: page.url() })
+      return
     }
+
+    sendWireError(`Unsupported client message type "${msg.type}"`, requestId)
   } catch (err) {
     onHandlerError(err)
-    wireError(err instanceof Error ? err.message : String(err))
+    sendWireError(err instanceof Error ? err.message : String(err), requestId)
   }
 }
 
@@ -564,6 +587,8 @@ export function startGeometryWebSocket(options: {
   let debounceTimer: ReturnType<typeof setTimeout> | null = null
   let extracting = false
   let pendingExtract = false
+  let extractSequence = 0
+  let completedExtractSequence = 0
   let actionQueue: Promise<void> = Promise.resolve()
   let pendingInputAcks: PendingInputAck[] = []
   const fieldLookupCache = createFillLookupCache()
@@ -590,8 +615,10 @@ export function startGeometryWebSocket(options: {
 
   function sendPendingInputAcks() {
     if (pendingInputAcks.length === 0) return
-    const pending = pendingInputAcks
-    pendingInputAcks = []
+    const pending = pendingInputAcks.filter(entry => completedExtractSequence > entry.afterExtractSequence)
+    if (pending.length === 0) return
+    const ready = new Set(pending)
+    pendingInputAcks = pendingInputAcks.filter(entry => !ready.has(entry))
     for (const { ws, requestId, result } of pending) {
       if (ws.readyState === ws.OPEN) {
         ws.send(JSON.stringify({
@@ -673,6 +700,7 @@ export function startGeometryWebSocket(options: {
   }
 
   async function runExtract(): Promise<boolean> {
+    const sequence = ++extractSequence
     const runStartedAt = performance.now()
     const beforeInputStartedAt = performance.now()
     try {
@@ -690,6 +718,13 @@ export function startGeometryWebSocket(options: {
       const extractMs = performance.now() - extractStartedAt
       const broadcastStartedAt = performance.now()
       const changed = broadcastSnapshot(snap)
+      completedExtractSequence = sequence
+      // An input ack only proves freshness after an extraction that started
+      // after the action completed. Release eligible acks immediately after
+      // that snapshot instead of waiting for the entire trailing-edge
+      // mutation drain, which can be indefinitely extended by animated or
+      // highly reactive controls such as react-select.
+      sendPendingInputAcks()
       const broadcastMs = performance.now() - broadcastStartedAt
       trace.extractCount += 1
       if (!trace.firstExtract) {
@@ -781,7 +816,12 @@ export function startGeometryWebSocket(options: {
               if (kind === 'resize') {
                 void runExtractQueued()
               } else {
-                pendingInputAcks.push({ ws, ...(requestId ? { requestId } : {}), ...(result !== undefined ? { result } : {}) })
+                pendingInputAcks.push({
+                  ws,
+                  afterExtractSequence: extractSequence,
+                  ...(requestId ? { requestId } : {}),
+                  ...(result !== undefined ? { result } : {}),
+                })
                 scheduleExtract()
               }
             },

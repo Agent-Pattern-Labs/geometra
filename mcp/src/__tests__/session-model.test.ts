@@ -2,6 +2,7 @@ import { describe, expect, it } from 'vitest'
 import {
   buildA11yTree,
   buildCompactUiIndex,
+  buildFormGraphs,
   buildFormRequiredSnapshot,
   buildFormSchemas,
   buildPageModel,
@@ -373,6 +374,74 @@ describe('buildPageModel', () => {
 })
 
 describe('buildFormSchemas', () => {
+  it('projects discovered schemas into FormGraph-compatible graphs', () => {
+    const tree = node('group', undefined, { x: 0, y: 0, width: 900, height: 700 }, {
+      meta: { pageUrl: 'https://jobs.example.com/apply' },
+      children: [
+        node('form', 'Application', { x: 20, y: 20, width: 760, height: 480 }, {
+          path: [0],
+          children: [
+            node('textbox', 'Full name', { x: 40, y: 60, width: 320, height: 36 }, {
+              path: [0, 0],
+              state: { required: true },
+              meta: { placeholder: 'Legal name', inputType: 'text' },
+            }),
+            node('group', undefined, { x: 40, y: 120, width: 520, height: 96 }, {
+              path: [0, 1],
+              children: [
+                node('text', 'Are you authorized to work in the United States?', { x: 48, y: 120, width: 420, height: 24 }, {
+                  path: [0, 1, 0],
+                }),
+                node('button', 'Yes', { x: 48, y: 160, width: 88, height: 40 }, {
+                  path: [0, 1, 1],
+                  focusable: true,
+                  state: { required: true },
+                }),
+                node('button', 'No', { x: 148, y: 160, width: 88, height: 40 }, {
+                  path: [0, 1, 2],
+                  focusable: true,
+                }),
+              ],
+            }),
+          ],
+        }),
+      ],
+    })
+
+    const graphs = buildFormGraphs(tree)
+
+    expect(graphs).toHaveLength(1)
+    expect(graphs[0]).toMatchObject({
+      formgraph: '0.1',
+      id: 'geometra:fm:0',
+      title: 'Application',
+      sources: [{ id: 'geometra-page', kind: 'html', url: 'https://jobs.example.com/apply' }],
+      review: { autoSubmitAllowed: false, requiredBeforeSubmit: true },
+      fields: [
+        {
+          id: 'ff:0.0',
+          path: 'web.forms.application.full.name',
+          label: 'Full name',
+          kind: 'text',
+          required: true,
+          aliases: ['Legal name'],
+          sourceAnchors: [{ sourceId: 'geometra-page', kind: 'html', fieldName: 'ff:0.0' }],
+        },
+        {
+          id: 'ff:0.1',
+          path: 'web.forms.application.are.you.authorized.to.work.in.the.united.states',
+          label: 'Are you authorized to work in the United States?',
+          kind: 'boolean',
+          required: true,
+          options: [
+            { value: 'Yes', label: 'Yes' },
+            { value: 'No', label: 'No' },
+          ],
+        },
+      ],
+    })
+  })
+
   it('builds a compact fill-oriented schema and collapses repeated answer groups', () => {
     const longEssay = 'Semantic browser automation should be reliable, compact, and predictable across large forms.'
     const tree = node('group', undefined, { x: 0, y: 0, width: 1024, height: 768 }, {
@@ -514,6 +583,130 @@ describe('buildFormSchemas', () => {
     })
   })
 
+  it('surfaces exact native option values and authored field identity without treating disabled choices as selectable', () => {
+    const tree = node('group', undefined, { x: 0, y: 0, width: 900, height: 700 }, {
+      children: [
+        node('form', 'Application', { x: 20, y: 20, width: 760, height: 480 }, {
+          path: [0],
+          children: [
+            node('combobox', 'Office', { x: 40, y: 80, width: 320, height: 36 }, {
+              path: [0, 0],
+              meta: {
+                controlTag: 'select',
+                controlKey: 'id:office-select',
+                controlId: 'office-select',
+                options: [
+                  { value: '', label: 'Choose an office', disabled: true, selected: true, index: 0 },
+                  { value: 'nyc', label: 'New York', disabled: false, selected: false, index: 1 },
+                  { value: 'nyc-alt', label: 'New York', disabled: false, selected: false, index: 2 },
+                  { value: 'nyc', label: 'New York', disabled: false, selected: false, index: 3 },
+                ],
+              },
+            }),
+          ],
+        }),
+      ],
+    })
+
+    const compact = buildFormSchemas(tree)[0]?.fields[0]
+    expect(compact).toMatchObject({
+      id: 'id:office-select',
+      fieldKey: 'id:office-select',
+      kind: 'choice',
+      choiceType: 'select',
+      optionCount: 4,
+    })
+    expect(compact).not.toHaveProperty('options')
+    expect(compact).not.toHaveProperty('optionDetails')
+
+    const detailed = buildFormSchemas(tree, { includeOptions: true })[0]?.fields[0]
+    expect(detailed?.options).toEqual(['New York'])
+    expect(detailed?.optionDetails).toEqual([
+      {
+        id: 'id:office-select:option:0',
+        value: '',
+        label: 'Choose an office',
+        index: 0,
+        disabled: true,
+        selected: true,
+      },
+      { id: 'id:office-select:option:1', value: 'nyc', label: 'New York', index: 1 },
+      { id: 'id:office-select:option:2', value: 'nyc-alt', label: 'New York', index: 2 },
+      { id: 'id:office-select:option:3', value: 'nyc', label: 'New York', index: 3 },
+    ])
+
+    const graphField = buildFormGraphs(tree)[0]?.fields[0]
+    expect(graphField).toMatchObject({
+      id: 'id:office-select',
+      sourceAnchors: [{
+        fieldName: 'id:office-select',
+        pointer: 'geometra:id:office-select',
+      }],
+      options: [
+        { value: 'nyc', label: 'New York' },
+        { value: 'nyc-alt', label: 'New York' },
+        { value: 'nyc', label: 'New York' },
+      ],
+      metadata: {
+        geometra: {
+          fieldId: 'id:office-select',
+          fieldKey: 'id:office-select',
+          optionDetails: expect.arrayContaining([
+            expect.objectContaining({ id: 'id:office-select:option:0', disabled: true }),
+          ]),
+        },
+      },
+    })
+  })
+
+  it('uses authored identities only when unique and keeps keyed fields in form sections', () => {
+    const uniqueTree = node('group', undefined, { x: 0, y: 0, width: 900, height: 700 }, {
+      children: [
+        node('form', 'Application', { x: 20, y: 20, width: 760, height: 480 }, {
+          path: [0],
+          children: [
+            node('group', 'Personal details', { x: 30, y: 40, width: 700, height: 180 }, {
+              path: [0, 0],
+              children: [
+                node('textbox', 'Email', { x: 40, y: 80, width: 320, height: 36 }, {
+                  path: [0, 0, 0],
+                  meta: { controlKey: 'id:application-email' },
+                }),
+              ],
+            }),
+          ],
+        }),
+      ],
+    })
+
+    expect(buildFormSchemas(uniqueTree)[0]).toMatchObject({
+      fields: [{ id: 'id:application-email', fieldKey: 'id:application-email' }],
+      sections: [{ name: 'Personal details', fieldIds: ['id:application-email'] }],
+    })
+
+    const duplicateTree = node('group', undefined, { x: 0, y: 0, width: 900, height: 700 }, {
+      children: [
+        node('form', 'Application', { x: 20, y: 20, width: 760, height: 480 }, {
+          path: [0],
+          children: [
+            node('textbox', 'Primary email', { x: 40, y: 80, width: 320, height: 36 }, {
+              path: [0, 0],
+              meta: { controlKey: 'name:input:email:contact' },
+            }),
+            node('textbox', 'Backup email', { x: 40, y: 140, width: 320, height: 36 }, {
+              path: [0, 1],
+              meta: { controlKey: 'name:input:email:contact' },
+            }),
+          ],
+        }),
+      ],
+    })
+
+    const duplicateFields = buildFormSchemas(duplicateTree)[0]?.fields ?? []
+    expect(duplicateFields.map(field => field.id)).toEqual(['ff:0.0', 'ff:0.1'])
+    expect(duplicateFields.every(field => field.fieldKey === undefined)).toBe(true)
+  })
+
   // Bug #3 regression (v1.43): a React Select / Headless UI / Radix
   // autocomplete combobox renders as a plain <input role="textbox"> in the
   // accessibility tree. The extractor tags it with meta.isAutocompleteCombobox
@@ -601,6 +794,7 @@ describe('buildFormRequiredSnapshot', () => {
             node('textbox', 'Full name', { x: 48, y: 120, width: 320, height: 36 }, {
               path: [0, 0],
               state: { required: true },
+              meta: { controlKey: 'id:full-name' },
             }),
             node('combobox', 'Preferred location', { x: 48, y: 940, width: 320, height: 36 }, {
               path: [0, 1],
@@ -638,7 +832,8 @@ describe('buildFormRequiredSnapshot', () => {
       requiredCount: 3,
       fields: [
         {
-          id: 'ff:0.0',
+          id: 'id:full-name',
+          fieldKey: 'id:full-name',
           label: 'Full name',
           visibility: { intersectsViewport: true, fullyVisible: true },
           scrollHint: { status: 'visible' },
@@ -931,6 +1126,53 @@ describe('buildA11yTree', () => {
         description: 'We will contact you about this role.',
         error: 'Please enter a valid email address.',
       },
+    })
+  })
+
+  it('preserves authored field identity and structured native option metadata', () => {
+    const tree = {
+      kind: 'box',
+      props: {},
+      semantic: {},
+      children: [
+        {
+          kind: 'box',
+          props: {},
+          semantic: {
+            tag: 'select',
+            role: 'combobox',
+            ariaLabel: 'Office',
+            controlKey: 'name:select:default:office',
+            controlName: 'office',
+            options: [
+              { value: '', label: 'Choose an office', disabled: true, selected: true, index: 0 },
+              { value: 'nyc', label: 'New York', disabled: false, selected: false, index: 1 },
+              { value: 'nyc-alt', label: 'New York', disabled: false, selected: false, index: 2 },
+            ],
+          },
+          handlers: { onClick: true, onKeyDown: true },
+        },
+      ],
+    } as Record<string, unknown>
+    const layout = {
+      x: 0,
+      y: 0,
+      width: 800,
+      height: 600,
+      children: [{ x: 24, y: 40, width: 320, height: 36, children: [] }],
+    } as Record<string, unknown>
+
+    const a11y = buildA11yTree(tree, layout)
+
+    expect(a11y.children[0]?.meta).toMatchObject({
+      controlTag: 'select',
+      controlKey: 'name:select:default:office',
+      controlName: 'office',
+      options: [
+        { value: '', label: 'Choose an office', disabled: true, selected: true, index: 0 },
+        { value: 'nyc', label: 'New York', disabled: false, selected: false, index: 1 },
+        { value: 'nyc-alt', label: 'New York', disabled: false, selected: false, index: 2 },
+      ],
     })
   })
 })
