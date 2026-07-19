@@ -1,5 +1,5 @@
 import type { ChildProcess } from 'node:child_process'
-import { randomUUID } from 'node:crypto'
+import { createHash, randomUUID } from 'node:crypto'
 import { performance } from 'node:perf_hooks'
 import WebSocket from 'ws'
 import {
@@ -482,6 +482,9 @@ export interface Session {
   peerProtocolCapabilities?: {
     authenticatedController?: boolean
     requestScopedAcks?: boolean
+    actionDeadlines?: boolean
+    idempotentRequestIds?: boolean
+    atomicTypeText?: boolean
     proxyActions?: boolean
     exactFieldIdentity?: boolean
     binaryFraming?: boolean
@@ -503,6 +506,10 @@ export interface Session {
   cachedA11y?: A11yNode | null
   cachedA11yRevision?: number
   cachedFormSchemas?: Map<string, { revision: number; forms: FormSchemaModel[] }>
+  /** True only after the current WebSocket transport has supplied a full frame. */
+  hasFreshFrame?: boolean
+  /** Permanently set when this session has been disconnected or otherwise retired. */
+  disposed?: boolean
   workflowState?: WorkflowState
   reconnectInFlight?: Promise<boolean>
   lifecycleTaskId?: string
@@ -513,6 +520,10 @@ export interface Session {
   heartbeatInterval?: ReturnType<typeof setInterval> | null
   heartbeatLastMessageAt?: number
   heartbeatPendingPongBy?: number | null
+  /** Mutating operations whose caller timed out before a terminal response. */
+  ambiguousOperations?: Map<string, AmbiguousOperation>
+  /** Mutating operations currently awaiting a terminal response. */
+  inFlightMutations?: Map<string, AmbiguousOperation>
 }
 
 export interface SessionConnectTrace {
@@ -534,7 +545,38 @@ export interface SessionConnectTrace {
 export interface UpdateWaitResult {
   status: 'updated' | 'acknowledged' | 'timed_out'
   timeoutMs: number
+  /** Wire identity used to correlate the terminal proxy response. */
+  requestId: string
+  /** Stable logical identity shared by every wire phase of one action. */
+  actionId: string
   result?: unknown
+}
+
+interface AmbiguousOperation {
+  fingerprint: string
+  actionId: string
+  requestId: string
+  requestIds: string[]
+  wireMessages: string[]
+  actionTimeoutMs?: number
+  timeoutMs: number
+  idempotent: boolean
+  mutating: boolean
+  /** A correlated ACK alone is insufficient for actions such as navigation. */
+  requireUpdateOnAck?: boolean
+  /** Protocol floor that the terminal ACK must explicitly satisfy. */
+  requiredProtocolVersion?: number
+  /** Any non-deduplication phase error permanently blocks later ACK promotion. */
+  stickyError?: Error
+  /**
+   * Once any caller observes a timeout, identical intent is permanently
+   * pinned to this identity for the rest of the session. A future caller
+   * cannot prove it is (or is not) the timed-out caller.
+   */
+  permanentTombstone?: boolean
+  completion?:
+    | { kind: 'result'; value: UpdateWaitResult }
+    | { kind: 'error'; error: Error }
 }
 
 /**
@@ -564,15 +606,12 @@ interface ReusableProxyEntry {
   proxyKey: string
   snapshotReady: boolean
   lastUsedAt: number
+  closed?: boolean
   /**
    * Per-proxy attach mutex. Serializes concurrent `connectThroughProxy`
-   * calls that pick this entry so that two parallel connects cannot both
-   * call `connect(proxy.wsUrl)` and end up with two distinct WebSocket
-   * sessions bound to the same Chromium. Without this lock, two agents
-   * launched in parallel against the pool would silently mutate the same
-   * DOM. The first connect to claim the lock wins; the second waits, then
-   * re-picks via findReusableProxy, sees the now-bound session, and takes
-   * the reusedExistingSession branch in attachToReusableProxy.
+   * calls that initially pick the same idle entry. The first caller claims
+   * that browser; every waiter re-picks and must use a different idle entry
+   * or start a fresh runtime. An active browser never has two Session owners.
    */
   attachLock?: Promise<void> | null
 }
@@ -582,12 +621,32 @@ let defaultSessionId: string | null = null
 const MAX_ACTIVE_SESSIONS = 5
 function generateSessionId(): string { return `s_${randomUUID()}` }
 
+interface SessionOwnershipLease {
+  readonly id: string
+  reserved: boolean
+  connectAttemptActive: boolean
+}
+
+class SessionCapacityError extends Error {
+  constructor(active: number, pending: number) {
+    super(
+      `Geometra MCP already has ${active} active sessions and ${pending} pending connection(s) ` +
+      `(limit ${MAX_ACTIVE_SESSIONS}). Disconnect an explicit session before connecting another; ` +
+      'active owners are never evicted implicitly.',
+    )
+    this.name = 'SessionCapacityError'
+  }
+}
+
+const pendingSessionOwnership = new Set<SessionOwnershipLease>()
+
 let reusableProxies: ReusableProxyEntry[] = []
 const REUSABLE_PROXY_POOL_LIMIT = 6
 /** Close idle reusable proxies after 5 minutes of inactivity. */
 const REUSABLE_PROXY_IDLE_TTL_MS = 5 * 60 * 1000
 let idleProxyTimer: ReturnType<typeof setInterval> | null = null
 const trackedReusableProxyChildren = new WeakSet<ChildProcess>()
+const embeddedProxyClosePromises = new WeakMap<EmbeddedProxyRuntime, Promise<void>>()
 const ACTION_UPDATE_TIMEOUT_MS = 2000
 const LISTBOX_UPDATE_TIMEOUT_MS = 4500
 const FILL_BATCH_BASE_TIMEOUT_MS = 2500
@@ -601,9 +660,57 @@ const FILL_BATCH_MAX_TIMEOUT_MS = 60_000
 const SESSION_RECONNECT_TIMEOUT_MS = 5_000
 const GEOMETRY_PROTOCOL_VERSION = 1
 const PROXY_ACTION_PROTOCOL_VERSION = 2
-let nextRequestSequence = 0
+const MAX_AMBIGUOUS_OPERATIONS_PER_SESSION = 64
+const MAX_AMBIGUOUS_WIRE_BYTES_PER_SESSION = 1024 * 1024
+const MUTATING_PROXY_ACTION_TYPES = new Set([
+  'event',
+  'key',
+  'typeText',
+  'resize',
+  'navigate',
+  'composition',
+  'file',
+  'setFieldText',
+  'setFieldChoice',
+  'fillFields',
+  'fillOtp',
+  'listboxPick',
+  'selectOption',
+  'setChecked',
+  'wheel',
+  'pdfGenerate',
+])
 
 type InboundServerMessage = Record<string, unknown> & { type: string }
+
+class GeometraWireError extends Error {
+  readonly code?: string
+  readonly requestId?: string
+  readonly actionId?: string
+
+  constructor(message: string, code?: string, requestId?: string, actionId?: string) {
+    super(message)
+    this.name = 'GeometraWireError'
+    this.code = code
+    this.requestId = requestId
+    this.actionId = actionId
+  }
+}
+
+const SAFE_NON_EXECUTION_WIRE_CODES = new Set([
+  'ACTION_EXPIRED',
+  'REQUEST_ID_CONFLICT',
+  'REQUEST_LEDGER_CAPACITY',
+])
+
+function wireErrorFromMessage(msg: InboundServerMessage, actionId?: string): GeometraWireError {
+  return new GeometraWireError(
+    typeof msg.message === 'string' ? msg.message : 'Geometra server error',
+    typeof msg.code === 'string' ? msg.code : undefined,
+    typeof msg.requestId === 'string' ? msg.requestId : undefined,
+    actionId,
+  )
+}
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null && !Array.isArray(value)
@@ -723,6 +830,9 @@ function updatePeerProtocol(session: Session, msg: InboundServerMessage): void {
     session.peerProtocolCapabilities = {
       authenticatedController: typeof capabilities.authenticatedController === 'boolean' ? capabilities.authenticatedController : undefined,
       requestScopedAcks: typeof capabilities.requestScopedAcks === 'boolean' ? capabilities.requestScopedAcks : undefined,
+      actionDeadlines: typeof capabilities.actionDeadlines === 'boolean' ? capabilities.actionDeadlines : undefined,
+      idempotentRequestIds: typeof capabilities.idempotentRequestIds === 'boolean' ? capabilities.idempotentRequestIds : undefined,
+      atomicTypeText: typeof capabilities.atomicTypeText === 'boolean' ? capabilities.atomicTypeText : undefined,
       proxyActions: typeof capabilities.proxyActions === 'boolean' ? capabilities.proxyActions : undefined,
       exactFieldIdentity: typeof capabilities.exactFieldIdentity === 'boolean' ? capabilities.exactFieldIdentity : undefined,
       binaryFraming: typeof capabilities.binaryFraming === 'boolean' ? capabilities.binaryFraming : undefined,
@@ -748,6 +858,255 @@ function outboundProtocolMetadata(session: Session): Record<string, number> {
   return { protocolVersion: proxyActionVersion ?? geometryVersion }
 }
 
+function canonicalActionJson(value: unknown): string {
+  if (Array.isArray(value)) return `[${value.map(canonicalActionJson).join(',')}]`
+  if (value !== null && typeof value === 'object') {
+    const record = value as Record<string, unknown>
+    return `{${Object.keys(record)
+      .sort()
+      .map(key => `${JSON.stringify(key)}:${canonicalActionJson(record[key])}`)
+      .join(',')}}`
+  }
+  return JSON.stringify(value) ?? 'null'
+}
+
+function actionFingerprint(value: unknown): string {
+  return createHash('sha256').update(canonicalActionJson(value)).digest('hex')
+}
+
+function isMutatingProxyAction(message: Record<string, unknown>): boolean {
+  return typeof message.type === 'string' && MUTATING_PROXY_ACTION_TYPES.has(message.type)
+}
+
+function actionTimeoutFor(session: Session, message: Record<string, unknown>, timeoutMs: number): number | undefined {
+  if (
+    session.peerTransport !== 'proxy' ||
+    session.peerProtocolCapabilities?.actionDeadlines !== true ||
+    !isMutatingProxyAction(message)
+  ) {
+    return undefined
+  }
+  return timeoutMs
+}
+
+function ambiguousOperationFor(session: Session, fingerprint: string): AmbiguousOperation | undefined {
+  return session.ambiguousOperations?.get(fingerprint) ?? session.inFlightMutations?.get(fingerprint)
+}
+
+function assertCanStartMutatingOperation(session: Session, fingerprint: string): void {
+  const operations = session.ambiguousOperations
+  const trackedCount = (operations?.size ?? 0) + (session.inFlightMutations?.size ?? 0)
+  if (operations?.has(fingerprint) || session.inFlightMutations?.has(fingerprint) || trackedCount < MAX_AMBIGUOUS_OPERATIONS_PER_SESSION) return
+  throw new Error(
+    `Session ${session.id} has ${trackedCount} unresolved action outcomes. ` +
+    'Inspect or reconnect the session before sending another mutation; Geometra refused to risk a duplicate action.',
+  )
+}
+
+function rememberAmbiguousOperation(session: Session, operation: AmbiguousOperation): void {
+  if (session.inFlightMutations?.get(operation.fingerprint) === operation) {
+    session.inFlightMutations.delete(operation.fingerprint)
+  }
+  const operations = session.ambiguousOperations ?? new Map<string, AmbiguousOperation>()
+  session.ambiguousOperations = operations
+  if (!operations.has(operation.fingerprint)) {
+    const retainedWireBytes = Array.from(operations.values()).reduce(
+      (total, candidate) => total + retainedOperationBytes(candidate),
+      0,
+    )
+    const operationWireBytes = retainedOperationBytes(operation)
+    if (retainedWireBytes + operationWireBytes > MAX_AMBIGUOUS_WIRE_BYTES_PER_SESSION) {
+      // Retain the hash and identities so the action remains blocked, but do
+      // not retain potentially sensitive field values merely for ergonomics.
+      operation.wireMessages = []
+      operation.idempotent = false
+    }
+  }
+  operations.set(operation.fingerprint, operation)
+}
+
+const OMITTED_TERMINAL_RESULT = {
+  retained: false,
+  reason: 'Terminal action result exceeded the 1 MiB per-session ambiguity retention cap.',
+} as const
+
+function retainedCompletionBytes(operation: AmbiguousOperation): number {
+  if (operation.completion?.kind !== 'result' || operation.completion.value.result === undefined) return 0
+  try {
+    return Buffer.byteLength(JSON.stringify(operation.completion.value.result))
+  } catch {
+    return 0
+  }
+}
+
+function retainedOperationBytes(operation: AmbiguousOperation): number {
+  return operation.wireMessages.reduce((sum, wire) => sum + Buffer.byteLength(wire), 0) +
+    retainedCompletionBytes(operation)
+}
+
+function boundedTerminalResult(
+  session: Session,
+  operation: AmbiguousOperation,
+  result: unknown,
+): unknown {
+  if (!operation.permanentTombstone || result === undefined) return result
+  let resultBytes: number
+  try {
+    resultBytes = Buffer.byteLength(JSON.stringify(result))
+  } catch {
+    return OMITTED_TERMINAL_RESULT
+  }
+  const otherOperations = new Set<AmbiguousOperation>([
+    ...Array.from(session.ambiguousOperations?.values() ?? []),
+    ...Array.from(session.inFlightMutations?.values() ?? []),
+  ])
+  otherOperations.delete(operation)
+  const retainedBytes = Array.from(otherOperations).reduce(
+    (total, candidate) => total + retainedOperationBytes(candidate),
+    0,
+  )
+  if (retainedBytes + resultBytes <= MAX_AMBIGUOUS_WIRE_BYTES_PER_SESSION) return result
+  const markerBytes = Buffer.byteLength(JSON.stringify(OMITTED_TERMINAL_RESULT))
+  return retainedBytes + markerBytes <= MAX_AMBIGUOUS_WIRE_BYTES_PER_SESSION
+    ? OMITTED_TERMINAL_RESULT
+    : undefined
+}
+
+function retainTerminalResult(
+  session: Session,
+  operation: AmbiguousOperation,
+  value: UpdateWaitResult,
+): void {
+  operation.wireMessages = []
+  const result = boundedTerminalResult(session, operation, value.result)
+  operation.completion = {
+    kind: 'result',
+    value: {
+      ...value,
+      ...(result !== undefined ? { result } : {}),
+    },
+  }
+}
+
+function retainTerminalError(operation: AmbiguousOperation, error: Error): void {
+  operation.wireMessages = []
+  operation.completion = { kind: 'error', error }
+}
+
+function trackInFlightMutation(session: Session, operation: AmbiguousOperation): void {
+  if (!operation.mutating) return
+  const retainedWireBytes = [
+    ...Array.from(session.ambiguousOperations?.values() ?? []),
+    ...Array.from(session.inFlightMutations?.values() ?? []),
+  ].reduce(
+    (total, candidate) => total + retainedOperationBytes(candidate),
+    0,
+  )
+  const operationWireBytes = retainedOperationBytes(operation)
+  if (retainedWireBytes + operationWireBytes > MAX_AMBIGUOUS_WIRE_BYTES_PER_SESSION) {
+    throw new Error(
+      'In-flight action replay data would exceed the 1 MiB per-session safety cap; Geometra refused to send the mutation.',
+    )
+  }
+  const operations = session.inFlightMutations ?? new Map<string, AmbiguousOperation>()
+  session.inFlightMutations = operations
+  operations.set(operation.fingerprint, operation)
+}
+
+function forgetAmbiguousOperation(session: Session, operation: AmbiguousOperation): void {
+  if (session.ambiguousOperations?.get(operation.fingerprint) === operation) {
+    session.ambiguousOperations.delete(operation.fingerprint)
+  }
+  if (session.inFlightMutations?.get(operation.fingerprint) === operation) {
+    session.inFlightMutations.delete(operation.fingerprint)
+  }
+}
+
+function stickyAmbiguousError(
+  operation: AmbiguousOperation,
+  error: unknown,
+): GeometraWireError {
+  const marker = `Outcome is ambiguous for actionId ${operation.actionId} (requestId ${operation.requestId})`
+  if (
+    error instanceof GeometraWireError &&
+    error.requestId === operation.requestId &&
+    error.actionId === operation.actionId &&
+    error.message.includes(marker)
+  ) {
+    return error
+  }
+
+  const sourceMessage = error instanceof Error ? error.message : String(error)
+  return new GeometraWireError(
+    `${sourceMessage} ${marker}; do not retry blindly.`,
+    error instanceof GeometraWireError
+      ? error.code ?? 'ACTION_OUTCOME_AMBIGUOUS'
+      : 'ACTION_OUTCOME_AMBIGUOUS',
+    operation.requestId,
+    operation.actionId,
+  )
+}
+
+function cacheLateAmbiguousOutcome(session: Session, msg: InboundServerMessage): void {
+  const requestId = typeof msg.requestId === 'string' ? msg.requestId : undefined
+  if (!requestId) return
+  const tracked = [
+    ...Array.from(session.ambiguousOperations?.values() ?? []),
+    ...Array.from(session.inFlightMutations?.values() ?? []),
+  ]
+  const operation = tracked.find(
+    candidate => candidate.requestIds.includes(requestId),
+  )
+  if (!operation || operation.completion) return
+  if (msg.type === 'error') {
+    if (msg.code === 'DUPLICATE_REQUEST') return
+    const error = wireErrorFromMessage(msg, operation.actionId)
+    if (
+      typeof msg.code === 'string' &&
+      SAFE_NON_EXECUTION_WIRE_CODES.has(msg.code) &&
+      operation.requestIds.length === 1
+    ) {
+      retainTerminalError(operation, error)
+    } else {
+      // A logical action may have many phases. Once any phase fails, a later
+      // final-phase ACK cannot prove that the whole action completed.
+      operation.wireMessages = []
+      operation.stickyError = stickyAmbiguousError(operation, error)
+    }
+    return
+  }
+  if (msg.type === 'ack') {
+    if (requestId !== operation.requestId) return
+    if (operation.stickyError) return
+    // Navigation and similar operations require a fresh post-action frame.
+    // A late ACK cannot establish that evidence on its own.
+    if (operation.requireUpdateOnAck) return
+    const peerProtocolVersion = typeof msg.proxyActionProtocolVersion === 'number'
+      ? msg.proxyActionProtocolVersion
+      : typeof msg.protocolVersion === 'number'
+        ? msg.protocolVersion
+        : session.peerProxyActionProtocolVersion
+    if (operation.requiredProtocolVersion !== undefined && (
+      peerProtocolVersion === undefined || peerProtocolVersion < operation.requiredProtocolVersion
+    )) {
+      operation.wireMessages = []
+      operation.stickyError = stickyAmbiguousError(operation, new Error(
+        `Proxy protocol ${peerProtocolVersion ?? 'unknown'} cannot guarantee exact field identity; ` +
+        `protocol ${operation.requiredProtocolVersion}+ is required. Update and reconnect the Geometra proxy.`,
+      ))
+      return
+    }
+    retainTerminalResult(session, operation, {
+      status: 'acknowledged',
+      timeoutMs: operation.timeoutMs,
+      requestId: operation.requestId,
+      actionId: operation.actionId,
+      ...(msg.result !== undefined ? { result: msg.result } : {}),
+    })
+    return
+  }
+}
+
 export type ProxyFillField =
   | { kind: 'auto'; fieldId?: string; fieldKey?: string; fieldLabel: string; value: string | boolean; exact?: boolean }
   | {
@@ -770,15 +1129,23 @@ function invalidateSessionCaches(session: Session): void {
   session.cachedFormSchemas?.clear()
 }
 
+function invalidateSessionUiState(session: Session): void {
+  session.hasFreshFrame = false
+  session.layout = null
+  session.tree = null
+  invalidateSessionCaches(session)
+}
+
 function applyInboundSessionMessage(session: Session, data: WebSocket.Data): InboundServerMessage {
   const msg = parseInboundServerMessage(data)
   updatePeerProtocol(session, msg)
   if (msg.type === 'frame') {
     session.layout = msg.layout as Record<string, unknown>
     session.tree = msg.tree as Record<string, unknown>
+    session.hasFreshFrame = true
     session.updateRevision++
     invalidateSessionCaches(session)
-  } else if (msg.type === 'patch' && session.layout) {
+  } else if (msg.type === 'patch' && session.hasFreshFrame === true && session.layout) {
     applyPatches(session.layout, msg.patches as Array<{
       path: number[]
       x?: number
@@ -789,6 +1156,7 @@ function applyInboundSessionMessage(session: Session, data: WebSocket.Data): Inb
     session.updateRevision++
     invalidateSessionCaches(session)
   }
+  cacheLateAmbiguousOutcome(session, msg)
   return msg
 }
 
@@ -832,6 +1200,7 @@ function reusableProxyEntryIsActive(entry: ReusableProxyEntry): boolean {
 
 function clearReusableProxiesIfExited(): void {
   reusableProxies = reusableProxies.filter(entry => {
+    if (entry.closed) return false
     if (entry.child) {
       return !entry.child.killed && entry.child.exitCode === null && entry.child.signalCode === null
     }
@@ -849,7 +1218,25 @@ function updateReusableProxySnapshotState(entry: ReusableProxyEntry, session: Se
   }
 }
 
+function closeEmbeddedProxyRuntime(runtime: EmbeddedProxyRuntime): Promise<void> {
+  const existing = embeddedProxyClosePromises.get(runtime)
+  if (existing) return existing
+  let settle!: () => void
+  const closing = new Promise<void>(resolve => { settle = resolve })
+  // Publish the promise before invoking user/runtime code so even a
+  // re-entrant cleanup observes the same close operation.
+  embeddedProxyClosePromises.set(runtime, closing)
+  try {
+    void runtime.close().then(settle, settle)
+  } catch {
+    settle()
+  }
+  return closing
+}
+
 function closeReusableProxy(entry: ReusableProxyEntry): void {
+  if (entry.closed) return
+  entry.closed = true
   reusableProxies = reusableProxies.filter(candidate => candidate !== entry)
   if (entry.child) {
     try {
@@ -860,24 +1247,15 @@ function closeReusableProxy(entry: ReusableProxyEntry): void {
     ensureIdleProxyTimer()
     return
   }
-  void entry.runtime?.close().catch(() => {})
+  if (entry.runtime) void closeEmbeddedProxyRuntime(entry.runtime)
   ensureIdleProxyTimer()
 }
 
 function closeReusableProxies(): void {
   clearReusableProxiesIfExited()
   const proxies = [...reusableProxies]
-  reusableProxies = []
   for (const entry of proxies) {
-    if (entry.child) {
-      try {
-        entry.child.kill('SIGTERM')
-      } catch {
-        /* ignore */
-      }
-      continue
-    }
-    void entry.runtime?.close().catch(() => {})
+    closeReusableProxy(entry)
   }
 }
 
@@ -1026,23 +1404,16 @@ function promoteDefaultSession(): void {
   defaultSessionId = null
 }
 
-/**
- * Clear `defaultSessionId` if it currently points at the given session id.
- * Used after tagging a fresh session as isolated — `connect()` set the
- * default pointer before the isolation flag was applied, and we need to
- * retract that assignment so this session is only addressable by its
- * explicit id.
- */
-function retractDefaultIfPointsTo(sessionId: string): void {
-  if (defaultSessionId === sessionId) {
-    promoteDefaultSession()
-  }
-}
-
 function shutdownSession(id: string, opts?: { closeProxy?: boolean; reason?: string }): void {
   const prev = activeSessions.get(id)
   if (!prev) return
-  const forceCloseProxy = prev.isolated === true
+  const hasUnsettledMutation = Boolean(
+    prev.inFlightMutations?.size || prev.ambiguousOperations?.size,
+  )
+  prev.disposed = true
+  prev.ambiguousOperations?.clear()
+  prev.inFlightMutations?.clear()
+  const forceCloseProxy = prev.isolated === true || hasUnsettledMutation
   safeCompleteSessionLifecycle(prev, opts?.reason ?? 'disconnect', {
     closeProxy: opts?.closeProxy ?? false,
     forceCloseProxy,
@@ -1050,7 +1421,8 @@ function shutdownSession(id: string, opts?: { closeProxy?: boolean; reason?: str
   activeSessions.delete(id)
   if (defaultSessionId === id) promoteDefaultSession()
   stopSessionHeartbeat(prev)
-  releaseSessionResources(prev, { closeProxy: opts?.closeProxy ?? false })
+  releaseSessionResources(prev, { closeProxy: (opts?.closeProxy ?? false) || hasUnsettledMutation })
+  invalidateSessionUiState(prev)
 }
 
 function releaseSessionResources(session: Session, opts?: { closeProxy?: boolean }): void {
@@ -1098,15 +1470,54 @@ function releaseSessionResources(session: Session, opts?: { closeProxy?: boolean
       closeReusableProxy(entry)
       return
     }
-    void session.proxyRuntime.close().catch(() => {})
+    void closeEmbeddedProxyRuntime(session.proxyRuntime)
   }
 }
 
-/** Evict the oldest session when at capacity. */
-function evictOldestSession(): void {
-  if (activeSessions.size < MAX_ACTIVE_SESSIONS) return
-  const oldestId = activeSessions.keys().next().value as string
-  shutdownSession(oldestId, { closeProxy: false, reason: 'evicted' })
+/**
+ * Reserve one ownership slot before any asynchronous transport or browser
+ * startup. Passing the same lease is idempotent, which lets an embedded
+ * connection hand its reservation through to `connect()` and safely
+ * reacquire it before a child-process fallback.
+ */
+function reserveSessionOwnership(existing?: SessionOwnershipLease): SessionOwnershipLease {
+  if (existing?.reserved && pendingSessionOwnership.has(existing)) return existing
+  pruneDisconnectedSessions()
+  if (activeSessions.size + pendingSessionOwnership.size >= MAX_ACTIVE_SESSIONS) {
+    throw new SessionCapacityError(activeSessions.size, pendingSessionOwnership.size)
+  }
+  const lease = existing ?? { id: randomUUID(), reserved: false, connectAttemptActive: false }
+  lease.reserved = true
+  pendingSessionOwnership.add(lease)
+  return lease
+}
+
+function beginSessionOwnershipAttempt(existing?: SessionOwnershipLease): SessionOwnershipLease {
+  const lease = reserveSessionOwnership(existing)
+  if (lease.connectAttemptActive) {
+    throw new Error(`Session ownership lease ${lease.id} is already assigned to a pending connection attempt`)
+  }
+  lease.connectAttemptActive = true
+  return lease
+}
+
+function releaseSessionOwnership(lease: SessionOwnershipLease): void {
+  if (!lease.reserved) return
+  pendingSessionOwnership.delete(lease)
+  lease.reserved = false
+  lease.connectAttemptActive = false
+}
+
+function claimSessionOwnership(lease: SessionOwnershipLease, session: Session): void {
+  if (!lease.reserved || !pendingSessionOwnership.has(lease)) {
+    throw new Error(`Session ownership lease ${lease.id} was not reserved when connection completed`)
+  }
+  // The transition is synchronous: no other connect can observe a moment
+  // where both the pending reservation and active owner are absent.
+  pendingSessionOwnership.delete(lease)
+  lease.reserved = false
+  lease.connectAttemptActive = false
+  activeSessions.set(session.id, session)
 }
 
 function formatUnknownError(err: unknown): string {
@@ -1246,11 +1657,8 @@ function findExactReusableProxy(options: {
 }): ReusableProxyEntry | undefined {
   clearReusableProxiesIfExited()
   return reusableProxies
-    .filter(entry => reusableProxyMatchesOptions(entry, options))
-    .sort((a, b) => {
-      const activeBonus = reusableProxyEntryIsActive(b) ? 1 : reusableProxyEntryIsActive(a) ? -1 : 0
-      return activeBonus || b.lastUsedAt - a.lastUsedAt
-    })[0]
+    .filter(entry => !reusableProxyEntryIsActive(entry) && reusableProxyMatchesOptions(entry, options))
+    .sort((a, b) => b.lastUsedAt - a.lastUsedAt)[0]
 }
 
 function findReusableProxy(options: {
@@ -1272,7 +1680,8 @@ function findReusableProxy(options: {
 
   return reusableProxies
     .filter(entry =>
-      entry.headless === desiredHeadless
+      !reusableProxyEntryIsActive(entry)
+      && entry.headless === desiredHeadless
       && entry.stealth === desiredStealth
       && entry.slowMo === desiredSlowMo
       // Proxy partition is hard: a session with a caller-provided proxy MUST
@@ -1285,7 +1694,6 @@ function findReusableProxy(options: {
         let value = 0
         if (entry.pageUrl === options.pageUrl) value += 100
         if (entry.width === desiredWidth && entry.height === desiredHeight) value += 10
-        if (reusableProxyEntryIsActive(entry)) value += 5
         return value
       }
       return score(b) - score(a) || b.lastUsedAt - a.lastUsedAt
@@ -1345,7 +1753,7 @@ export async function prewarmProxy(options: {
     try {
       await runtime.ready
     } catch (err) {
-      await runtime.close().catch(() => {})
+      await closeEmbeddedProxyRuntime(runtime)
       throw err
     }
     setReusableProxy({ runtime }, wsUrl, {
@@ -1422,18 +1830,15 @@ async function attachToReusableProxy(proxy: ReusableProxyEntry, options: {
   const desiredWidth = options.width ?? proxy.width
   const desiredHeight = options.height ?? proxy.height
   const needsSnapshotKickoff = options.awaitInitialFrame !== false && !proxy.snapshotReady
-  let reusedExistingSession: Session | null = null
-  for (const s of activeSessions.values()) {
-    if ((proxy.child && s.proxyChild === proxy.child) || (proxy.runtime && s.proxyRuntime === proxy.runtime)) {
-      reusedExistingSession = s
-      break
-    }
+  if (reusableProxyEntryIsActive(proxy)) {
+    throw new Error('Reusable proxy already has an active session owner')
   }
-  const session = reusedExistingSession ?? await connect(proxy.wsUrl, {
+  const session = await connect(proxy.wsUrl, {
     skipInitialResize: true,
     closePreviousProxy: false,
     awaitInitialFrame: needsSnapshotKickoff ? false : options.awaitInitialFrame,
     authToken: proxy.authToken,
+    isolated: false,
   })
 
   if (!session) {
@@ -1445,6 +1850,7 @@ async function attachToReusableProxy(proxy: ReusableProxyEntry, options: {
   session.proxyReusable = true
   touchReusableProxy(proxy)
 
+  try {
   let resizeKickoffMs: number | undefined
   if (needsSnapshotKickoff || desiredWidth !== proxy.width || desiredHeight !== proxy.height) {
     const resizeStartedAt = performance.now()
@@ -1468,7 +1874,7 @@ async function attachToReusableProxy(proxy: ReusableProxyEntry, options: {
     updateReusableProxySnapshotState(proxy, session)
   }
 
-  const baseConnectTrace = !reusedExistingSession ? session.connectTrace : undefined
+  const baseConnectTrace = session.connectTrace
   session.connectTrace = {
     mode: 'reused-proxy',
     reused: true,
@@ -1486,9 +1892,16 @@ async function attachToReusableProxy(proxy: ReusableProxyEntry, options: {
   safeRecordSessionSnapshot(session, 'session.proxy_attached', {
     transportMode: 'reused-proxy',
     targetPageUrl: options.pageUrl,
-    reusedExistingSession: reusedExistingSession !== null,
+    reusedExistingSession: false,
   })
   return session
+  } catch (err) {
+    // The provisional WebSocket session must not remain an active owner when
+    // resize/navigation fails. Release only the session here; the caller owns
+    // eviction of the stale warm proxy entry.
+    shutdownSession(session.id, { closeProxy: false, reason: 'proxy_attach_failed' })
+    throw err
+  }
 }
 
 async function startFreshProxySession(options: {
@@ -1509,7 +1922,7 @@ async function startFreshProxySession(options: {
   isolated?: boolean
   /** Outbound HTTP/SOCKS proxy for Chromium. */
   proxy?: SpawnProxyConfig
-}): Promise<Session> {
+}, initialOwnershipLease: SessionOwnershipLease): Promise<Session> {
   const startedAt = performance.now()
   const eagerInitialExtract =
     options.eagerInitialExtract !== undefined
@@ -1517,115 +1930,44 @@ async function startFreshProxySession(options: {
       : options.awaitInitialFrame !== false
         ? undefined
         : false
+  let ownershipLease = reserveSessionOwnership(initialOwnershipLease)
   let pendingEmbeddedRuntime: EmbeddedProxyRuntime | undefined
+  let pendingEmbeddedConnect: Promise<Session> | undefined
+  let attachedEmbeddedSession: Session | undefined
   try {
-    const proxyStartStartedAt = performance.now()
-    const { runtime, wsUrl } = await startEmbeddedGeometraProxy({
-      pageUrl: options.pageUrl,
-      port: options.port ?? 0,
-      headless: options.headless,
-      width: options.width,
-      height: options.height,
-      slowMo: options.slowMo,
-      stealth: options.stealth,
-      eagerInitialExtract,
-      proxy: options.proxy,
-    })
-    pendingEmbeddedRuntime = runtime
-    const proxyStartMs = performance.now() - proxyStartStartedAt
-    const session = await Promise.race([
-      connect(wsUrl, {
+    try {
+      const proxyStartStartedAt = performance.now()
+      const { runtime, wsUrl } = await startEmbeddedGeometraProxy({
+        pageUrl: options.pageUrl,
+        port: options.port ?? 0,
+        headless: options.headless,
+        width: options.width,
+        height: options.height,
+        slowMo: options.slowMo,
+        stealth: options.stealth,
+        eagerInitialExtract,
+        proxy: options.proxy,
+      })
+      pendingEmbeddedRuntime = runtime
+      const proxyStartMs = performance.now() - proxyStartStartedAt
+      pendingEmbeddedConnect = connectWithOwnership(wsUrl, {
         skipInitialResize: true,
         closePreviousProxy: false,
         awaitInitialFrame: options.awaitInitialFrame,
         authToken: runtime.authToken,
-      }),
-      rejectOnRuntimeReadyFailure(runtime),
-    ])
-    // Connect succeeded — the session now owns the runtime, so the
-    // catch-block cleanup below must not also close it.
-    pendingEmbeddedRuntime = undefined
-    session.proxyRuntime = runtime
-    session.proxyReusable = !options.isolated
-    if (options.isolated) {
-      session.isolated = true
-      // connect() already set defaultSessionId to this session. Retract
-      // that assignment so the isolated session is only addressable by its
-      // explicit id — the implicit-default fallback is the contamination
-      // vector we're fixing, and an isolated session must never be the
-      // implicit target of a tool call that omits sessionId.
-      retractDefaultIfPointsTo(session.id)
-    } else {
-      setReusableProxy({ runtime }, wsUrl, {
-        headless: options.headless,
-        slowMo: options.slowMo,
-        stealth: options.stealth,
-        width: options.width,
-        height: options.height,
-        pageUrl: options.pageUrl,
-        snapshotReady: Boolean(session.tree && session.layout),
-        proxy: options.proxy,
+        isolated: options.isolated === true,
+        ownershipLease,
       })
-    }
-    const baseConnectTrace = session.connectTrace
-    session.connectTrace = {
-      mode: 'fresh-proxy',
-      reused: false,
-      awaitInitialFrame: options.awaitInitialFrame !== false,
-      proxyStartMode: 'embedded',
-      proxyStartMs,
-      connectMs: baseConnectTrace?.totalMs,
-      wsOpenMs: baseConnectTrace?.wsOpenMs,
-      firstFrameMs: baseConnectTrace?.firstFrameMs,
-      resolvedWithoutInitialFrame: baseConnectTrace?.resolvedWithoutInitialFrame,
-      totalMs: performance.now() - startedAt,
-    }
-    safeRecordSessionSnapshot(session, 'session.proxy_attached', {
-      transportMode: 'fresh-proxy',
-      proxyStartMode: 'embedded',
-      requestedPageUrl: options.pageUrl,
-      isolated: options.isolated === true,
-    })
-    return session
-  } catch (e) {
-    // If startEmbeddedGeometraProxy() returned but the subsequent connect()
-    // threw (e.g. WebSocket failure, first-frame timeout), the runtime
-    // still owns a launched Chromium that nobody is going to clean up.
-    // Without this, that Chromium leaks for the lifetime of the MCP server
-    // every time we fall through to the child-process fallback path.
-    if (pendingEmbeddedRuntime) {
-      const leaked = pendingEmbeddedRuntime
-      void leaked.close().catch(() => {})
-    }
-    const proxyStartStartedAt = performance.now()
-    const { child, wsUrl, authToken } = await spawnGeometraProxy({
-      pageUrl: options.pageUrl,
-      port: options.port ?? 0,
-      headless: options.headless,
-      width: options.width,
-      height: options.height,
-      slowMo: options.slowMo,
-      stealth: options.stealth,
-      eagerInitialExtract,
-      proxy: options.proxy,
-    })
-    const proxyStartMs = performance.now() - proxyStartStartedAt
-    try {
-      const session = await connect(wsUrl, {
-        skipInitialResize: true,
-        closePreviousProxy: false,
-        awaitInitialFrame: options.awaitInitialFrame,
-        authToken,
-      })
-      session.proxyChild = child
+      const session = await Promise.race([
+        pendingEmbeddedConnect,
+        rejectOnRuntimeReadyFailure(runtime),
+      ])
+      pendingEmbeddedConnect = undefined
+      attachedEmbeddedSession = session
+      session.proxyRuntime = runtime
       session.proxyReusable = !options.isolated
-      if (options.isolated) {
-        session.isolated = true
-        // See the embedded-runtime path above — an isolated session must
-        // not be the implicit default. Retract the pointer set by connect().
-        retractDefaultIfPointsTo(session.id)
-      } else {
-        setReusableProxy({ child, authToken }, wsUrl, {
+      if (!options.isolated) {
+        setReusableProxy({ runtime }, wsUrl, {
           headless: options.headless,
           slowMo: options.slowMo,
           stealth: options.stealth,
@@ -1641,7 +1983,7 @@ async function startFreshProxySession(options: {
         mode: 'fresh-proxy',
         reused: false,
         awaitInitialFrame: options.awaitInitialFrame !== false,
-        proxyStartMode: 'child',
+        proxyStartMode: 'embedded',
         proxyStartMs,
         connectMs: baseConnectTrace?.totalMs,
         wsOpenMs: baseConnectTrace?.wsOpenMs,
@@ -1651,19 +1993,113 @@ async function startFreshProxySession(options: {
       }
       safeRecordSessionSnapshot(session, 'session.proxy_attached', {
         transportMode: 'fresh-proxy',
-        proxyStartMode: 'child',
+        proxyStartMode: 'embedded',
         requestedPageUrl: options.pageUrl,
         isolated: options.isolated === true,
       })
       return session
-    } catch (fallbackError) {
-      try {
-        child.kill('SIGTERM')
-      } catch {
-        /* ignore */
+    } catch (embeddedFailure) {
+      // `runtime.ready` can reject before the parallel WebSocket connect
+      // settles. Close the runtime and await that losing connect before this
+      // lease is eligible for child fallback; one reservation can never back
+      // two simultaneous attempts.
+      if (attachedEmbeddedSession) {
+        shutdownSession(attachedEmbeddedSession.id, { closeProxy: true, reason: 'embedded_proxy_start_failed' })
       }
-      throw fallbackError instanceof Error ? fallbackError : e
+      if (pendingEmbeddedRuntime) {
+        await closeEmbeddedProxyRuntime(pendingEmbeddedRuntime)
+      }
+      if (pendingEmbeddedConnect) {
+        const orphanedSession = await pendingEmbeddedConnect.catch(() => undefined)
+        pendingEmbeddedConnect = undefined
+        if (orphanedSession) {
+          orphanedSession.proxyRuntime = pendingEmbeddedRuntime
+          orphanedSession.proxyReusable = false
+          shutdownSession(orphanedSession.id, { closeProxy: true, reason: 'embedded_proxy_ready_failed' })
+        }
+      }
+
+      ownershipLease = reserveSessionOwnership(ownershipLease)
+      let pendingChild: ChildProcess | undefined
+      let attachedChildSession: Session | undefined
+      try {
+        const proxyStartStartedAt = performance.now()
+        const { child, wsUrl, authToken } = await spawnGeometraProxy({
+          pageUrl: options.pageUrl,
+          port: options.port ?? 0,
+          headless: options.headless,
+          width: options.width,
+          height: options.height,
+          slowMo: options.slowMo,
+          stealth: options.stealth,
+          eagerInitialExtract,
+          proxy: options.proxy,
+        })
+        pendingChild = child
+        const proxyStartMs = performance.now() - proxyStartStartedAt
+        const session = await connectWithOwnership(wsUrl, {
+          skipInitialResize: true,
+          closePreviousProxy: false,
+          awaitInitialFrame: options.awaitInitialFrame,
+          authToken,
+          isolated: options.isolated === true,
+          ownershipLease,
+        })
+        attachedChildSession = session
+        session.proxyChild = child
+        session.proxyReusable = !options.isolated
+        if (!options.isolated) {
+          setReusableProxy({ child, authToken }, wsUrl, {
+            headless: options.headless,
+            slowMo: options.slowMo,
+            stealth: options.stealth,
+            width: options.width,
+            height: options.height,
+            pageUrl: options.pageUrl,
+            snapshotReady: Boolean(session.tree && session.layout),
+            proxy: options.proxy,
+          })
+        }
+        const baseConnectTrace = session.connectTrace
+        session.connectTrace = {
+          mode: 'fresh-proxy',
+          reused: false,
+          awaitInitialFrame: options.awaitInitialFrame !== false,
+          proxyStartMode: 'child',
+          proxyStartMs,
+          connectMs: baseConnectTrace?.totalMs,
+          wsOpenMs: baseConnectTrace?.wsOpenMs,
+          firstFrameMs: baseConnectTrace?.firstFrameMs,
+          resolvedWithoutInitialFrame: baseConnectTrace?.resolvedWithoutInitialFrame,
+          totalMs: performance.now() - startedAt,
+        }
+        safeRecordSessionSnapshot(session, 'session.proxy_attached', {
+          transportMode: 'fresh-proxy',
+          proxyStartMode: 'child',
+          requestedPageUrl: options.pageUrl,
+          isolated: options.isolated === true,
+        })
+        return session
+      } catch (fallbackError) {
+        if (attachedChildSession) {
+          shutdownSession(attachedChildSession.id, { closeProxy: true, reason: 'child_proxy_start_failed' })
+        } else if (pendingChild) {
+          try {
+            pendingChild.kill('SIGTERM')
+          } catch {
+            /* ignore */
+          }
+        }
+        if (fallbackError instanceof SessionCapacityError) throw fallbackError
+        throw new Error(
+          `Failed to start embedded browser session: ${formatUnknownError(embeddedFailure)}\n` +
+          `Child-process proxy fallback also failed: ${formatUnknownError(fallbackError)}`,
+          { cause: fallbackError },
+        )
+      }
     }
+  } finally {
+    releaseSessionOwnership(ownershipLease)
   }
 }
 
@@ -1680,16 +2116,46 @@ export function connect(
     closePreviousProxy?: boolean
     awaitInitialFrame?: boolean
     authToken?: string
+    isolated?: boolean
+  },
+): Promise<Session> {
+  return connectWithOwnership(url, opts)
+}
+
+function connectWithOwnership(
+  url: string,
+  opts?: {
+    width?: number
+    height?: number
+    skipInitialResize?: boolean
+    closePreviousProxy?: boolean
+    awaitInitialFrame?: boolean
+    authToken?: string
+    isolated?: boolean
+    ownershipLease?: SessionOwnershipLease
   },
 ): Promise<Session> {
   return new Promise((resolve, reject) => {
     const startedAt = performance.now()
     clearReusableProxiesIfExited()
-    evictOldestSession()
+    let ownershipLease: SessionOwnershipLease
+    try {
+      ownershipLease = beginSessionOwnershipAttempt(opts?.ownershipLease)
+    } catch (err) {
+      reject(err instanceof Error ? err : new Error(String(err)))
+      return
+    }
 
-    const ws = new WebSocket(url, opts?.authToken
-      ? { headers: { Authorization: `Bearer ${opts.authToken}` } }
-      : undefined)
+    let ws: WebSocket
+    try {
+      ws = new WebSocket(url, opts?.authToken
+        ? { headers: { Authorization: `Bearer ${opts.authToken}` } }
+        : undefined)
+    } catch (err) {
+      releaseSessionOwnership(ownershipLease)
+      reject(err instanceof Error ? err : new Error(String(err)))
+      return
+    }
     const session: Session = {
       id: generateSessionId(),
       ws,
@@ -1697,6 +2163,7 @@ export function connect(
       tree: null,
       url,
       ...(opts?.authToken ? { transportAuthToken: opts.authToken } : {}),
+      isolated: opts?.isolated === true,
       updateRevision: 0,
       connectTrace: {
         mode: 'direct-ws',
@@ -1707,6 +2174,8 @@ export function connect(
       cachedA11y: null,
       cachedA11yRevision: -1,
       cachedFormSchemas: new Map(),
+      hasFreshFrame: false,
+      disposed: false,
       heartbeatInterval: null,
       heartbeatLastMessageAt: Date.now(),
       heartbeatPendingPongBy: null,
@@ -1719,6 +2188,7 @@ export function connect(
       } catch {
         /* ignore */
       }
+      releaseSessionOwnership(ownershipLease)
       reject(new Error(`Failed to initialize durable session state for ${url}: ${formatUnknownError(err)}`))
       return
     }
@@ -1740,6 +2210,7 @@ export function connect(
         } catch {
           /* ignore */
         }
+        releaseSessionOwnership(ownershipLease)
         reject(new Error(`Connection to ${url} timed out after 10s`))
       }
     }, 10_000)
@@ -1755,7 +2226,16 @@ export function connect(
         // Start with the shared GEOM v1 envelope. The first frame explicitly
         // advertises whether this is a native server or a proxy-action peer.
         // Legacy proxy v1/v2 endpoints both accept this compatibility hello.
-        ws.send(JSON.stringify({ type: 'resize', width, height, protocolVersion: GEOMETRY_PROTOCOL_VERSION }))
+        try {
+          ws.send(JSON.stringify({ type: 'resize', width, height, protocolVersion: GEOMETRY_PROTOCOL_VERSION }))
+        } catch (err) {
+          if (resolved) return
+          resolved = true
+          clearTimeout(timeout)
+          releaseSessionOwnership(ownershipLease)
+          try { ws.close() } catch { /* ignore */ }
+          reject(new Error(`Failed to initialize connection to ${url}: ${formatUnknownError(err)}`))
+        }
       }
     })
 
@@ -1768,14 +2248,14 @@ export function connect(
           assertAuthenticatedProxyHandshake(session)
         }
         if (msg.type === 'hello' && opts?.awaitInitialFrame === false && !resolved) {
-          resolved = true
           clearTimeout(timeout)
           if (session.connectTrace) {
             session.connectTrace.resolvedWithoutInitialFrame = true
             session.connectTrace.totalMs = performance.now() - startedAt
           }
-          activeSessions.set(session.id, session)
-          defaultSessionId = session.id
+          claimSessionOwnership(ownershipLease, session)
+          resolved = true
+          if (!session.isolated) defaultSessionId = session.id
           startSessionHeartbeat(session)
           safeRecordSessionSnapshot(session, 'session.open', {
             awaitInitialFrame: false,
@@ -1790,13 +2270,13 @@ export function connect(
             connectTrace.firstFrameMs = performance.now() - startedAt
           }
           if (!resolved) {
-            resolved = true
             clearTimeout(timeout)
             if (session.connectTrace) {
               session.connectTrace.totalMs = performance.now() - startedAt
             }
-            activeSessions.set(session.id, session)
-            defaultSessionId = session.id
+            claimSessionOwnership(ownershipLease, session)
+            resolved = true
+            if (!session.isolated) defaultSessionId = session.id
             startSessionHeartbeat(session)
             safeRecordSessionSnapshot(session, 'session.connected')
             resolve(session)
@@ -1809,23 +2289,28 @@ export function connect(
           resolved = true
           clearTimeout(timeout)
           try { ws.close() } catch { /* ignore */ }
+          releaseSessionOwnership(ownershipLease)
           reject(new Error(typeof msg.message === 'string' ? msg.message : 'Geometra server error'))
         }
       } catch (err) {
+        rememberReusableProxyPageUrl(session)
         try { ws.close(1002, 'Invalid protocol message') } catch { /* ignore */ }
         if (!resolved) {
           resolved = true
           clearTimeout(timeout)
+          releaseSessionOwnership(ownershipLease)
           reject(err instanceof Error ? err : new Error(String(err)))
         } else {
-          session.layout = null
-          session.tree = null
-          invalidateSessionCaches(session)
+          invalidateSessionUiState(session)
         }
       }
     })
 
     ws.on('error', (err) => {
+      if (session.ws === ws) {
+        rememberReusableProxyPageUrl(session)
+        invalidateSessionUiState(session)
+      }
       if (!resolved) {
         safeFailSessionLifecycle(session, 'websocket_error', {
           transportUrl: url,
@@ -1833,18 +2318,22 @@ export function connect(
         })
         resolved = true
         clearTimeout(timeout)
+        releaseSessionOwnership(ownershipLease)
         reject(new Error(`WebSocket error connecting to ${url}: ${err.message}`))
       }
     })
 
     ws.on('close', () => {
       if (session.ws !== ws) return
+      rememberReusableProxyPageUrl(session)
+      invalidateSessionUiState(session)
       if (!resolved) {
         safeFailSessionLifecycle(session, 'websocket_closed_before_ready', {
           transportUrl: url,
         })
         resolved = true
         clearTimeout(timeout)
+        releaseSessionOwnership(ownershipLease)
         reject(new Error(`Connection to ${url} closed before first frame`))
         return
       }
@@ -1872,12 +2361,10 @@ export async function connectThroughProxy(options: {
   awaitInitialFrame?: boolean
   eagerInitialExtract?: boolean
   /**
-   * When true, bypass the reusable proxy pool entirely and always spawn a
-   * fresh Chromium for this session. The session is tagged isolated, never
-   * entered into the pool on disconnect, and its underlying browser is
-   * destroyed when the session disconnects. Use for parallel form
-   * submission so localStorage / cookies / page state from one job cannot
-   * leak into another. Default false preserves the existing pool behavior.
+   * Browser sessions are isolated by default. Pass `false` explicitly to
+   * opt into sequential warm-browser reuse, including shared cookies and
+   * localStorage. Isolated sessions never enter the reusable pool and their
+   * browser is destroyed on disconnect.
    */
   isolated?: boolean
   /**
@@ -1888,23 +2375,25 @@ export async function connectThroughProxy(options: {
   proxy?: SpawnProxyConfig
 }): Promise<Session> {
   clearReusableProxiesIfExited()
+  const isolated = options.isolated !== false
+  const normalizedOptions = { ...options, isolated }
 
   // Isolated sessions skip the pool entirely. They always get their own
   // brand-new Chromium and never reuse a proxy from a prior call. The
   // tag flows down so startFreshProxySession knows to keep this proxy out
   // of the pool on success and so shutdownSession knows to force-close it.
-  if (options.isolated) {
-    return await startFreshProxySession({ ...options, isolated: true })
+  if (isolated) {
+    const ownershipLease = reserveSessionOwnership()
+    return await startFreshProxySession(normalizedOptions, ownershipLease)
   }
 
   let reuseFailure: unknown
 
   // Loop because if a candidate is currently being attached by another
-  // concurrent connectThroughProxy call we wait for it, then re-pick. The
-  // second pick may now find the same entry already bound to an active
-  // session — attachToReusableProxy's reusedExistingSession branch then
-  // returns that session instead of opening a second WebSocket. Bounded
-  // by the pool size to defend against pathological churn.
+  // concurrent connectThroughProxy call we wait for it, then re-pick. Active
+  // entries are never eligible: the second caller either claims another idle
+  // warm browser or starts a fresh one. Bounded by the pool size to defend
+  // against pathological churn.
   for (let attempt = 0; attempt < REUSABLE_PROXY_POOL_LIMIT + 1; attempt++) {
     const reusableProxy = findReusableProxy(options)
     if (!reusableProxy) break
@@ -1915,9 +2404,12 @@ export async function connectThroughProxy(options: {
     let releaseLock: () => void = () => {}
     reusableProxy.attachLock = new Promise<void>(resolve => { releaseLock = resolve })
     try {
+      if (reusableProxyEntryIsActive(reusableProxy)) continue
       return await attachToReusableProxy(reusableProxy, options)
     } catch (err) {
+      if (err instanceof SessionCapacityError) throw err
       reuseFailure = err
+      if (reusableProxyEntryIsActive(reusableProxy)) continue
       closeReusableProxy(reusableProxy)
       break
     } finally {
@@ -1927,8 +2419,10 @@ export async function connectThroughProxy(options: {
   }
 
   try {
-    return await startFreshProxySession(options)
+    const ownershipLease = reserveSessionOwnership()
+    return await startFreshProxySession(normalizedOptions, ownershipLease)
   } catch (e) {
+    if (e instanceof SessionCapacityError) throw e
     if (reuseFailure) {
       throw new Error(
         `Failed to recover reusable browser session after it became stale: ${formatUnknownError(reuseFailure)}\nFresh proxy start also failed: ${formatUnknownError(e)}`,
@@ -1948,12 +2442,20 @@ export function getSession(id?: string): Session | null {
 export function pruneDisconnectedSessions(): string[] {
   const removedIds: string[] = []
   for (const [id, session] of activeSessions.entries()) {
-    if (session.ws.readyState === WebSocket.OPEN || session.reconnectInFlight || reconnectUrlForSession(session)) continue
+    if (session.ws.readyState === WebSocket.OPEN) continue
+    rememberReusableProxyPageUrl(session)
+    invalidateSessionUiState(session)
+    if (session.reconnectInFlight || reconnectUrlForSession(session)) continue
     removedIds.push(id)
+    session.disposed = true
+    session.ambiguousOperations?.clear()
+    session.inFlightMutations?.clear()
     activeSessions.delete(id)
     if (defaultSessionId === id) {
       promoteDefaultSession()
     }
+    stopSessionHeartbeat(session)
+    releaseSessionResources(session, { closeProxy: true })
   }
   return removedIds
 }
@@ -2021,11 +2523,29 @@ export function getDefaultSessionId(): string | null {
 
 export function disconnect(opts?: { closeProxy?: boolean; sessionId?: string }): void {
   if (opts?.sessionId) {
-    shutdownSession(opts.sessionId, { closeProxy: opts?.closeProxy ?? false, reason: 'disconnect' })
-  } else if (defaultSessionId) {
-    shutdownSession(defaultSessionId, { closeProxy: opts?.closeProxy ?? false, reason: 'disconnect' })
+    if (!activeSessions.has(opts.sessionId)) return
+    shutdownSession(opts.sessionId, { closeProxy: opts.closeProxy ?? false, reason: 'disconnect' })
+    return
   }
-  if (opts?.closeProxy) closeReusableProxies()
+
+  const resolved = resolveSession()
+  if (resolved.kind === 'none') return
+  if (resolved.kind === 'ambiguous') {
+    throw new Error(
+      `Cannot disconnect without an explicit sessionId while session routing is ambiguous. ` +
+      `Active sessions: ${resolved.activeIds.join(', ')}.`,
+    )
+  }
+  if (resolved.kind === 'not_found') return
+  shutdownSession(resolved.session.id, { closeProxy: opts?.closeProxy ?? false, reason: 'disconnect' })
+}
+
+/** Process/test teardown only. User-facing disconnects are always owner-scoped. */
+export function shutdownAllSessionsAndProxies(): void {
+  for (const id of [...activeSessions.keys()]) {
+    shutdownSession(id, { closeProxy: true, reason: 'process_shutdown' })
+  }
+  closeReusableProxies()
 }
 
 function estimateFillBatchTimeout(fields: ProxyFillField[]): number {
@@ -2067,7 +2587,13 @@ export function waitForUiCondition(
   timeoutMs: number,
 ): Promise<boolean> {
   return new Promise((resolve) => {
+    const transport = session.ws
     const check = () => {
+      if (session.ws !== transport) {
+        cleanup()
+        resolve(false)
+        return
+      }
       let matched: boolean
       try {
         matched = predicate()
@@ -2096,12 +2622,12 @@ export function waitForUiCondition(
 
     function cleanup() {
       clearTimeout(timeout)
-      session.ws.off('message', onMessage)
-      session.ws.off('close', onClose)
+      transport.off('message', onMessage)
+      transport.off('close', onClose)
     }
 
-    session.ws.on('message', onMessage)
-    session.ws.on('close', onClose)
+    transport.on('message', onMessage)
+    transport.on('close', onClose)
     check()
   })
 }
@@ -2124,6 +2650,7 @@ async function openWebSocket(
   url: string,
   session: Session,
   timeoutMs = SESSION_RECONNECT_TIMEOUT_MS,
+  viewport?: { width: number; height: number },
 ): Promise<{ ws: WebSocket; handshakeMessage: WebSocket.Data }> {
   return await new Promise((resolve, reject) => {
     const ws = new WebSocket(url, session.transportAuthToken
@@ -2148,8 +2675,8 @@ async function openWebSocket(
     }, timeoutMs)
 
     const onOpen = () => {
-      const width = typeof session.layout?.width === 'number' ? session.layout.width : 1024
-      const height = typeof session.layout?.height === 'number' ? session.layout.height : 768
+      const width = viewport?.width ?? 1024
+      const height = viewport?.height ?? 768
       // Current proxies attest immediately with `hello`. This compatibility
       // resize prompts native/legacy peers that only emit a frame after input.
       ws.send(JSON.stringify({
@@ -2207,6 +2734,8 @@ function bindReconnectedSocket(session: Session, ws: WebSocket): void {
     try {
       applyInboundSessionMessage(session, data)
     } catch {
+      rememberReusableProxyPageUrl(session)
+      invalidateSessionUiState(session)
       try { ws.close(1002, 'Invalid protocol message') } catch { /* ignore */ }
     }
   })
@@ -2215,8 +2744,16 @@ function bindReconnectedSocket(session: Session, ws: WebSocket): void {
     noteSessionSocketActivity(session, ws)
   })
 
+  ws.on('error', () => {
+    if (session.ws !== ws) return
+    rememberReusableProxyPageUrl(session)
+    invalidateSessionUiState(session)
+  })
+
   ws.on('close', () => {
     if (session.ws !== ws) return
+    rememberReusableProxyPageUrl(session)
+    invalidateSessionUiState(session)
     if (activeSessions.get(session.id) === session && !session.lifecycleFinalized) {
       safeRecordSessionSnapshot(session, 'session.transport_closed', {
         reconnectable: reconnectUrlForSession(session) !== null,
@@ -2225,12 +2762,22 @@ function bindReconnectedSocket(session: Session, ws: WebSocket): void {
   })
 }
 
-async function ensureSessionConnected(session: Session): Promise<void> {
+function sessionIsDisposedOrUnowned(session: Session): boolean {
+  return session.disposed === true || activeSessions.get(session.id) !== session
+}
+
+export async function ensureSessionConnected(session: Session): Promise<void> {
+  if (sessionIsDisposedOrUnowned(session)) {
+    throw new Error(`Session ${session.id} is disconnected or no longer owns its transport`)
+  }
   if (session.ws.readyState === WebSocket.OPEN) return
   if (session.reconnectInFlight) {
     const recovered = await session.reconnectInFlight
     if (!recovered) {
       throw new Error('Not connected')
+    }
+    if (sessionIsDisposedOrUnowned(session)) {
+      throw new Error(`Session ${session.id} was disconnected while reconnecting`)
     }
     return
   }
@@ -2238,9 +2785,24 @@ async function ensureSessionConnected(session: Session): Promise<void> {
   if (!targetUrl) {
     throw new Error('Not connected')
   }
+  const reconnectViewport = {
+    width: typeof session.layout?.width === 'number' ? session.layout.width : 1024,
+    height: typeof session.layout?.height === 'number' ? session.layout.height : 768,
+  }
+  rememberReusableProxyPageUrl(session)
+  invalidateSessionUiState(session)
   const reconnectPromise = (async () => {
     try {
-      const { ws: nextWs, handshakeMessage } = await openWebSocket(targetUrl, session)
+      const { ws: nextWs, handshakeMessage } = await openWebSocket(
+        targetUrl,
+        session,
+        SESSION_RECONNECT_TIMEOUT_MS,
+        reconnectViewport,
+      )
+      if (sessionIsDisposedOrUnowned(session)) {
+        try { nextWs.close() } catch { /* ignore */ }
+        throw new Error(`Session ${session.id} was disconnected while reconnecting`)
+      }
       try {
         session.ws.close()
       } catch {
@@ -2268,8 +2830,12 @@ async function ensureSessionConnected(session: Session): Promise<void> {
         activeSessions.delete(session.id)
         if (defaultSessionId === session.id) promoteDefaultSession()
       }
+      session.disposed = true
+      session.ambiguousOperations?.clear()
+      session.inFlightMutations?.clear()
       stopSessionHeartbeat(session)
       releaseSessionResources(session, { closeProxy: true })
+      invalidateSessionUiState(session)
       throw err
     }
   })()
@@ -2283,6 +2849,9 @@ async function ensureSessionConnected(session: Session): Promise<void> {
   if (!recovered) {
     throw new Error('Not connected')
   }
+  if (sessionIsDisposedOrUnowned(session)) {
+    throw new Error(`Session ${session.id} was disconnected while reconnecting`)
+  }
 }
 
 async function sendResizeAndWaitForUpdate(
@@ -2291,15 +2860,11 @@ async function sendResizeAndWaitForUpdate(
   height: number,
   timeoutMs = 5_000,
 ): Promise<UpdateWaitResult> {
-  await ensureSessionConnected(session)
-  const startRevision = session.updateRevision
-  session.ws.send(JSON.stringify({
+  return await sendAndWaitForUpdate(session, {
     type: 'resize',
     width,
     height,
-    ...outboundProtocolMetadata(session),
-  }))
-  return await waitForNextUpdate(session, timeoutMs, undefined, startRevision)
+  }, timeoutMs)
 }
 
 /**
@@ -2320,8 +2885,28 @@ export function sendClick(session: Session, x: number, y: number, timeoutMs?: nu
 export function sendType(session: Session, text: string, timeoutMs?: number): Promise<UpdateWaitResult> {
   return (async () => {
     await ensureSessionConnected(session)
+    const waitTimeoutMs = timeoutMs ?? ACTION_UPDATE_TIMEOUT_MS
+    if (session.peerTransport === 'proxy' && session.peerProtocolCapabilities?.atomicTypeText === true) {
+      if (text.length > 65_536) {
+        throw new Error('geometra_type text exceeds the proxy atomic typing limit of 65,536 characters')
+      }
+      return await sendAndWaitForUpdate(session, { type: 'typeText', text }, waitTimeoutMs)
+    }
+    const fingerprint = actionFingerprint({ type: 'typeSequence', text })
+    const existing = ambiguousOperationFor(session, fingerprint)
+    if (existing) {
+      return await sendPreparedActionOperation(session, existing, waitTimeoutMs, undefined, true)
+    }
+    assertCanStartMutatingOperation(session, fingerprint)
 
-    // Send each character as keydown + keyup
+    const actionId = randomUUID()
+    const actionTimeoutMs = actionTimeoutFor(session, { type: 'key' }, waitTimeoutMs)
+    const keyEvents: Array<Record<string, unknown> & { requestId: string }> = []
+
+    // Give every key phase its own identity. Waiting on the final key-up is
+    // sufficient because the proxy processes its action queue in wire order;
+    // a scoped acknowledgement for that phase therefore confirms that every
+    // earlier phase in this type sequence has also finished.
     for (const char of text) {
       const keyEvent = {
         type: 'key',
@@ -2334,12 +2919,43 @@ export function sendType(session: Session, text: string, timeoutMs?: number): Pr
         metaKey: false,
         altKey: false,
       }
-      session.ws.send(JSON.stringify(keyEvent))
-      session.ws.send(JSON.stringify({ ...keyEvent, eventType: 'onKeyUp' }))
+      keyEvents.push({
+        ...keyEvent,
+        ...(actionTimeoutMs !== undefined ? { actionTimeoutMs } : {}),
+        requestId: randomUUID(),
+      })
+      keyEvents.push({
+        ...keyEvent,
+        eventType: 'onKeyUp',
+        ...(actionTimeoutMs !== undefined ? { actionTimeoutMs } : {}),
+        requestId: randomUUID(),
+      })
     }
 
-    // Wait briefly for server to process and send update
-    return await waitForNextUpdate(session, timeoutMs)
+    if (keyEvents.length === 0) {
+      return {
+        status: 'acknowledged',
+        timeoutMs: waitTimeoutMs,
+        requestId: randomUUID(),
+        actionId,
+      }
+    }
+
+    const finalRequestId = keyEvents[keyEvents.length - 1]!.requestId
+    const operation: AmbiguousOperation = {
+      fingerprint,
+      actionId,
+      requestId: finalRequestId,
+      requestIds: keyEvents.map(keyEvent => keyEvent.requestId),
+      wireMessages: keyEvents.map(keyEvent => JSON.stringify(keyEvent)),
+      ...(actionTimeoutMs !== undefined ? { actionTimeoutMs } : {}),
+      timeoutMs: waitTimeoutMs,
+      idempotent: session.peerTransport === 'proxy' &&
+        session.peerProtocolCapabilities?.idempotentRequestIds === true,
+      mutating: true,
+    }
+    trackInFlightMutation(session, operation)
+    return await sendPreparedActionOperation(session, operation, waitTimeoutMs)
   })()
 }
 
@@ -4848,8 +5464,13 @@ async function sendAndWaitForUpdate(
   opts?: { requireUpdateOnAck?: boolean; requiredProtocolVersion?: number },
 ): Promise<UpdateWaitResult> {
   await ensureSessionConnected(session)
-  const requestId = `req-${++nextRequestSequence}`
-  const startRevision = session.updateRevision
+  const fingerprint = actionFingerprint(message)
+  const existing = ambiguousOperationFor(session, fingerprint)
+  if (existing) {
+    return await sendPreparedActionOperation(session, existing, timeoutMs, opts, true)
+  }
+  if (isMutatingProxyAction(message)) assertCanStartMutatingOperation(session, fingerprint)
+
   const requiresExactFieldIdentity = typeof message.fieldKey === 'string' || (
     message.type === 'fillFields' &&
     Array.isArray(message.fields) &&
@@ -4863,42 +5484,196 @@ async function sendAndWaitForUpdate(
       `Proxy protocol ${session.peerProxyActionProtocolVersion} cannot guarantee exact field identity; protocol ${PROXY_ACTION_PROTOCOL_VERSION}+ is required. Update and reconnect the Geometra proxy.`,
     )
   }
-  session.ws.send(JSON.stringify({
+
+  const actionId = randomUUID()
+  const requestId = randomUUID()
+  const actionTimeoutMs = actionTimeoutFor(session, message, timeoutMs)
+  const wireMessage = {
     ...message,
+    ...(actionTimeoutMs !== undefined ? { actionTimeoutMs } : {}),
     requestId,
     ...outboundProtocolMetadata(session),
-  }))
-  return await waitForNextUpdate(session, timeoutMs, requestId, startRevision, {
+  }
+  const operation: AmbiguousOperation = {
+    fingerprint,
+    actionId,
+    requestId,
+    requestIds: [requestId],
+    wireMessages: [JSON.stringify(wireMessage)],
+    ...(actionTimeoutMs !== undefined ? { actionTimeoutMs } : {}),
+    timeoutMs,
+    idempotent: session.peerTransport === 'proxy' &&
+      session.peerProtocolCapabilities?.idempotentRequestIds === true,
+    mutating: isMutatingProxyAction(message),
+    ...(opts?.requireUpdateOnAck ? { requireUpdateOnAck: true } : {}),
+    ...(requiresExactFieldIdentity ? { requiredProtocolVersion: PROXY_ACTION_PROTOCOL_VERSION } :
+      opts?.requiredProtocolVersion !== undefined ? { requiredProtocolVersion: opts.requiredProtocolVersion } : {}),
+  }
+  trackInFlightMutation(session, operation)
+  return await sendPreparedActionOperation(session, operation, timeoutMs, {
     ...opts,
     ...(requiresExactFieldIdentity ? { requiredProtocolVersion: PROXY_ACTION_PROTOCOL_VERSION } : {}),
   })
 }
 
+async function sendPreparedActionOperation(
+  session: Session,
+  operation: AmbiguousOperation,
+  timeoutMs: number,
+  opts?: { requireUpdateOnAck?: boolean; requiredProtocolVersion?: number },
+  retry = false,
+): Promise<UpdateWaitResult> {
+  if (operation.stickyError) throw operation.stickyError
+  if (operation.completion) {
+    if (operation.completion.kind === 'error') {
+      // Completion errors are restricted to proven non-execution. Deliver
+      // that correlated evidence once, then allow a genuinely fresh intent.
+      forgetAmbiguousOperation(session, operation)
+      throw operation.completion.error
+    }
+    if (!operation.permanentTombstone) forgetAmbiguousOperation(session, operation)
+    return operation.completion.value
+  }
+
+  if (operation.permanentTombstone) {
+    // At least one indistinguishable caller already observed an unconfirmed
+    // outcome. Never replay this fingerprint within the same session.
+    return {
+      status: 'timed_out',
+      timeoutMs: operation.timeoutMs,
+      requestId: operation.requestId,
+      actionId: operation.actionId,
+    }
+  }
+
+  if (retry && (
+    !operation.idempotent ||
+    session.peerTransport !== 'proxy' ||
+    session.peerProtocolCapabilities?.idempotentRequestIds !== true
+  )) {
+    // An older/native peer cannot guarantee that replaying an identical wire
+    // message is safe. The second indistinguishable caller therefore makes
+    // this identity a permanent session tombstone even before the first
+    // caller settles.
+    operation.permanentTombstone = true
+    rememberAmbiguousOperation(session, operation)
+    return {
+      status: 'timed_out',
+      timeoutMs: operation.timeoutMs,
+      requestId: operation.requestId,
+      actionId: operation.actionId,
+    }
+  }
+
+  const startRevision = session.updateRevision
+  try {
+    const result = await waitForNextUpdate(
+      session,
+      timeoutMs,
+      operation,
+      startRevision,
+      {
+        ...(operation.requireUpdateOnAck ? { requireUpdateOnAck: true } : {}),
+        ...(operation.requiredProtocolVersion !== undefined
+          ? { requiredProtocolVersion: operation.requiredProtocolVersion }
+          : {}),
+      },
+      operation.idempotent,
+      (transport) => {
+        for (const wireMessage of operation.wireMessages) transport.send(wireMessage)
+      },
+    )
+    if (result.status === 'timed_out') {
+      operation.permanentTombstone = true
+      rememberAmbiguousOperation(session, operation)
+      return result
+    }
+    retainTerminalResult(session, operation, result)
+    if (!operation.permanentTombstone) forgetAmbiguousOperation(session, operation)
+    return result
+  } catch (err) {
+    const safelyDidNotExecute = err instanceof GeometraWireError &&
+      err.code !== undefined &&
+      SAFE_NON_EXECUTION_WIRE_CODES.has(err.code) &&
+      operation.requestIds.length === 1
+    if (safelyDidNotExecute) {
+      const terminalError = err instanceof Error ? err : new Error(String(err))
+      retainTerminalError(operation, terminalError)
+      // This caller received correlated proof that the mutation never began.
+      // That delivery consumes the tombstone, even if another waiter had
+      // previously timed out.
+      forgetAmbiguousOperation(session, operation)
+      throw terminalError
+    }
+    if (operation.mutating) {
+      // A transport/handler/extraction error can arrive after a browser-side
+      // mutation. Preserve the exact identity so a later call cannot create
+      // a fresh mutation merely because the first response was an error.
+      rememberAmbiguousOperation(session, operation)
+      const ambiguousError = stickyAmbiguousError(operation, err)
+      operation.wireMessages = []
+      operation.stickyError = ambiguousError
+      throw ambiguousError
+    } else {
+      forgetAmbiguousOperation(session, operation)
+    }
+    throw err
+  }
+}
+
 function waitForNextUpdate(
   session: Session,
   timeoutMs = ACTION_UPDATE_TIMEOUT_MS,
-  requestId?: string,
+  operation: AmbiguousOperation,
   startRevision = session.updateRevision,
   opts?: { requireUpdateOnAck?: boolean; requiredProtocolVersion?: number },
+  ignoreDuplicateRequestError = false,
+  sendAfterSubscribe?: (transport: WebSocket) => void,
 ): Promise<UpdateWaitResult> {
   return new Promise((resolve, reject) => {
+    const transport = session.ws
+    const { requestId, actionId } = operation
+    const operationRequestIds = new Set(operation.requestIds)
     let ackSeen = false
     let ackResult: unknown
 
-    const ackPayload = (): Omit<UpdateWaitResult, 'status' | 'timeoutMs'> => (
-      ackSeen && ackResult !== undefined ? { result: ackResult } : {}
-    )
+    const ackPayload = (): Pick<UpdateWaitResult, 'requestId' | 'actionId'> & { result?: unknown } => ({
+      requestId,
+      actionId,
+      ...(ackSeen && ackResult !== undefined ? { result: ackResult } : {}),
+    })
 
     const onMessage = (data: WebSocket.Data) => {
+      if (session.ws !== transport) return
       try {
         const msg = parseInboundServerMessage(data)
         updatePeerProtocol(session, msg)
         const messageRequestId = typeof msg.requestId === 'string' ? msg.requestId : undefined
 
         if (requestId) {
-          if (msg.type === 'error' && (messageRequestId === requestId || messageRequestId === undefined)) {
+          const requiresScopedAck = session.peerProtocolCapabilities?.requestScopedAcks === true
+          if (
+            ignoreDuplicateRequestError &&
+            msg.type === 'error' &&
+            messageRequestId !== undefined &&
+            operationRequestIds.has(messageRequestId) &&
+            msg.code === 'DUPLICATE_REQUEST'
+          ) {
+            // The proxy has guaranteed that this replay did not mutate. Keep
+            // waiting for the original action's late correlated terminal ACK.
+            return
+          }
+          if (operation.stickyError) {
             cleanup()
-            reject(new Error(typeof msg.message === 'string' ? msg.message : 'Geometra server error'))
+            reject(operation.stickyError)
+            return
+          }
+          if (msg.type === 'error' && (
+            (messageRequestId !== undefined && operationRequestIds.has(messageRequestId)) ||
+            (!requiresScopedAck && messageRequestId === undefined)
+          )) {
+            cleanup()
+            reject(wireErrorFromMessage(msg, actionId))
             return
           }
           if ((msg.type === 'frame' || (msg.type === 'patch' && session.layout)) && ackSeen && session.updateRevision > startRevision) {
@@ -4920,9 +5695,12 @@ function waitForNextUpdate(
               peerProtocolVersion === undefined || peerProtocolVersion < opts.requiredProtocolVersion
             )) {
               cleanup()
-              reject(new Error(
+              const protocolError = stickyAmbiguousError(operation, new Error(
                 `Proxy protocol ${peerProtocolVersion ?? 'unknown'} cannot guarantee exact field identity; protocol ${opts.requiredProtocolVersion}+ is required. Update and reconnect the Geometra proxy.`,
               ))
+              operation.stickyError = protocolError
+              if (operation.mutating) rememberAmbiguousOperation(session, operation)
+              reject(protocolError)
               return
             }
             ackSeen = true
@@ -4941,20 +5719,22 @@ function waitForNextUpdate(
 
         if (msg.type === 'error') {
           cleanup()
-          reject(new Error(typeof msg.message === 'string' ? msg.message : 'Geometra server error'))
+          reject(wireErrorFromMessage(msg, actionId))
           return
         }
         if (msg.type === 'frame') {
           cleanup()
-          resolve({ status: 'updated', timeoutMs })
+          resolve({ status: 'updated', timeoutMs, ...ackPayload() })
         } else if (msg.type === 'patch' && session.layout) {
           cleanup()
-          resolve({ status: 'updated', timeoutMs })
+          resolve({ status: 'updated', timeoutMs, ...ackPayload() })
         } else if (msg.type === 'ack') {
           cleanup()
           resolve({
             status: 'acknowledged',
             timeoutMs,
+            requestId,
+            actionId,
             ...(msg.result !== undefined ? { result: msg.result } : {}),
           })
         }
@@ -4967,22 +5747,72 @@ function waitForNextUpdate(
     // Expose timeout explicitly so action handlers can tell the user the result is ambiguous.
     const timeout = setTimeout(() => {
       cleanup()
-      if (requestId && session.updateRevision > startRevision) {
+      if (session.ws !== transport) {
+        if (operation.mutating) rememberAmbiguousOperation(session, operation)
+        resolve({ status: 'timed_out', timeoutMs, requestId, actionId })
+        return
+      }
+      const requiresScopedAck = session.peerProtocolCapabilities?.requestScopedAcks === true
+      if (requestId && !requiresScopedAck && session.updateRevision > startRevision) {
         resolve({ status: 'updated', timeoutMs, ...ackPayload() })
         return
       }
-      if (requestId && ackSeen) {
+      if (requestId && ackSeen && (!opts?.requireUpdateOnAck || session.updateRevision > startRevision)) {
         resolve({ status: 'acknowledged', timeoutMs, ...ackPayload() })
         return
       }
-      resolve({ status: 'timed_out', timeoutMs })
+      if (operation.mutating) rememberAmbiguousOperation(session, operation)
+      resolve({ status: 'timed_out', timeoutMs, requestId, actionId })
     }, timeoutMs)
+
+    const onClose = () => {
+      cleanup()
+      if (operation.mutating) rememberAmbiguousOperation(session, operation)
+      reject(new GeometraWireError(
+        'Action transport closed before a correlated terminal response arrived',
+        'TRANSPORT_CLOSED',
+        requestId,
+        actionId,
+      ))
+    }
+
+    const onError = (error: Error) => {
+      cleanup()
+      if (operation.mutating) rememberAmbiguousOperation(session, operation)
+      reject(new GeometraWireError(
+        `Action transport failed before a correlated terminal response arrived: ${error.message}`,
+        'TRANSPORT_ERROR',
+        requestId,
+        actionId,
+      ))
+    }
 
     function cleanup() {
       clearTimeout(timeout)
-      session.ws.off('message', onMessage)
+      transport.off('message', onMessage)
+      transport.off('close', onClose)
+      transport.off('error', onError)
     }
 
-    session.ws.on('message', onMessage)
+    transport.on('message', onMessage)
+    transport.on('close', onClose)
+    transport.on('error', onError)
+    if (operation.completion) {
+      cleanup()
+      if (operation.completion.kind === 'error') reject(operation.completion.error)
+      else resolve(operation.completion.value)
+      return
+    }
+    if (sendAfterSubscribe) {
+      try {
+        if (session.ws !== transport || transport.readyState !== WebSocket.OPEN) {
+          throw new Error('Action transport changed before the request could be sent')
+        }
+        sendAfterSubscribe(transport)
+      } catch (err) {
+        cleanup()
+        reject(err instanceof Error ? err : new Error(String(err)))
+      }
+    }
   })
 }

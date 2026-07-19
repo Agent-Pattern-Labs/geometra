@@ -6,6 +6,35 @@ function validationError(payload: unknown): string | null {
 }
 
 describe('proxy client action validation', () => {
+  it('accepts bounded atomic typing and rejects oversize text before mutation', () => {
+    expect(validationError({ type: 'typeText', text: 'cover letter' })).toBeNull()
+    expect(validationError({ type: 'typeText', text: 'x'.repeat(65_537) })).toBe(
+      'Invalid typeText message: text must be a string no longer than 65,536 characters',
+    )
+  })
+
+  it('accepts only non-negative safe-integer action timeouts on mutating messages', () => {
+    expect(validationError({
+      type: 'setChecked',
+      label: 'Consent',
+      actionTimeoutMs: 1_000,
+    })).toBeNull()
+
+    for (const actionTimeoutMs of [-1, Number.NaN, 'tomorrow', 1.5, Number.MAX_SAFE_INTEGER + 1]) {
+      expect(validationError({
+        type: 'setChecked',
+        label: 'Consent',
+        actionTimeoutMs,
+      })).toBe('Invalid setChecked message: actionTimeoutMs must be a non-negative safe integer')
+    }
+  })
+
+  it('does not accept action timeouts on the read-only screenshot message', () => {
+    expect(validationError({ type: 'screenshot', actionTimeoutMs: 1_000 })).toBe(
+      'Invalid client message "screenshot": payload does not match the proxy protocol',
+    )
+  })
+
   it('accepts a fully disambiguated setChecked action', () => {
     expect(validationError({
       type: 'setChecked',

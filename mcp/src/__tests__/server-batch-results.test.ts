@@ -35,6 +35,8 @@ const mockState = vi.hoisted(() => ({
   nodeContexts: new Map<string, Record<string, unknown>>(),
   nodeContextReadHook: undefined as undefined | ((node: { path?: number[] }) => void),
   session: {
+    id: 'session-test',
+    ws: { readyState: 1, OPEN: 1 },
     tree: { kind: 'box' },
     layout: { x: 0, y: 0, width: 1280, height: 800, children: [] },
     url: 'ws://127.0.0.1:3200',
@@ -42,10 +44,12 @@ const mockState = vi.hoisted(() => ({
     cachedA11y: undefined as unknown,
     cachedA11yRevision: undefined as unknown,
     cachedFormSchemas: undefined as unknown,
+    hasFreshFrame: true,
   },
   formSchemas: [] as Array<Record<string, unknown>>,
   connect: vi.fn(),
   connectThroughProxy: vi.fn(),
+  ensureSessionConnected: vi.fn(async () => {}),
   prewarmProxy: vi.fn(),
   sendClick: vi.fn(async () => ({
     status: 'updated' as 'updated' | 'acknowledged' | 'timed_out',
@@ -70,6 +74,8 @@ const mockState = vi.hoisted(() => ({
 }))
 
 function resetMockSessionCaches() {
+  mockState.session.ws.readyState = mockState.session.ws.OPEN
+  mockState.session.hasFreshFrame = true
   mockState.session.updateRevision = 1
   mockState.session.cachedA11y = undefined
   mockState.session.cachedA11yRevision = undefined
@@ -103,6 +109,7 @@ function resetMockActionBehaviors() {
 vi.mock('../session.js', () => ({
   connect: mockState.connect,
   connectThroughProxy: mockState.connectThroughProxy,
+  ensureSessionConnected: mockState.ensureSessionConnected,
   prewarmProxy: mockState.prewarmProxy,
   disconnect: vi.fn(),
   pruneDisconnectedSessions: vi.fn(() => []),
@@ -520,7 +527,12 @@ describe('batch MCP result shaping', () => {
 
   it('treats a timed-out batched action as a failed step', async () => {
     const handler = getToolHandler('geometra_run_actions')
-    mockState.sendClick.mockResolvedValueOnce({ status: 'timed_out', timeoutMs: 250 })
+    mockState.sendClick.mockResolvedValueOnce({
+      status: 'timed_out',
+      timeoutMs: 250,
+      requestId: 'click-request-1',
+      actionId: 'click-action-1',
+    })
 
     const result = await handler({
       actions: [{ type: 'click', x: 20, y: 30 }],
@@ -537,13 +549,61 @@ describe('batch MCP result shaping', () => {
       successCount: 0,
       errorCount: 1,
       stoppedAt: 0,
+      ambiguousAt: 0,
+      resumeBlocked: true,
+      resumeFromIndex: 0,
     })
     expect(steps[0]).toMatchObject({
       index: 0,
       type: 'click',
       ok: false,
       error: expect.stringMatching(/timed out.*unconfirmed/i),
+      requestId: 'click-request-1',
+      actionId: 'click-action-1',
     })
+  })
+
+  it('pins an identity-bearing late action error to the same ambiguous step', async () => {
+    const handler = getToolHandler('geometra_run_actions')
+    const requestId = 'late-request-1'
+    const actionId = 'late-action-1'
+    mockState.sendClick.mockRejectedValueOnce(Object.assign(
+      new Error(
+        `snapshot failed after the browser action Outcome is ambiguous for actionId ${actionId} (requestId ${requestId}); do not retry blindly.`,
+      ),
+      { code: 'SNAPSHOT_FAILED', requestId, actionId },
+    ))
+
+    const result = await handler({
+      actions: [
+        { type: 'click', x: 20, y: 30 },
+        { type: 'click', x: 40, y: 50 },
+      ],
+      stopOnError: false,
+      includeSteps: true,
+      detail: 'terse',
+    })
+
+    const payload = JSON.parse(result.content[0]!.text) as Record<string, unknown>
+    const steps = payload.steps as Array<Record<string, unknown>>
+    expect(payload).toMatchObject({
+      completed: false,
+      ambiguous: true,
+      ambiguousAt: 0,
+      stoppedAt: 0,
+      resumeBlocked: true,
+      resumeFromIndex: 0,
+    })
+    expect(steps).toHaveLength(1)
+    expect(steps[0]).toMatchObject({
+      index: 0,
+      outcome: 'unconfirmed',
+      retrySafety: 'inspect-first',
+      code: 'SNAPSHOT_FAILED',
+      requestId,
+      actionId,
+    })
+    expect(mockState.sendClick).toHaveBeenCalledOnce()
   })
 
   it('keeps fill_fields minimal output structured and does not echo long essay text', async () => {
@@ -797,6 +857,78 @@ describe('batch MCP result shaping', () => {
     })
   })
 
+  it('does not sequentially replay a timed-out batched fill_fields mutation', async () => {
+    const handler = getToolHandler('geometra_fill_fields')
+    mockState.sendFillFields.mockResolvedValueOnce({
+      status: 'timed_out',
+      timeoutMs: 6000,
+      requestId: 'fill-batch-request-1',
+      actionId: 'fill-batch-action-1',
+    })
+
+    const result = await handler({
+      fields: [
+        { kind: 'text', fieldLabel: 'Full name', value: 'Taylor Applicant' },
+        { kind: 'text', fieldLabel: 'Email', value: 'taylor@example.com' },
+      ],
+      stopOnError: false,
+      failOnInvalid: false,
+      includeSteps: false,
+      detail: 'terse',
+    })
+    const payload = JSON.parse(result.content[0]!.text) as Record<string, unknown>
+
+    expect(result.isError).toBe(true)
+    expect(payload).toMatchObject({
+      completed: false,
+      execution: 'batched',
+      outcome: 'unconfirmed',
+      retrySafety: 'inspect-first',
+      requestId: 'fill-batch-request-1',
+      actionId: 'fill-batch-action-1',
+    })
+    expect(mockState.sendFillFields).toHaveBeenCalledOnce()
+    expect(mockState.sendFieldText).not.toHaveBeenCalled()
+  })
+
+  it('stops sequential fill_fields on ambiguity even when stopOnError is false', async () => {
+    const handler = getToolHandler('geometra_fill_fields')
+    mockState.sendFieldText.mockResolvedValueOnce({
+      status: 'timed_out',
+      timeoutMs: 2000,
+      requestId: 'fill-field-request-1',
+      actionId: 'fill-field-action-1',
+    })
+
+    const result = await handler({
+      fields: [
+        { kind: 'text', fieldLabel: 'Full name', value: 'Taylor Applicant' },
+        { kind: 'text', fieldLabel: 'Email', value: 'taylor@example.com' },
+      ],
+      stopOnError: false,
+      failOnInvalid: false,
+      includeSteps: true,
+      detail: 'terse',
+    })
+    const payload = JSON.parse(result.content[0]!.text) as Record<string, unknown>
+    const steps = payload.steps as Array<Record<string, unknown>>
+
+    expect(mockState.sendFieldText).toHaveBeenCalledOnce()
+    expect(payload).toMatchObject({
+      completed: false,
+      ambiguous: true,
+      ambiguousAt: 0,
+      resumeBlocked: true,
+      resumeFromIndex: 0,
+    })
+    expect(steps).toHaveLength(1)
+    expect(steps[0]).toMatchObject({
+      outcome: 'unconfirmed',
+      requestId: 'fill-field-request-1',
+      actionId: 'fill-field-action-1',
+    })
+  })
+
   it('auto-connects run_actions and supports final-only output', async () => {
     const handler = getToolHandler('geometra_run_actions')
 
@@ -834,6 +966,7 @@ describe('batch MCP result shaping', () => {
     }))
     expect(payload).toMatchObject({
       autoConnected: true,
+      sessionId: 'session-test',
       transport: 'proxy',
       pageUrl: 'https://shop.example.com/login',
       completed: true,
@@ -846,10 +979,18 @@ describe('batch MCP result shaping', () => {
 
   it('keeps final-only run_actions failures visible and incomplete', async () => {
     const handler = getToolHandler('geometra_run_actions')
-    mockState.sendClick.mockResolvedValueOnce({ status: 'timed_out', timeoutMs: 250 })
+    mockState.sendClick.mockResolvedValueOnce({
+      status: 'timed_out',
+      timeoutMs: 250,
+      requestId: 'run-request-1',
+      actionId: 'run-action-1',
+    })
 
     const result = await handler({
-      actions: [{ type: 'click', x: 20, y: 30 }],
+      actions: [
+        { type: 'click', x: 20, y: 30 },
+        { type: 'click', x: 40, y: 50 },
+      ],
       stopOnError: false,
       includeSteps: false,
       output: 'final',
@@ -857,7 +998,16 @@ describe('batch MCP result shaping', () => {
     })
     const payload = JSON.parse(result.content[0]!.text) as Record<string, unknown>
 
-    expect(payload).toMatchObject({ completed: false, successCount: 0, errorCount: 1 })
+    expect(payload).toMatchObject({
+      completed: false,
+      successCount: 0,
+      errorCount: 1,
+      ambiguous: true,
+      ambiguousAt: 0,
+      resumeBlocked: true,
+      resumeFromIndex: 0,
+    })
+    expect(mockState.sendClick).toHaveBeenCalledOnce()
     expect(payload).not.toHaveProperty('steps')
   })
 
@@ -1092,6 +1242,32 @@ describe('batch MCP result shaping', () => {
       pageUrl: 'https://jobs.example.com/application',
     })
     expect(payload).not.toHaveProperty('currentUi')
+    expect(mockState.connectThroughProxy).toHaveBeenCalledWith(expect.objectContaining({
+      pageUrl: 'https://jobs.example.com/application',
+      isolated: true,
+    }))
+  })
+
+  it('requires explicit isolated:false for warm reuse and rejects isolation claims on direct ws endpoints', async () => {
+    const handler = getToolHandler('geometra_connect')
+
+    await handler({
+      pageUrl: 'https://jobs.example.com/application',
+      isolated: false,
+    })
+    expect(mockState.connectThroughProxy).toHaveBeenCalledWith(expect.objectContaining({
+      pageUrl: 'https://jobs.example.com/application',
+      isolated: false,
+    }))
+
+    vi.clearAllMocks()
+    const rejected = await handler({
+      url: 'ws://127.0.0.1:3200',
+      isolated: true,
+    })
+    expect(rejected.isError).toBe(true)
+    expect(rejected.content[0]!.text).toContain('unsupported for direct ws:// endpoints')
+    expect(mockState.connect).not.toHaveBeenCalled()
   })
 
   it('prepares a warm browser without creating an active session', async () => {
@@ -1414,6 +1590,8 @@ describe('batch MCP result shaping', () => {
       width: undefined,
       height: undefined,
       slowMo: undefined,
+      isolated: true,
+      proxy: undefined,
       awaitInitialFrame: false,
       eagerInitialExtract: true,
     })
@@ -1462,6 +1640,28 @@ describe('batch MCP result shaping', () => {
       archetypes: ['form'],
       summary: { formCount: 1 },
     })
+  })
+
+  it('does not serve a cached page model while the transport is closing', async () => {
+    const handler = getToolHandler('geometra_page_model')
+    mockState.session.tree = { kind: 'box' } as unknown as typeof mockState.session.tree
+    mockState.session.layout = {
+      x: 0,
+      y: 0,
+      width: 1280,
+      height: 800,
+      children: [],
+    } as unknown as typeof mockState.session.layout
+    mockState.session.hasFreshFrame = true
+    mockState.session.ws.readyState = 0
+    mockState.ensureSessionConnected.mockRejectedValueOnce(new Error('transport closing'))
+
+    const result = await handler({})
+
+    expect(result.isError).toBe(true)
+    expect(result.content[0]!.text).toContain('No UI tree available')
+    const { buildA11yTree } = await import('../session.js')
+    expect(buildA11yTree).not.toHaveBeenCalled()
   })
 
   it('returns compact form schemas without requiring section expansion', async () => {
@@ -1574,6 +1774,7 @@ describe('batch MCP result shaping', () => {
       width: undefined,
       height: undefined,
       slowMo: undefined,
+      isolated: true,
       awaitInitialFrame: undefined,
     })
     expect(payload).toMatchObject({
@@ -1930,6 +2131,7 @@ describe('batch MCP result shaping', () => {
       width: undefined,
       height: undefined,
       slowMo: undefined,
+      isolated: true,
       awaitInitialFrame: undefined,
     })
     expect(mockState.sendFillFields).toHaveBeenCalledWith(
@@ -2635,7 +2837,12 @@ describe('submit_form tool', () => {
         node('button', 'Submit', { bounds: { x: 60, y: 480, width: 100, height: 40 }, path: [0] }),
       ],
     })
-    mockState.sendClick.mockResolvedValueOnce({ status: 'timed_out', timeoutMs: 500 })
+    mockState.sendClick.mockResolvedValueOnce({
+      status: 'timed_out',
+      timeoutMs: 500,
+      requestId: 'submit-request-1',
+      actionId: 'submit-action-1',
+    })
 
     const result = await handler({ skipFill: true, detail: 'terse' })
     const payload = JSON.parse(result.content[0]!.text) as Record<string, unknown>
@@ -2643,9 +2850,15 @@ describe('submit_form tool', () => {
     expect(result.isError).toBeUndefined()
     expect(payload).toMatchObject({
       completed: false,
-      execution: 'unconfirmed',
       outcome: 'unconfirmed',
-      submit: { wait: 'timed_out' },
+      pauseReason: 'action-outcome-ambiguous',
+      retrySafety: 'inspect-first',
+      resumeHint: { retrySameCall: false, inspectCurrentUiFirst: true },
+      submit: {
+        wait: 'timed_out',
+        requestId: 'submit-request-1',
+        actionId: 'submit-action-1',
+      },
     })
   })
 

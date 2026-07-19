@@ -1,14 +1,14 @@
 /**
- * Integration test for `connectThroughProxy({ isolated: true })`.
+ * Integration tests for safe-by-default proxy session isolation.
  *
  * Setup: a tiny HTTP server serves an HTML page that, on first visit, writes
  * a path-tagged marker to `localStorage` if one isn't already set, then
  * renders the marker text into an `<h1>`. The marker is therefore set ONCE
  * per browser instance, regardless of how many navigations happen.
  *
- * Two scenarios verify the isolated flag's behavior:
+ * Two scenarios verify the isolation contract:
  *
- * 1. **Pooled (default)**: connect to `/page-a`, disconnect (the proxy
+ * 1. **Explicit warm reuse** (`isolated: false`): connect to `/page-a`, disconnect (the proxy
  *    enters the reusable pool), then connect to `/page-b`. The second
  *    connect attaches to the same pooled proxy, which navigates the
  *    existing Chromium from /page-a to /page-b — but the browser's
@@ -16,8 +16,8 @@
  *    SEES THE FIRST SESSION'S MARKER. This documents the contamination
  *    that breaks parallel form submission against real apply flows.
  *
- * 2. **Isolated**: same connect/disconnect/connect sequence, but with
- *    `isolated: true`. Each connect spawns a brand-new Chromium with
+ * 2. **Default isolated**: the same connect/disconnect/connect sequence with
+ *    the flag omitted. Each connect spawns a brand-new Chromium with
  *    empty storage, so the second session sees its own marker, not the
  *    first's. This is the fix.
  *
@@ -35,6 +35,7 @@ import {
   disconnect,
   getDefaultSessionId,
   resolveSession,
+  shutdownAllSessionsAndProxies,
 } from '../session.js'
 import type { A11yNode, Session } from '../session.js'
 
@@ -93,7 +94,7 @@ async function waitForMarkerText(
   )
 }
 
-describe('connectThroughProxy({ isolated: true })', () => {
+describe('connectThroughProxy session isolation', () => {
   beforeAll(async () => {
     server = http.createServer((req, res) => {
       const url = req.url ?? '/'
@@ -115,15 +116,14 @@ describe('connectThroughProxy({ isolated: true })', () => {
 
   afterEach(() => {
     // Force-close everything so the next test starts with no pooled proxies.
-    disconnect({ closeProxy: true })
+    shutdownAllSessionsAndProxies()
   })
 
-  it('isolated sessions get independent localStorage between connects', async () => {
-    // First isolated session against /page-a.
+  it('browser sessions are isolated by default and get independent localStorage between connects', async () => {
+    // Omission must choose the safe, isolated default.
     const sessionA = await connectThroughProxy({
       pageUrl: `${baseUrl}/page-a`,
       headless: true,
-      isolated: true,
     })
     expect(sessionA.isolated).toBe(true)
     const markerA = await waitForMarkerText(sessionA, 'marker-from-')
@@ -139,7 +139,6 @@ describe('connectThroughProxy({ isolated: true })', () => {
     const sessionB = await connectThroughProxy({
       pageUrl: `${baseUrl}/page-b`,
       headless: true,
-      isolated: true,
     })
     expect(sessionB.isolated).toBe(true)
     const markerB = await waitForMarkerText(sessionB, 'marker-from-')
@@ -150,13 +149,13 @@ describe('connectThroughProxy({ isolated: true })', () => {
     disconnect({ sessionId: sessionB.id })
   }, 30_000)
 
-  it('pooled (default) sessions DO leak localStorage — documents the bug isolated fixes', async () => {
-    // First pooled session against /page-a. The proxy will be eligible
-    // for reuse after disconnect.
+  it('only explicit isolated:false opts into sequential warm state reuse', async () => {
+    // First explicitly pooled session. The proxy becomes eligible for reuse
+    // after disconnect.
     const sessionA = await connectThroughProxy({
       pageUrl: `${baseUrl}/page-a`,
       headless: true,
-      // isolated: false (default)
+      isolated: false,
     })
     expect(sessionA.isolated).toBeFalsy()
     const markerA = await waitForMarkerText(sessionA, 'marker-from-')
@@ -172,6 +171,7 @@ describe('connectThroughProxy({ isolated: true })', () => {
     const sessionB = await connectThroughProxy({
       pageUrl: `${baseUrl}/page-b`,
       headless: true,
+      isolated: false,
     })
     const markerB = await waitForMarkerText(sessionB, 'marker-from-')
     // Documents the contamination: the second session sees the first
@@ -181,17 +181,11 @@ describe('connectThroughProxy({ isolated: true })', () => {
     disconnect({ sessionId: sessionB.id, closeProxy: true })
   }, 30_000)
 
-  it('serializes concurrent default connects to a pooled proxy onto a single session', async () => {
-    // Regression for the per-proxy attach race. Before the attachLock fix,
-    // two concurrent connectThroughProxy calls that both picked the same
-    // pooled proxy entry could both pass attachToReusableProxy's
-    // "reusedExistingSession" check (because neither's session was in
-    // activeSessions yet — connect() runs first) and then both call
-    // connect(proxy.wsUrl), creating two distinct WebSocket sessions
-    // bound to the same Chromium. Two agents would silently mutate the
-    // same DOM. With the lock, the second connect waits for the first,
-    // re-picks via findReusableProxy, and takes the reusedExistingSession
-    // branch — both calls return the same Session object.
+  it('never gives concurrent warm-pool callers the same Session owner', async () => {
+    // Regression for the per-proxy attach race. Two concurrent callers may
+    // initially select the same idle pool entry. The attach lock lets only
+    // one claim it; the second must re-pick and start or claim a different
+    // runtime. No active browser ever has two Session owners.
     //
     // Step 1: warm the pool with a single connect+disconnect so the next
     // connects find an existing entry. Cold-start parallel connects
@@ -200,23 +194,25 @@ describe('connectThroughProxy({ isolated: true })', () => {
     const warmup = await connectThroughProxy({
       pageUrl: `${baseUrl}/page-a`,
       headless: true,
+      isolated: false,
     })
     disconnect({ sessionId: warmup.id, closeProxy: false })
 
     // Step 2: fire two concurrent connects. Without the lock, both would
     // call connect(proxy.wsUrl) and create distinct sessions bound to the
-    // same browser. With the lock, the second waits for the first to bind,
-    // then sees the bound session and reuses it.
+    // same browser. With the lock, the second waits, sees that browser is
+    // owned, and starts or claims a different runtime.
     const [sessionA, sessionB] = await Promise.all([
-      connectThroughProxy({ pageUrl: `${baseUrl}/page-a`, headless: true }),
-      connectThroughProxy({ pageUrl: `${baseUrl}/page-a`, headless: true }),
+      connectThroughProxy({ pageUrl: `${baseUrl}/page-a`, headless: true, isolated: false }),
+      connectThroughProxy({ pageUrl: `${baseUrl}/page-a`, headless: true, isolated: false }),
     ])
 
-    // Both connects must converge on the same underlying session. If they
-    // don't, the race re-emerged: two agents would race in the same browser.
-    expect(sessionA.id).toBe(sessionB.id)
+    expect(sessionA.id).not.toBe(sessionB.id)
+    expect(sessionA).not.toBe(sessionB)
+    expect(sessionA.proxyRuntime).not.toBe(sessionB.proxyRuntime)
 
     disconnect({ sessionId: sessionA.id, closeProxy: true })
+    disconnect({ sessionId: sessionB.id, closeProxy: true })
   }, 30_000)
 
   // ── Bug #1 regression: parallel isolated sessions must never share a
@@ -233,17 +229,14 @@ describe('connectThroughProxy({ isolated: true })', () => {
         connectThroughProxy({
           pageUrl: `${baseUrl}/page-a`,
           headless: true,
-          isolated: true,
         }),
         connectThroughProxy({
           pageUrl: `${baseUrl}/page-b`,
           headless: true,
-          isolated: true,
         }),
         connectThroughProxy({
           pageUrl: `${baseUrl}/page-a`,
           headless: true,
-          isolated: true,
         }),
       ])
 
@@ -333,6 +326,7 @@ describe('connectThroughProxy({ isolated: true })', () => {
     const session = await connectThroughProxy({
       pageUrl: `${baseUrl}/page-a`,
       headless: true,
+      isolated: false,
     })
     try {
       expect(session.isolated).toBeFalsy()

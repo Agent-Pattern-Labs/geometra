@@ -6,6 +6,7 @@ import { formatConnectFailureMessage, isHttpUrl, normalizeConnectTarget } from '
 import {
   connect,
   connectThroughProxy,
+  ensureSessionConnected,
   disconnect,
   pruneDisconnectedSessions,
   resolveSession,
@@ -395,7 +396,7 @@ const GEOMETRA_WAIT_FILTER_REQUIRED_MESSAGE =
 
 /** Strict input so unknown keys (e.g. textGone) fail parse; empty-filter checks happen in handlers / waitForSemanticCondition. */
 const sessionIdSchemaField = {
-  sessionId: z.string().optional().describe('Session identifier returned by geometra_connect. Omit to use the most recent session.'),
+  sessionId: z.string().optional().describe('Session identifier returned by geometra_connect or an auto-connected tool. Omit only when exactly one non-isolated session is active.'),
 }
 
 const geometraQueryInputSchema = z.object({
@@ -784,7 +785,7 @@ const batchActionSchema = z.discriminatedUnion('type', [
   }).strict(),
   z.object({
     type: z.literal('type'),
-    text: z.string(),
+    text: z.string().max(65_536),
     timeoutMs: timeoutMsInput,
   }).strict(),
   z.object({
@@ -898,7 +899,7 @@ export function createServer(): McpServer {
   )
 
   const sessionIdInput = z.string().optional().describe(
-    'Session identifier returned by geometra_connect. Omit to use the most recent session.',
+    'Session identifier returned by geometra_connect or an auto-connected tool. Omit only when exactly one non-isolated session is active.',
   )
 
   // ── connect ──────────────────────────────────────────────────
@@ -912,7 +913,7 @@ Use \`url\` (ws://…) only when a Geometra/native server or an already-running 
 
 Chromium runs **headless** by default unless \`headless: false\`. Pass \`stealth: true\` (or set \`GEOMETRA_STEALTH=1\`) to opt into CloakBrowser's Chromium for authorized testing instead of stock Playwright Chromium. File upload / wheel / native \`<select>\` need the proxy path (\`pageUrl\` or ws to proxy). Set \`returnForms: true\` and/or \`returnPageModel: true\` when you want a lower-turn startup response. When connect first-response latency matters more than inlining the page model, pair \`returnPageModel: true\` with \`pageModelMode: "deferred"\` and call \`geometra_page_model\` next.
 
-**Parallelism:** by default, geometra MCP pools and reuses Chromium instances across sessions for speed. That pooling is safe for read-only exploration, but it shares localStorage / cookies / page state across whichever sessions land on the same proxy — which means **two parallel form-submission flows can contaminate each other** (one job's email/autocomplete state leaks into another, or worse, two agents end up driving the same browser tab). For parallel apply / form submission, pass \`isolated: true\`. Each isolated session gets its own brand-new Chromium that is destroyed on disconnect, never enters the pool, and is guaranteed independent of every other session. The cost is ~1–2s of extra startup vs the ~50ms reusable-proxy attach.`,
+**Session isolation:** browser sessions started from \`pageUrl\` (or an HTTP(S) \`url\`) are isolated by default: each gets a fresh Chromium that is destroyed on disconnect. Pass \`isolated: false\` explicitly only when you intentionally want sequential warm-browser reuse, including shared cookies, localStorage, and page state. Direct \`ws://\` connections attach to an externally managed endpoint and cannot create browser isolation.`,
     {
       url: z
         .string()
@@ -959,8 +960,7 @@ Chromium runs **headless** by default unless \`headless: false\`. Pass \`stealth
       isolated: z
         .boolean()
         .optional()
-        .default(false)
-        .describe('When true, bypass the reusable proxy pool and spawn a brand-new Chromium for this session that is destroyed on disconnect. Required for safe parallel form submission — without this, two parallel sessions can land on the same pooled proxy and contaminate each other. Default false (use the pool for speed).'),
+        .describe('For pageUrl/HTTP(S) browser connects, omission uses a fresh Chromium that is destroyed on disconnect. Pass false explicitly to opt into sequential warm-browser reuse and shared browser state. Direct ws:// endpoints are externally managed.'),
       proxy: z
         .object({
           server: z
@@ -1010,6 +1010,9 @@ Chromium runs **headless** by default unless \`headless: false\`. Pass \`stealth
       const browser = resolveBrowserStealth({ stealth: input.stealth, browserMode: input.browserMode })
       if (!browser.ok) return err(browser.error)
       const target = normalized.value
+      if (target.kind === 'ws' && input.isolated === true) {
+        return err('isolated:true is unsupported for direct ws:// endpoints because MCP does not own that browser/runtime. Use pageUrl/HTTP(S) url for an isolated browser, or omit isolated for the externally managed endpoint.')
+      }
       const formSchema = {
         formId: input.formId,
         maxFields: input.maxFields,
@@ -1041,7 +1044,7 @@ Chromium runs **headless** by default unless \`headless: false\`. Pass \`stealth
             height: input.height,
             slowMo: input.slowMo,
             ...(browser.stealth !== undefined && { stealth: browser.stealth }),
-            isolated: input.isolated,
+            isolated: input.isolated !== false,
             proxy: input.proxy,
             awaitInitialFrame: deferInlinePageModel ? false : undefined,
             eagerInitialExtract: deferInlinePageModel ? true : undefined,
@@ -1106,7 +1109,7 @@ Chromium runs **headless** by default unless \`headless: false\`. Pass \`stealth
     'geometra_prepare_browser',
     `Pre-launch and pre-navigate a reusable geometra-proxy browser for a normal web page without creating an active MCP session.
 
-Use this when you can prepare ahead of the user-facing task so the next \`geometra_connect\` or one-call \`geometra_run_actions\` on the same \`pageUrl\` / viewport / headless settings skips the cold browser launch.`,
+Use this when you can prepare ahead of the user-facing task so the next \`geometra_connect\` or one-call \`geometra_run_actions\` on the same \`pageUrl\` / viewport / headless settings skips the cold browser launch. The consuming call must pass \`isolated: false\` explicitly; isolated browser connects intentionally ignore the warm pool.`,
     {
       pageUrl: z
         .string()
@@ -1495,6 +1498,14 @@ Use \`kind: "text"\` for textboxes / textareas, \`"choice"\` for selects / combo
           // operators can aggregate how often it fires.
           fallbackFromBatch = { attempted: true, used: true, reason: 'batched-unavailable', attempts: 2 }
         } catch (e) {
+          const ambiguity = ambiguousOutcomeDetails(e)
+          if (ambiguity) {
+            return err(JSON.stringify({
+              completed: false,
+              execution: 'batched',
+              ...ambiguousOutcomePayload(ambiguity),
+            }, null, detail === 'verbose' ? 2 : undefined))
+          }
           const message = e instanceof Error ? e.message : String(e)
           return err(message)
         }
@@ -1502,6 +1513,7 @@ Use \`kind: "text"\` for textboxes / textareas, \`"choice"\` for selects / combo
 
       const steps: Array<Record<string, unknown>> = []
       let stoppedAt: number | undefined
+      let ambiguousAt: number | undefined
 
       for (let index = 0; index < resolvedFields.fields.length; index++) {
         const field = resolvedFields.fields[index]!
@@ -1517,21 +1529,34 @@ Use \`kind: "text"\` for textboxes / textareas, \`"choice"\` for selects / combo
             ? { index, kind: field.kind, ok: true, summary: result.summary }
             : { index, kind: field.kind, ok: true, ...result.compact })
         } catch (e) {
-          const message = e instanceof Error ? e.message : String(e)
+          let handledError = e
+          let message = e instanceof Error ? e.message : String(e)
           // Retry once for transient selection failures
-          if (message.includes('selection_not_confirmed') || message.includes('still invalid after fill')) {
+          if (!ambiguousOutcomeDetails(e) && (message.includes('selection_not_confirmed') || message.includes('still invalid after fill'))) {
             try {
               const retryResult = await executeFillField(session, field, detail)
               steps.push(detail === 'verbose'
                 ? { index, kind: field.kind, ok: true, summary: retryResult.summary, retried: true }
                 : { index, kind: field.kind, ok: true, ...retryResult.compact, retried: true })
               continue
-            } catch { /* fall through to error handling */ }
+            } catch (retryError) {
+              handledError = retryError
+              message = retryError instanceof Error ? retryError.message : String(retryError)
+            }
           }
+          const ambiguity = ambiguousOutcomeDetails(handledError)
           const suggestion = isResolvedFillFieldInput(field) ? suggestRecovery(field, message) : undefined
-          steps.push({ index, kind: field.kind, ok: false, error: message, ...(suggestion ? { suggestion } : {}) })
-          if (stopOnError) {
+          steps.push({
+            index,
+            kind: field.kind,
+            ok: false,
+            error: message,
+            ...(ambiguity ? ambiguousOutcomePayload(ambiguity) : {}),
+            ...(suggestion ? { suggestion } : {}),
+          })
+          if (ambiguity || stopOnError) {
             stoppedAt = index
+            if (ambiguity) ambiguousAt = index
             break
           }
         }
@@ -1549,6 +1574,13 @@ Use \`kind: "text"\` for textboxes / textareas, \`"choice"\` for selects / combo
         errorCount,
         ...(includeSteps ? { steps } : {}),
         ...(stoppedAt !== undefined ? { stoppedAt } : {}),
+        ...(ambiguousAt !== undefined ? {
+          ambiguous: true,
+          ambiguousAt,
+          resumeBlocked: true,
+          resumeFromIndex: ambiguousAt,
+          resumeInstruction: 'Inspect the current UI before resuming; do not skip the ambiguous field.',
+        } : {}),
         ...(fallbackFromBatch ? { fallback: fallbackFromBatch } : {}),
         ...(signals ? { final: sessionSignalsPayload(signals, detail) } : {}),
       }
@@ -1609,8 +1641,7 @@ Pass \`valuesById\` with field ids from \`geometra_form_schema\` for the most st
       isolated: z
         .boolean()
         .optional()
-        .default(false)
-        .describe('When auto-connecting via pageUrl/url, request an isolated proxy (own brand-new Chromium, destroyed on disconnect). Required for safe parallel form submission. See geometra_connect for details. Ignored when reusing an existing sessionId — set isolated on the original geometra_connect for that case.'),
+        .describe('When auto-connecting via pageUrl/HTTP(S) url, use a fresh isolated Chromium by default. Pass false explicitly for sequential warm reuse. Ignored when using an existing sessionId.'),
       detail: detailInput(),
       sessionId: sessionIdInput,
     },
@@ -1694,6 +1725,7 @@ Pass \`valuesById\` with field ids from \`geometra_form_schema\` for the most st
         try {
           const startRevision = session.updateRevision
           const wait = await sendFillFields(session, toProxyFillFields(planned.fields))
+          assertActionWaitConfirmed('Batched form fill', wait)
           const ackResult = parseProxyFillAckResult(wait.result)
           if (ackResult && ackResult.invalidCount === 0) {
             usedBatch = true
@@ -1717,6 +1749,16 @@ Pass \`valuesById\` with field ids from \`geometra_form_schema\` for the most st
           await waitForBatchFieldReadback(session, planned.fields)
           usedBatch = true
         } catch (e) {
+          const ambiguity = ambiguousOutcomeDetails(e)
+          if (ambiguity) {
+            return err(JSON.stringify({
+              ...connection,
+              completed: false,
+              execution: 'batched',
+              formId: schema.formId,
+              ...ambiguousOutcomePayload(ambiguity),
+            }, null, detail === 'verbose' ? 2 : undefined))
+          }
           if (!canFallbackToSequentialFill(e)) {
             const message = e instanceof Error ? e.message : String(e)
             return err(message)
@@ -1780,6 +1822,7 @@ Pass \`valuesById\` with field ids from \`geometra_form_schema\` for the most st
 
       const steps: Array<Record<string, unknown>> = []
       let stoppedAt: number | undefined
+      let ambiguousAt: number | undefined
       const startIndex = resumeFromIndex ?? 0
 
       for (let index = startIndex; index < planned.fields.length; index++) {
@@ -1794,10 +1837,20 @@ Pass \`valuesById\` with field ids from \`geometra_form_schema\` for the most st
             : { index, kind: field.kind, ok: true, ...(confidence !== undefined ? { confidence, matchMethod } : {}), ...result.compact })
         } catch (e) {
           const message = e instanceof Error ? e.message : String(e)
+          const ambiguity = ambiguousOutcomeDetails(e)
           const suggestion = suggestRecovery(field, message)
-          steps.push({ index, kind: field.kind, ok: false, ...(confidence !== undefined ? { confidence, matchMethod } : {}), error: message, ...(suggestion ? { suggestion } : {}) })
-          if (stopOnError) {
+          steps.push({
+            index,
+            kind: field.kind,
+            ok: false,
+            ...(confidence !== undefined ? { confidence, matchMethod } : {}),
+            error: message,
+            ...(ambiguity ? ambiguousOutcomePayload(ambiguity) : {}),
+            ...(suggestion ? { suggestion } : {}),
+          })
+          if (ambiguity || stopOnError) {
             stoppedAt = index
+            if (ambiguity) ambiguousAt = index
             break
           }
         }
@@ -1832,7 +1885,16 @@ Pass \`valuesById\` with field ids from \`geometra_form_schema\` for the most st
           : undefined,
         ...(startIndex > 0 ? { resumedFromIndex: startIndex } : {}),
         ...(includeSteps ? { steps } : {}),
-        ...(stoppedAt !== undefined ? { stoppedAt, resumeFromIndex: stoppedAt + 1 } : {}),
+        ...(stoppedAt !== undefined ? {
+          stoppedAt,
+          resumeFromIndex: ambiguousAt ?? (stoppedAt + 1),
+        } : {}),
+        ...(ambiguousAt !== undefined ? {
+          ambiguous: true,
+          ambiguousAt,
+          resumeBlocked: true,
+          resumeInstruction: 'Inspect the current UI before resuming; do not skip the ambiguous field.',
+        } : {}),
         ...(fallbackFromBatch ? { fallback: fallbackFromBatch } : {}),
         ...(verification ? { verification } : {}),
         ...(signals ? { final: sessionSignalsPayload(signals, detail) } : {}),
@@ -1868,7 +1930,7 @@ Pass \`valuesById\` with field ids from \`geometra_form_schema\` for the most st
 
 Pass \`valuesById\` or \`valuesByLabel\` to populate fields, \`submit\` to target the submit button (default: semantic \`{ role: 'button', name: 'Submit' }\`), and \`waitFor\` to block on the post-submit state (success banner, navigation, submit button gone, etc.). Navigation is detected automatically and surfaced as \`navigated: true\` with \`afterUrl\`.
 
-Pass \`pageUrl\`/\`url\` to auto-connect in the same call — use \`isolated: true\` for safe parallel submissions.`,
+Pass \`pageUrl\`/\`url\` to auto-connect in the same call. These browser connects are isolated by default; pass \`isolated: false\` only for intentional sequential warm reuse.`,
     {
       url: z.string().optional().describe('Optional target URL. Use a ws:// Geometra server URL or an http(s) page URL to auto-connect before submitting.'),
       pageUrl: z.string().optional().describe('Optional http(s) page URL to auto-connect before submitting. Prefer this over url for browser pages.'),
@@ -1879,7 +1941,7 @@ Pass \`pageUrl\`/\`url\` to auto-connect in the same call — use \`isolated: tr
       slowMo: z.number().int().nonnegative().optional().describe('Playwright slowMo (ms) when auto-spawning a proxy.'),
       stealth: stealthInput(),
       browserMode: browserModeInput(),
-      isolated: z.boolean().optional().default(false).describe('When auto-connecting via pageUrl/url, request an isolated proxy. Required for safe parallel form submission.'),
+      isolated: z.boolean().optional().describe('When auto-connecting via pageUrl/HTTP(S) url, use a fresh isolated Chromium by default. Pass false explicitly for sequential warm reuse.'),
       formId: z.string().optional().describe('Optional form id from geometra_form_schema or geometra_page_model'),
       valuesById: formValuesRecordSchema.optional().describe('Form values keyed by stable field id from geometra_form_schema'),
       valuesByLabel: formValuesRecordSchema.optional().describe('Form values keyed by schema field label'),
@@ -1980,6 +2042,28 @@ Pass \`pageUrl\`/\`url\` to auto-connect in the same call — use \`isolated: tr
             toProxyFillFields(planned.fields),
             capTimeoutMs(undefined, timeoutCapFromDeadline(deadlineAt), HOST_SAFE_TOOL_TIMEOUT_MS),
           )
+          if (wait.status === 'timed_out') {
+            fillSummary = {
+              formId: schema.formId,
+              execution: 'batched',
+              fieldCount: planned.fields.length,
+              ...waitStatusPayload(wait),
+              ...(entryCount !== planned.fields.length ? { requestedValueCount: entryCount } : {}),
+            }
+            const guidance = ambiguousActionGuidance(wait)
+            return ok(JSON.stringify(pausedPayload('fill', {
+              tool: 'geometra_submit_form',
+              retrySameCall: false,
+              inspectCurrentUiFirst: true,
+              skipFill: false,
+              actionId: wait.actionId,
+              requestId: wait.requestId,
+            }, {
+              pauseReason: 'action-outcome-ambiguous',
+              retrySafety: 'inspect-first',
+              guidance,
+            }), null, detail === 'verbose' ? 2 : undefined))
+          }
           const ack = parseProxyFillAckResult(wait.result)
           await waitForDeferredBatchUpdate(session, startRevision, wait)
           fillSummary = {
@@ -1991,14 +2075,19 @@ Pass \`pageUrl\`/\`url\` to auto-connect in the same call — use \`isolated: tr
             ...(ack?.invalidFields ? { invalidFields: ack.invalidFields } : {}),
             ...(entryCount !== planned.fields.length ? { requestedValueCount: entryCount } : {}),
           }
-          if (wait.status === 'timed_out') {
-            return ok(JSON.stringify(pausedPayload('fill', {
-              tool: 'geometra_submit_form',
-              retrySameCall: true,
-              skipFill: false,
-            }), null, detail === 'verbose' ? 2 : undefined))
-          }
         } catch (e) {
+          const ambiguity = ambiguousOutcomeDetails(e)
+          if (ambiguity) {
+            return err(JSON.stringify({
+              ...connection,
+              completed: false,
+              paused: true,
+              phase: 'fill',
+              pauseReason: 'action-outcome-ambiguous',
+              ...ambiguousOutcomePayload(ambiguity),
+              submit: { attempted: false, reason: 'Fill outcome must be inspected before submission.' },
+            }, null, detail === 'verbose' ? 2 : undefined))
+          }
           if (!canFallbackToSequentialFill(e)) {
             const message = e instanceof Error ? e.message : String(e)
             return err(`Failed to fill form before submit: ${message}`)
@@ -2010,6 +2099,7 @@ Pass \`pageUrl\`/\`url\` to auto-connect in the same call — use \`isolated: tr
         if (!usedBatch) {
           let successCount = 0
           let firstErr: string | undefined
+          let firstAmbiguity: AmbiguousOutcomeDetails | undefined
           for (const field of planned.fields) {
             if (!hasSoftBudget(deadlineAt)) {
               fillSummary = {
@@ -2030,6 +2120,7 @@ Pass \`pageUrl\`/\`url\` to auto-connect in the same call — use \`isolated: tr
               successCount += 1
             } catch (e) {
               firstErr = e instanceof Error ? e.message : String(e)
+              firstAmbiguity = ambiguousOutcomeDetails(e)
               break
             }
           }
@@ -2042,6 +2133,18 @@ Pass \`pageUrl\`/\`url\` to auto-connect in the same call — use \`isolated: tr
             ...(entryCount !== planned.fields.length ? { requestedValueCount: entryCount } : {}),
           }
           if (firstErr !== undefined) {
+            if (firstAmbiguity) {
+              return err(JSON.stringify({
+                ...connection,
+                completed: false,
+                paused: true,
+                phase: 'fill',
+                pauseReason: 'action-outcome-ambiguous',
+                fill: fillSummary,
+                ...ambiguousOutcomePayload(firstAmbiguity),
+                submit: { attempted: false, reason: 'Fill outcome must be inspected before submission.' },
+              }, null, detail === 'verbose' ? 2 : undefined))
+            }
             return err(JSON.stringify({
               ...connection,
               completed: false,
@@ -2237,6 +2340,26 @@ Pass \`pageUrl\`/\`url\` to auto-connect in the same call — use \`isolated: tr
         capTimeoutMs(submitTimeoutMs, timeoutCapFromDeadline(deadlineAt), 15_000),
       )
 
+      if (clickWait.status === 'timed_out') {
+        const guidance = ambiguousActionGuidance(clickWait)
+        return ok(JSON.stringify(pausedPayload('submit', {
+          ...submitResumeHint,
+          retrySameCall: false,
+          inspectCurrentUiFirst: true,
+          actionId: clickWait.actionId,
+          requestId: clickWait.requestId,
+        }, {
+          pauseReason: 'action-outcome-ambiguous',
+          retrySafety: 'inspect-first',
+          guidance,
+          submit: {
+            at: submitPoint,
+            ...(resolvedClick.value.target ? { target: compactNodeReference(resolvedClick.value.target) } : {}),
+            ...waitStatusPayload(clickWait),
+          },
+        }), null, detail === 'verbose' ? 2 : undefined))
+      }
+
       let waitResult: WaitConditionResult | undefined
       let waitError: string | undefined
       if (waitFor) {
@@ -2294,11 +2417,11 @@ Pass \`pageUrl\`/\`url\` to auto-connect in the same call — use \`isolated: tr
       const waitEvidenceFresh = waitResult
         ? waitConditionHasFreshEvidence(beforeWaitEvidence, after, waitResult)
         : false
-      const execution = clickWait.status === 'timed_out' ? 'unconfirmed' : 'completed'
+      const execution = 'completed'
       const invalidCount = signals?.invalidFields.length ?? 0
       const outcome: 'submitted' | 'validation_failed' | 'unconfirmed' = invalidCount > 0
         ? 'validation_failed'
-        : execution === 'unconfirmed' || Boolean(waitError)
+        : waitError
           ? 'unconfirmed'
           : waitFor
             ? waitEvidenceFresh
@@ -2373,8 +2496,7 @@ Supported step types: \`click\`, \`type\`, \`key\`, \`upload_files\`, \`pick_lis
       isolated: z
         .boolean()
         .optional()
-        .default(false)
-        .describe('When auto-connecting via pageUrl/url, request an isolated proxy. See geometra_connect for details.'),
+        .describe('When auto-connecting via pageUrl/HTTP(S) url, use a fresh isolated Chromium by default. Pass false explicitly for sequential warm reuse.'),
       actions: z.array(batchActionSchema).min(1).max(80).describe('Ordered high-level action steps to run sequentially'),
       resumeFromIndex: z
         .number()
@@ -2427,6 +2549,7 @@ Supported step types: \`click\`, \`type\`, \`key\`, \`upload_files\`, \`pick_lis
       const steps: Array<Record<string, unknown>> = []
       let stoppedAt: number | undefined
       let pausedAt: number | undefined
+      let ambiguousAt: number | undefined
       const batchStartedAt = performance.now()
       // Collect transparent-fallback signals from each step so run_actions
       // surfaces them at top level regardless of `includeSteps` — otherwise
@@ -2505,6 +2628,7 @@ Supported step types: \`click\`, \`type\`, \`key\`, \`upload_files\`, \`pick_lis
           }
         } catch (e) {
           const message = e instanceof Error ? e.message : String(e)
+          const ambiguity = ambiguousOutcomeDetails(e)
           const elapsedMs = Number((performance.now() - startedAt).toFixed(1))
           const cumulativeMs = Number((performance.now() - batchStartedAt).toFixed(1))
           steps.push({
@@ -2515,7 +2639,15 @@ Supported step types: \`click\`, \`type\`, \`key\`, \`upload_files\`, \`pick_lis
             cumulativeMs,
             ...(uiTreeWaitMs > 0 ? { uiTreeWaitMs: Number(uiTreeWaitMs.toFixed(1)) } : {}),
             error: message,
+            ...(ambiguity ? ambiguousOutcomePayload(ambiguity) : {}),
           })
+          if (ambiguity) {
+            // Continuing would silently skip a mutation that may still land.
+            // Stop regardless of stopOnError and pin any resume to this step.
+            ambiguousAt = index
+            stoppedAt = index
+            break
+          }
           if (stopOnError) {
             stoppedAt = index
             break
@@ -2530,6 +2662,15 @@ Supported step types: \`click\`, \`type\`, \`key\`, \`upload_files\`, \`pick_lis
       const completed = errorCount === 0 && stoppedAt === undefined && pausedAt === undefined && startIndex + steps.length >= actions.length
       const resumePayload = {
         ...(startIndex > 0 ? { resumedFromIndex: startIndex } : {}),
+        ...(ambiguousAt !== undefined
+          ? {
+              ambiguous: true,
+              ambiguousAt,
+              resumeBlocked: true,
+              resumeFromIndex: ambiguousAt,
+              resumeInstruction: 'Do not skip this ambiguous step. Inspect the current UI; an identical retry will reuse its action identity when deduplication is supported.',
+            }
+          : {}),
         ...(pausedAt !== undefined
           ? {
               paused: true,
@@ -2641,8 +2782,7 @@ Unlike geometra_expand_section, this collapses repeated radio/button groups into
       isolated: z
         .boolean()
         .optional()
-        .default(false)
-        .describe('When auto-connecting via pageUrl/url, request an isolated proxy. See geometra_connect for details.'),
+        .describe('When auto-connecting via pageUrl/HTTP(S) url, use a fresh isolated Chromium by default. Pass false explicitly for sequential warm reuse.'),
       formId: z.string().optional().describe('Optional form id from geometra_page_model. If omitted, returns every form schema on the page.'),
       maxFields: z.number().int().min(1).max(120).optional().default(80).describe('Cap returned fields per form'),
       onlyRequiredFields: z.boolean().optional().default(false).describe('Only include required fields'),
@@ -2940,7 +3080,14 @@ After clicking, returns a compact semantic delta when possible (dialogs/forms/li
         ...(resolved.fallback ? { fallback: resolved.fallback } : {}),
       }
       if (wait.status === 'timed_out') {
-        return err(detailText(lines.filter(Boolean).join('\n'), { completed: false, outcome: 'unconfirmed', ...compact }, detail))
+        const guidance = ambiguousActionGuidance(wait)
+        return err(detailText([...lines.filter(Boolean), guidance].join('\n'), {
+          completed: false,
+          outcome: 'unconfirmed',
+          retrySafety: 'inspect-first',
+          guidance,
+          ...compact,
+        }, detail))
       }
       return ok(detailText(lines.filter(Boolean).join('\n'), compact, detail))
     }
@@ -2953,7 +3100,7 @@ After clicking, returns a compact semantic delta when possible (dialogs/forms/li
 
 Each character is sent as a key event through the geometry protocol. Returns a compact semantic delta when possible, otherwise a short current-UI overview.`,
     {
-      text: z.string().describe('Text to type into the focused element'),
+      text: z.string().max(65_536).describe('Text to type into the focused element (maximum 65,536 characters)'),
       timeoutMs: z
         .number()
         .int()
@@ -3619,14 +3766,20 @@ Returns \`{ pdf, pageUrl }\` where \`pdf\` is the base64-encoded PDF bytes.`,
 
   server.tool(
     'geometra_disconnect',
-    `Disconnect from the Geometra server. Proxy-backed sessions keep compatible browsers alive by default so the next geometra_connect can reuse them quickly; pass closeBrowser=true to fully tear down the warm proxy/browser pool.`,
+    'Disconnect one explicitly resolved Geometra session. Isolated browser sessions are always destroyed. A session created with isolated: false may return its browser to the warm pool; pass closeBrowser: true to destroy that session\'s browser only. This tool never closes another session\'s browser.',
     {
-      closeBrowser: z.boolean().optional().default(false).describe('Fully close the spawned proxy/browser instead of keeping it warm for reuse'),
+      closeBrowser: z.boolean().optional().default(false).describe("Destroy this session's spawned proxy/browser instead of returning an explicitly reusable browser to the warm pool"),
       sessionId: sessionIdInput,
     },
     async ({ closeBrowser, sessionId }) => {
-      disconnect({ closeProxy: closeBrowser, sessionId })
-      return ok(closeBrowser ? 'Disconnected and closed browser.' : 'Disconnected.')
+      const resolved = resolveToolSession(sessionId)
+      if ('error' in resolved) return resolved.error
+      const target = resolved.session
+      disconnect({ closeProxy: closeBrowser, sessionId: target.id })
+      const browserClosed = closeBrowser || target.isolated === true
+      return ok(browserClosed
+        ? `Disconnected session ${target.id} and closed its browser.`
+        : `Disconnected session ${target.id}; its explicitly reusable browser remains warm.`)
     }
   )
 
@@ -3677,20 +3830,40 @@ function connectPayload(
   }
 }
 
+function sessionHasFreshUi(session: Session): boolean {
+  // `ws` is required on real Sessions. The absence allowance keeps legacy
+  // in-process test doubles compatible while production always verifies the
+  // transport is OPEN, closing the CLOSING -> close-event stale-read window.
+  const transportOpen = !session.ws || session.ws.readyState === session.ws.OPEN
+  return transportOpen
+    && session.hasFreshFrame !== false
+    && Boolean(session.tree && session.layout)
+}
+
 function sessionA11y(session: Session): A11yNode | null {
-  if (!session.tree || !session.layout) return null
+  if (!sessionHasFreshUi(session)) return null
   if (session.cachedA11yRevision === session.updateRevision) {
     return session.cachedA11y ?? null
   }
-  const a11y = buildA11yTree(session.tree, session.layout)
+  const a11y = buildA11yTree(session.tree!, session.layout!)
   session.cachedA11y = a11y
   session.cachedA11yRevision = session.updateRevision
   return a11y
 }
 
 async function ensureSessionUiTree(session: Session, timeoutMs = 4_000): Promise<boolean> {
-  if (session.tree && session.layout) return true
-  return await waitForUiCondition(session, () => Boolean(session.tree && session.layout), timeoutMs)
+  if (sessionHasFreshUi(session)) return true
+  try {
+    await ensureSessionConnected(session)
+  } catch {
+    return false
+  }
+  if (sessionHasFreshUi(session)) return true
+  return await waitForUiCondition(
+    session,
+    () => sessionHasFreshUi(session),
+    timeoutMs,
+  )
 }
 
 async function sessionA11yWhenReady(session: Session, timeoutMs = 4_000): Promise<A11yNode | null> {
@@ -3897,7 +4070,7 @@ function deferredPageModelConnectPayload(
 ): Record<string, unknown> {
   return {
     deferred: true,
-    ready: Boolean(session.tree && session.layout),
+    ready: sessionHasFreshUi(session),
     tool: 'geometra_page_model',
     options: {
       maxPrimaryActions: options?.maxPrimaryActions ?? 6,
@@ -3935,7 +4108,7 @@ async function ensureToolSession(
     slowMo?: number
     stealth?: boolean
     awaitInitialFrame?: boolean
-    /** When true and an auto-connect is needed, request an isolated proxy. */
+    /** Browser auto-connects isolate unless the caller explicitly passes false. */
     isolated?: boolean
   },
   missingConnectionMessage = 'Not connected. Call geometra_connect first.',
@@ -3978,6 +4151,12 @@ async function ensureToolSession(
   const normalized = normalizeConnectTarget({ url: target.url, pageUrl: target.pageUrl })
   if (!normalized.ok) return { ok: false, error: normalized.error }
   const resolvedTarget = normalized.value
+  if (resolvedTarget.kind === 'ws' && target.isolated === true) {
+    return {
+      ok: false,
+      error: 'isolated:true is unsupported for direct ws:// endpoints because MCP does not own that browser/runtime. Use pageUrl/HTTP(S) url for an isolated browser, or omit isolated for the externally managed endpoint.',
+    }
+  }
 
   try {
     if (resolvedTarget.kind === 'proxy') {
@@ -3990,7 +4169,7 @@ async function ensureToolSession(
         slowMo: target.slowMo,
         ...(target.stealth !== undefined && { stealth: target.stealth }),
         awaitInitialFrame: target.awaitInitialFrame,
-        isolated: target.isolated,
+        isolated: target.isolated !== false,
       })
       return {
         ok: true,
@@ -4022,6 +4201,7 @@ async function ensureToolSession(
 function autoConnectionPayload(
   target:
     | {
+        session: Session
         autoConnected: boolean
         transport?: 'proxy' | 'ws'
         requestedPageUrl?: string
@@ -4033,6 +4213,7 @@ function autoConnectionPayload(
   if (!target?.autoConnected) return {}
   return {
     autoConnected: true,
+    sessionId: target.session.id,
     ...(target.transport ? { transport: target.transport } : {}),
     ...(target.requestedPageUrl ? { pageUrl: target.requestedPageUrl } : {}),
     ...(target.requestedWsUrl ? { requestedWsUrl: target.requestedWsUrl } : {}),
@@ -4064,8 +4245,8 @@ function postActionSummary(
   if (wait?.status === 'timed_out') {
     notes.push(
       detail === 'verbose'
-        ? `No frame or patch arrived within ${wait.timeoutMs}ms after the action. The action may still have succeeded if it did not change geometry or semantics.`
-        : `No update arrived within ${wait.timeoutMs}ms; the action may still have succeeded.`,
+        ? `No correlated terminal response arrived within ${wait.timeoutMs}ms. The action may still be running or may already have succeeded. ${ambiguousActionGuidance(wait)}`
+        : `No correlated response arrived within ${wait.timeoutMs}ms; the action may still have succeeded. Do not retry blindly.`,
     )
   }
   if (!after) return [...notes, 'No UI update received'].filter(Boolean).join('\n')
@@ -4460,7 +4641,11 @@ function fieldStatePayload(session: Session, fieldLabel: string, fieldKey?: stri
 
 function waitStatusPayload(wait: UpdateWaitResult | undefined): Record<string, unknown> {
   if (!wait) return {}
-  const payload: Record<string, unknown> = { wait: wait.status }
+  const payload: Record<string, unknown> = {
+    wait: wait.status,
+    requestId: wait.requestId,
+    actionId: wait.actionId,
+  }
   // Surface navigation info from proxy click handlers so callers can tell
   // when a click triggered a full-page nav (form submit → thank-you page).
   // Without this, the proxy session may die on the next request and the
@@ -4919,6 +5104,12 @@ function detailText(summary: string, compact: Record<string, unknown>, detail: R
   return detail === 'terse' ? JSON.stringify(compact) : summary
 }
 
+function ambiguousActionGuidance(wait: UpdateWaitResult): string {
+  return `Outcome is ambiguous for actionId ${wait.actionId} (requestId ${wait.requestId}). ` +
+    'Do not retry blindly or skip this step; inspect the current UI first. ' +
+    'An identical retry reuses the same action identity when the proxy supports deduplication.'
+}
+
 function actionWaitResponse(
   wait: UpdateWaitResult,
   summary: string,
@@ -4926,9 +5117,12 @@ function actionWaitResponse(
   detail: ResponseDetail,
 ) {
   if (wait.status === 'timed_out') {
-    return err(detailText(summary, {
+    const guidance = ambiguousActionGuidance(wait)
+    return err(detailText(`${summary}\n${guidance}`, {
       completed: false,
       outcome: 'unconfirmed',
+      retrySafety: 'inspect-first',
+      guidance,
       ...compact,
     }, detail))
   }
@@ -5417,6 +5611,7 @@ function resolveFillFieldInputs(
 }
 
 function canFallbackToSequentialFill(error: unknown): boolean {
+  if (ambiguousOutcomeDetails(error)) return false
   const message = error instanceof Error ? error.message : String(error)
   try {
     const parsed = JSON.parse(message) as Record<string, unknown>
@@ -5479,7 +5674,7 @@ async function tryBatchedResolvedFields(
   try {
     const startRevision = session.updateRevision
     const wait = await sendFillFields(session, toProxyFillFields(fields))
-    if (wait.status === 'timed_out') return { ok: false }
+    assertActionWaitConfirmed('Batched field fill', wait)
     const ackResult = parseProxyFillAckResult(wait.result)
     batchAckResult = ackResult
     if (ackResult && ackResult.invalidCount === 0) {
@@ -5590,9 +5785,61 @@ function assertBatchActionConfirmed(actionType: BatchAction['type'], wait: Updat
   assertActionWaitConfirmed(`${actionType} action`, wait)
 }
 
+class AmbiguousActionOutcomeError extends Error {
+  readonly wait: UpdateWaitResult
+
+  constructor(actionName: string, wait: UpdateWaitResult) {
+    super(`${actionName} timed out after ${wait.timeoutMs}ms; its outcome is unconfirmed. ${ambiguousActionGuidance(wait)}`)
+    this.name = 'AmbiguousActionOutcomeError'
+    this.wait = wait
+  }
+}
+
+interface AmbiguousOutcomeDetails {
+  wait?: UpdateWaitResult
+  requestId?: string
+  actionId?: string
+  code?: string
+}
+
+function ambiguousOutcomeDetails(error: unknown): AmbiguousOutcomeDetails | undefined {
+  if (error instanceof AmbiguousActionOutcomeError) {
+    return {
+      wait: error.wait,
+      requestId: error.wait.requestId,
+      actionId: error.wait.actionId,
+    }
+  }
+  if (!error || typeof error !== 'object') return undefined
+  const candidate = error as Record<string, unknown>
+  const code = typeof candidate.code === 'string' ? candidate.code : undefined
+  const requestId = typeof candidate.requestId === 'string' ? candidate.requestId : undefined
+  const actionId = typeof candidate.actionId === 'string' ? candidate.actionId : undefined
+  const message = typeof candidate.message === 'string' ? candidate.message : ''
+  if (
+    code !== 'ACTION_OUTCOME_AMBIGUOUS' &&
+    !(requestId && actionId && message.includes('Outcome is ambiguous'))
+  ) return undefined
+  return { ...(requestId ? { requestId } : {}), ...(actionId ? { actionId } : {}), ...(code ? { code } : {}) }
+}
+
+function ambiguousOutcomePayload(details: AmbiguousOutcomeDetails): Record<string, unknown> {
+  return {
+    outcome: 'unconfirmed',
+    retrySafety: 'inspect-first',
+    ...(details.wait ? waitStatusPayload(details.wait) : {}),
+    ...(!details.wait && details.requestId ? { requestId: details.requestId } : {}),
+    ...(!details.wait && details.actionId ? { actionId: details.actionId } : {}),
+    ...(details.code ? { code: details.code } : {}),
+    guidance: details.actionId && details.requestId
+      ? `Outcome is ambiguous for actionId ${details.actionId} (requestId ${details.requestId}). Do not retry blindly or skip this step; inspect the current UI first.`
+      : 'The action outcome is ambiguous. Do not retry blindly or skip this step; inspect the current UI first.',
+  }
+}
+
 function assertActionWaitConfirmed(actionName: string, wait: UpdateWaitResult): void {
   if (wait.status === 'timed_out') {
-    throw new Error(`${actionName} timed out after ${wait.timeoutMs}ms; its outcome is unconfirmed.`)
+    throw new AmbiguousActionOutcomeError(actionName, wait)
   }
 }
 
@@ -6012,7 +6259,7 @@ function suggestRecovery(field: ResolvedFillFieldInput, error: string): string |
   }
 
   if (lowerError.includes('timeout')) {
-    return `Action timed out. The page may still be loading. Try geometra_wait_for with a loading indicator, then retry.`
+    return 'Action timed out and may still complete. Do not retry blindly; inspect the current UI or wait for a loading indicator before repeating the identical action.'
   }
 
   return undefined

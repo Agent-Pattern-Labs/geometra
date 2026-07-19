@@ -48,6 +48,7 @@ const mockState = vi.hoisted(() => ({
   formSchemas: [] as Array<Record<string, unknown>>,
   connect: vi.fn(),
   connectThroughProxy: vi.fn(),
+  ensureSessionConnected: vi.fn(async () => {}),
   prewarmProxy: vi.fn(),
   sendClick: vi.fn(async () => ({ status: 'updated' as const, timeoutMs: 2000 })),
   sendType: vi.fn(async () => ({ status: 'updated' as const, timeoutMs: 2000 })),
@@ -86,6 +87,7 @@ function bumpMockUiRevision() {
 vi.mock('../session.js', () => ({
   connect: mockState.connect,
   connectThroughProxy: mockState.connectThroughProxy,
+  ensureSessionConnected: mockState.ensureSessionConnected,
   prewarmProxy: mockState.prewarmProxy,
   disconnect: vi.fn(),
   pruneDisconnectedSessions: vi.fn(() => []),

@@ -34,6 +34,9 @@ export const PROXY_PROTOCOL_VERSION = PROXY_ACTION_PROTOCOL_VERSION
 export interface ProxyProtocolCapabilities {
   transport: 'proxy'
   requestScopedAcks: true
+  actionDeadlines: true
+  idempotentRequestIds: true
+  atomicTypeText: true
   proxyActions: true
   exactFieldIdentity: true
 }
@@ -56,6 +59,7 @@ export type ClientEventMessage = {
   eventType: string
   x: number
   y: number
+  actionTimeoutMs?: number
   requestId?: string
   protocolVersion?: number
 }
@@ -69,6 +73,16 @@ export type ClientKeyMessage = {
   ctrlKey: boolean
   metaKey: boolean
   altKey: boolean
+  actionTimeoutMs?: number
+  requestId?: string
+  protocolVersion?: number
+}
+
+/** One deduplicated browser mutation for a bounded focused-element type. */
+export type ClientTypeTextMessage = {
+  type: 'typeText'
+  text: string
+  actionTimeoutMs?: number
   requestId?: string
   protocolVersion?: number
 }
@@ -78,6 +92,7 @@ export type ClientResizeMessage = {
   width: number
   height: number
   capabilities?: { binaryFraming?: boolean }
+  actionTimeoutMs?: number
   requestId?: string
   protocolVersion?: number
 }
@@ -85,6 +100,7 @@ export type ClientResizeMessage = {
 export type ClientNavigateMessage = {
   type: 'navigate'
   url: string
+  actionTimeoutMs?: number
   requestId?: string
   protocolVersion?: number
 }
@@ -93,6 +109,7 @@ export type ClientCompositionMessage = {
   type: 'composition'
   eventType: 'onCompositionStart' | 'onCompositionUpdate' | 'onCompositionEnd'
   data: string
+  actionTimeoutMs?: number
   requestId?: string
   protocolVersion?: number
 }
@@ -111,6 +128,7 @@ export type ClientFileMessage = {
   strategy?: 'auto' | 'chooser' | 'hidden' | 'drop'
   dropX?: number
   dropY?: number
+  actionTimeoutMs?: number
   requestId?: string
   protocolVersion?: number
 }
@@ -126,6 +144,7 @@ export type ClientSetFieldTextMessage = {
   typingDelayMs?: number
   /** Dispatch composition + input events before assignment (some IME-heavy controlled inputs). */
   imeFriendly?: boolean
+  actionTimeoutMs?: number
   requestId?: string
   protocolVersion?: number
 }
@@ -140,6 +159,7 @@ export type ClientSetFieldChoiceMessage = {
   query?: string
   choiceType?: ClientChoiceType
   exact?: boolean
+  actionTimeoutMs?: number
   requestId?: string
   protocolVersion?: number
 }
@@ -172,6 +192,7 @@ export type ClientFillField =
 export type ClientFillFieldsMessage = {
   type: 'fillFields'
   fields: ClientFillField[]
+  actionTimeoutMs?: number
   requestId?: string
   protocolVersion?: number
 }
@@ -186,6 +207,7 @@ export type ClientListboxPickMessage = {
   fieldKey?: ClientFieldKey
   fieldLabel?: string
   query?: string
+  actionTimeoutMs?: number
   requestId?: string
   protocolVersion?: number
 }
@@ -197,6 +219,7 @@ export type ClientSelectOptionMessage = {
   value?: string
   label?: string
   index?: number
+  actionTimeoutMs?: number
   requestId?: string
   protocolVersion?: number
 }
@@ -210,6 +233,7 @@ export type ClientSetCheckedMessage = {
   controlType?: 'checkbox' | 'radio'
   contextText?: string
   sectionText?: string
+  actionTimeoutMs?: number
   requestId?: string
   protocolVersion?: number
 }
@@ -220,6 +244,7 @@ export type ClientWheelMessage = {
   deltaY?: number
   x?: number
   y?: number
+  actionTimeoutMs?: number
   requestId?: string
   protocolVersion?: number
 }
@@ -235,6 +260,7 @@ export type ClientFillOtpMessage = {
   value: string
   fieldLabel?: string
   perCharDelayMs?: number
+  actionTimeoutMs?: number
   requestId?: string
   protocolVersion?: number
 }
@@ -251,6 +277,7 @@ export type ClientPdfGenerateMessage = {
   margin?: string
   /** Print background graphics. Defaults to true. */
   printBackground?: boolean
+  actionTimeoutMs?: number
   requestId?: string
   protocolVersion?: number
 }
@@ -258,6 +285,7 @@ export type ClientPdfGenerateMessage = {
 export type ParsedClientMessage =
   | ClientEventMessage
   | ClientKeyMessage
+  | ClientTypeTextMessage
   | ClientResizeMessage
   | ClientNavigateMessage
   | ClientCompositionMessage
@@ -288,8 +316,9 @@ const COMMON_MESSAGE_KEYS = new Set([
   'geometryProtocolVersion',
   'proxyActionProtocolVersion',
 ])
+const MUTATING_MESSAGE_KEYS = new Set([...COMMON_MESSAGE_KEYS, 'actionTimeoutMs'])
 const SET_CHECKED_MESSAGE_KEYS = new Set([
-  ...COMMON_MESSAGE_KEYS,
+  ...MUTATING_MESSAGE_KEYS,
   'label',
   'fieldKey',
   'checked',
@@ -298,22 +327,23 @@ const SET_CHECKED_MESSAGE_KEYS = new Set([
   'contextText',
   'sectionText',
 ])
-const FILL_FIELDS_MESSAGE_KEYS = new Set([...COMMON_MESSAGE_KEYS, 'fields'])
+const FILL_FIELDS_MESSAGE_KEYS = new Set([...MUTATING_MESSAGE_KEYS, 'fields'])
 const MESSAGE_KEYS = {
-  event: new Set([...COMMON_MESSAGE_KEYS, 'eventType', 'x', 'y']),
-  key: new Set([...COMMON_MESSAGE_KEYS, 'eventType', 'key', 'code', 'shiftKey', 'ctrlKey', 'metaKey', 'altKey']),
-  resize: new Set([...COMMON_MESSAGE_KEYS, 'width', 'height', 'capabilities']),
-  navigate: new Set([...COMMON_MESSAGE_KEYS, 'url']),
-  composition: new Set([...COMMON_MESSAGE_KEYS, 'eventType', 'data']),
-  file: new Set([...COMMON_MESSAGE_KEYS, 'paths', 'fieldId', 'fieldKey', 'x', 'y', 'fieldLabel', 'contextText', 'sectionText', 'exact', 'strategy', 'dropX', 'dropY']),
-  setFieldText: new Set([...COMMON_MESSAGE_KEYS, 'fieldId', 'fieldKey', 'fieldLabel', 'value', 'exact', 'typingDelayMs', 'imeFriendly']),
-  setFieldChoice: new Set([...COMMON_MESSAGE_KEYS, 'fieldId', 'fieldKey', 'fieldLabel', 'value', 'optionIndex', 'query', 'choiceType', 'exact']),
-  fillOtp: new Set([...COMMON_MESSAGE_KEYS, 'value', 'fieldLabel', 'perCharDelayMs']),
-  listboxPick: new Set([...COMMON_MESSAGE_KEYS, 'label', 'exact', 'openX', 'openY', 'fieldId', 'fieldKey', 'fieldLabel', 'query']),
-  selectOption: new Set([...COMMON_MESSAGE_KEYS, 'x', 'y', 'value', 'label', 'index']),
-  wheel: new Set([...COMMON_MESSAGE_KEYS, 'deltaX', 'deltaY', 'x', 'y']),
+  event: new Set([...MUTATING_MESSAGE_KEYS, 'eventType', 'x', 'y']),
+  key: new Set([...MUTATING_MESSAGE_KEYS, 'eventType', 'key', 'code', 'shiftKey', 'ctrlKey', 'metaKey', 'altKey']),
+  typeText: new Set([...MUTATING_MESSAGE_KEYS, 'text']),
+  resize: new Set([...MUTATING_MESSAGE_KEYS, 'width', 'height', 'capabilities']),
+  navigate: new Set([...MUTATING_MESSAGE_KEYS, 'url']),
+  composition: new Set([...MUTATING_MESSAGE_KEYS, 'eventType', 'data']),
+  file: new Set([...MUTATING_MESSAGE_KEYS, 'paths', 'fieldId', 'fieldKey', 'x', 'y', 'fieldLabel', 'contextText', 'sectionText', 'exact', 'strategy', 'dropX', 'dropY']),
+  setFieldText: new Set([...MUTATING_MESSAGE_KEYS, 'fieldId', 'fieldKey', 'fieldLabel', 'value', 'exact', 'typingDelayMs', 'imeFriendly']),
+  setFieldChoice: new Set([...MUTATING_MESSAGE_KEYS, 'fieldId', 'fieldKey', 'fieldLabel', 'value', 'optionIndex', 'query', 'choiceType', 'exact']),
+  fillOtp: new Set([...MUTATING_MESSAGE_KEYS, 'value', 'fieldLabel', 'perCharDelayMs']),
+  listboxPick: new Set([...MUTATING_MESSAGE_KEYS, 'label', 'exact', 'openX', 'openY', 'fieldId', 'fieldKey', 'fieldLabel', 'query']),
+  selectOption: new Set([...MUTATING_MESSAGE_KEYS, 'x', 'y', 'value', 'label', 'index']),
+  wheel: new Set([...MUTATING_MESSAGE_KEYS, 'deltaX', 'deltaY', 'x', 'y']),
   screenshot: new Set(COMMON_MESSAGE_KEYS),
-  pdfGenerate: new Set([...COMMON_MESSAGE_KEYS, 'html', 'format', 'landscape', 'margin', 'printBackground']),
+  pdfGenerate: new Set([...MUTATING_MESSAGE_KEYS, 'html', 'format', 'landscape', 'margin', 'printBackground']),
 }
 const FILL_FIELD_KEYS = {
   auto: new Set(['kind', 'fieldId', 'fieldKey', 'fieldLabel', 'value', 'exact']),
@@ -387,6 +417,15 @@ function hasValidCommonFields(record: UnknownRecord): boolean {
     isOptionalFiniteNumber(record.protocolVersion) &&
     isOptionalFiniteNumber(record.geometryProtocolVersion) &&
     isOptionalFiniteNumber(record.proxyActionProtocolVersion)
+}
+
+function hasValidMutatingFields(record: UnknownRecord): boolean {
+  return hasValidCommonFields(record) &&
+    (record.actionTimeoutMs === undefined || (
+      typeof record.actionTimeoutMs === 'number' &&
+      Number.isSafeInteger(record.actionTimeoutMs) &&
+      record.actionTimeoutMs >= 0
+    ))
 }
 
 function hasValidFileTargetContract(record: UnknownRecord): boolean {
@@ -467,7 +506,13 @@ export function isKeyMessage(msg: ParsedClientMessage): msg is ClientKeyMessage 
     typeof record.key === 'string' && typeof record.code === 'string' &&
     typeof record.shiftKey === 'boolean' && typeof record.ctrlKey === 'boolean' &&
     typeof record.metaKey === 'boolean' && typeof record.altKey === 'boolean' &&
-    hasValidCommonFields(record)
+    hasValidMutatingFields(record)
+}
+
+export function isTypeTextMessage(msg: ParsedClientMessage): msg is ClientTypeTextMessage {
+  const record = asRecord(msg)
+  return !!record && record.type === 'typeText' && hasOnlyKeys(record, MESSAGE_KEYS.typeText) &&
+    typeof record.text === 'string' && record.text.length <= 65_536 && hasValidMutatingFields(record)
 }
 
 export function isResizeMessage(msg: ParsedClientMessage): msg is ClientResizeMessage {
@@ -477,26 +522,26 @@ export function isResizeMessage(msg: ParsedClientMessage): msg is ClientResizeMe
     (record.capabilities === undefined || (
       !!asRecord(record.capabilities) && hasOnlyKeys(record.capabilities as UnknownRecord, new Set(['binaryFraming'])) &&
       isOptionalBoolean((record.capabilities as UnknownRecord).binaryFraming)
-    )) && hasValidCommonFields(record)
+    )) && hasValidMutatingFields(record)
 }
 
 export function isNavigateMessage(msg: ParsedClientMessage): msg is ClientNavigateMessage {
   const record = asRecord(msg)
   return !!record && record.type === 'navigate' && hasOnlyKeys(record, MESSAGE_KEYS.navigate) &&
-    isTrimmedNonEmptyString(record.url) && hasValidCommonFields(record)
+    isTrimmedNonEmptyString(record.url) && hasValidMutatingFields(record)
 }
 
 export function isClickEventMessage(msg: ParsedClientMessage): msg is ClientEventMessage {
   const record = asRecord(msg)
   return !!record && record.type === 'event' && hasOnlyKeys(record, MESSAGE_KEYS.event) && record.eventType === 'onClick' &&
-    isFiniteNumber(record.x) && isFiniteNumber(record.y) && hasValidCommonFields(record)
+    isFiniteNumber(record.x) && isFiniteNumber(record.y) && hasValidMutatingFields(record)
 }
 
 export function isCompositionMessage(msg: ParsedClientMessage): msg is ClientCompositionMessage {
   const record = asRecord(msg)
   return !!record && record.type === 'composition' && hasOnlyKeys(record, MESSAGE_KEYS.composition) &&
     (record.eventType === 'onCompositionStart' || record.eventType === 'onCompositionUpdate' || record.eventType === 'onCompositionEnd') &&
-    typeof record.data === 'string' && hasValidCommonFields(record)
+    typeof record.data === 'string' && hasValidMutatingFields(record)
 }
 
 export function isFileMessage(msg: ParsedClientMessage): msg is ClientFileMessage {
@@ -512,7 +557,7 @@ export function isFileMessage(msg: ParsedClientMessage): msg is ClientFileMessag
     isOptionalBoolean(record.exact) &&
     (record.strategy === undefined || record.strategy === 'auto' || record.strategy === 'chooser' || record.strategy === 'hidden' || record.strategy === 'drop') &&
     isOptionalFiniteNumber(record.dropX) && isOptionalFiniteNumber(record.dropY) &&
-    hasValidFileTargetContract(record) && hasValidCommonFields(record)
+    hasValidFileTargetContract(record) && hasValidMutatingFields(record)
 }
 
 export function isSetFieldTextMessage(msg: ParsedClientMessage): msg is ClientSetFieldTextMessage {
@@ -523,7 +568,7 @@ export function isSetFieldTextMessage(msg: ParsedClientMessage): msg is ClientSe
     (record.fieldId === undefined || isTrimmedNonEmptyString(record.fieldId)) &&
     (record.fieldKey === undefined || isClientFieldKey(record.fieldKey)) &&
     isOptionalBoolean(record.exact) && isOptionalFiniteNumber(record.typingDelayMs) &&
-    isOptionalBoolean(record.imeFriendly) && hasValidCommonFields(record)
+    isOptionalBoolean(record.imeFriendly) && hasValidMutatingFields(record)
 }
 
 export function isSetFieldChoiceMessage(msg: ParsedClientMessage): msg is ClientSetFieldChoiceMessage {
@@ -536,14 +581,14 @@ export function isSetFieldChoiceMessage(msg: ParsedClientMessage): msg is Client
     (record.optionIndex === undefined || (isFiniteNumber(record.optionIndex) && Number.isInteger(record.optionIndex) && record.optionIndex >= 0)) &&
     isOptionalTrimmedString(record.query) && isOptionalBoolean(record.exact) &&
     (record.choiceType === undefined || record.choiceType === 'select' || record.choiceType === 'group' || record.choiceType === 'listbox') &&
-    hasValidCommonFields(record)
+    hasValidMutatingFields(record)
 }
 
 export function isFillFieldsMessage(msg: ParsedClientMessage): msg is ClientFillFieldsMessage {
   const record = asRecord(msg)
   return !!record && record.type === 'fillFields' && hasOnlyKeys(record, FILL_FIELDS_MESSAGE_KEYS) &&
     Array.isArray(record.fields) && record.fields.length > 0 &&
-    record.fields.every(isClientFillField) && hasValidCommonFields(record)
+    record.fields.every(isClientFillField) && hasValidMutatingFields(record)
 }
 
 export function isFillOtpMessage(msg: ParsedClientMessage): msg is ClientFillOtpMessage {
@@ -551,7 +596,7 @@ export function isFillOtpMessage(msg: ParsedClientMessage): msg is ClientFillOtp
   return !!record && record.type === 'fillOtp' && hasOnlyKeys(record, MESSAGE_KEYS.fillOtp) &&
     isTrimmedNonEmptyString(record.value) &&
     isOptionalTrimmedString(record.fieldLabel) && isOptionalFiniteNumber(record.perCharDelayMs) &&
-    hasValidCommonFields(record)
+    hasValidMutatingFields(record)
 }
 
 export function isSelectOptionMessage(msg: ParsedClientMessage): msg is ClientSelectOptionMessage {
@@ -561,14 +606,14 @@ export function isSelectOptionMessage(msg: ParsedClientMessage): msg is ClientSe
     (record.value === undefined || typeof record.value === 'string') &&
     (record.label === undefined || typeof record.label === 'string') &&
     (record.index === undefined || (isFiniteNumber(record.index) && Number.isInteger(record.index) && record.index >= 0)) &&
-    (record.value !== undefined || record.label !== undefined || record.index !== undefined) && hasValidCommonFields(record)
+    (record.value !== undefined || record.label !== undefined || record.index !== undefined) && hasValidMutatingFields(record)
 }
 
 export function isWheelMessage(msg: ParsedClientMessage): msg is ClientWheelMessage {
   const record = asRecord(msg)
   return !!record && record.type === 'wheel' && hasOnlyKeys(record, MESSAGE_KEYS.wheel) && isOptionalFiniteNumber(record.deltaX) &&
     isOptionalFiniteNumber(record.deltaY) && isOptionalFiniteNumber(record.x) && isOptionalFiniteNumber(record.y) &&
-    (record.deltaX !== undefined || record.deltaY !== undefined) && hasValidCommonFields(record)
+    (record.deltaX !== undefined || record.deltaY !== undefined) && hasValidMutatingFields(record)
 }
 
 export function isListboxPickMessage(msg: ParsedClientMessage): msg is ClientListboxPickMessage {
@@ -579,7 +624,7 @@ export function isListboxPickMessage(msg: ParsedClientMessage): msg is ClientLis
     (record.fieldId === undefined || isTrimmedNonEmptyString(record.fieldId)) &&
     (record.fieldKey === undefined || isClientFieldKey(record.fieldKey)) &&
     isOptionalTrimmedString(record.fieldLabel) && isOptionalTrimmedString(record.query) &&
-    hasValidListboxTargetContract(record) && hasValidCommonFields(record)
+    hasValidListboxTargetContract(record) && hasValidMutatingFields(record)
 }
 
 export function isSetCheckedMessage(msg: ParsedClientMessage): msg is ClientSetCheckedMessage {
@@ -590,7 +635,7 @@ export function isSetCheckedMessage(msg: ParsedClientMessage): msg is ClientSetC
     isOptionalBoolean(record.checked) && isOptionalBoolean(record.exact) &&
     (record.controlType === undefined || record.controlType === 'checkbox' || record.controlType === 'radio') &&
     isOptionalTrimmedString(record.contextText) && isOptionalTrimmedString(record.sectionText) &&
-    hasValidCommonFields(record)
+    hasValidMutatingFields(record)
 }
 
 export function isScreenshotMessage(msg: ParsedClientMessage): msg is ClientScreenshotMessage {
@@ -604,12 +649,13 @@ export function isPdfGenerateMessage(msg: ParsedClientMessage): msg is ClientPdf
     (record.html === undefined || typeof record.html === 'string') &&
     (record.format === undefined || record.format === 'A4' || record.format === 'Letter') &&
     isOptionalBoolean(record.landscape) && isOptionalTrimmedString(record.margin) &&
-    isOptionalBoolean(record.printBackground) && hasValidCommonFields(record)
+    isOptionalBoolean(record.printBackground) && hasValidMutatingFields(record)
 }
 
 const KNOWN_CLIENT_MESSAGE_TYPES = new Set([
   'event',
   'key',
+  'typeText',
   'resize',
   'navigate',
   'composition',
@@ -631,7 +677,7 @@ export function clientMessageValidationError(msg: ParsedClientMessage): string |
   const record = asRecord(msg)
   if (!record || typeof record.type !== 'string') return 'Invalid client message: expected an object with a string type'
 
-  const valid = isClickEventMessage(msg) || isKeyMessage(msg) || isResizeMessage(msg) ||
+  const valid = isClickEventMessage(msg) || isKeyMessage(msg) || isTypeTextMessage(msg) || isResizeMessage(msg) ||
     isNavigateMessage(msg) || isCompositionMessage(msg) || isFileMessage(msg) ||
     isSetFieldTextMessage(msg) || isSetFieldChoiceMessage(msg) || isFillFieldsMessage(msg) ||
     isFillOtpMessage(msg) || isListboxPickMessage(msg) || isSelectOptionMessage(msg) ||
@@ -640,6 +686,16 @@ export function clientMessageValidationError(msg: ParsedClientMessage): string |
 
   if (!KNOWN_CLIENT_MESSAGE_TYPES.has(record.type)) {
     return `Unsupported client message type "${record.type}"`
+  }
+  if (record.type === 'typeText' && (typeof record.text !== 'string' || record.text.length > 65_536)) {
+    return 'Invalid typeText message: text must be a string no longer than 65,536 characters'
+  }
+  if (record.type !== 'screenshot' && record.actionTimeoutMs !== undefined && (
+    typeof record.actionTimeoutMs !== 'number' ||
+    !Number.isSafeInteger(record.actionTimeoutMs) ||
+    record.actionTimeoutMs < 0
+  )) {
+    return `Invalid ${record.type} message: actionTimeoutMs must be a non-negative safe integer`
   }
   if (record.type === 'setChecked') {
     if (!isTrimmedNonEmptyString(record.label)) {

@@ -18,14 +18,14 @@ Geometra proxy:       Chromium → DOM geometry → same WebSocket as native →
 
 Use Geometra MCP when an LLM needs to explore, interpret, and operate a real UI with compact semantic state instead of repeatedly consuming large browser snapshots. Keep Playwright-style tooling for deterministic scripts, DOM-oriented test automation, and compatibility fallback paths while Geometra closes remaining live-site gaps.
 
-Proxy-backed sessions stay warm by default on disconnect, and MCP now keeps a small warm pool so compatible headed, headless, and stealth workflows do not immediately evict each other.
+Proxy-backed browser sessions are isolated by default: each `pageUrl`/HTTP(S) connect gets a fresh Chromium that is destroyed on disconnect, and follow-up tools must use the returned `sessionId`. Pass `isolated: false` only when you intentionally want sequential warm-browser reuse, including shared cookies, localStorage, and page state. A browser prepared with `geometra_prepare_browser` is consumed only by a connect that explicitly opts into that warm pool.
 
 ## Tools
 
 | Tool | Description |
 |---|---|
 | `geometra_connect` | Connect with `url` (ws://…) **or** `pageUrl` (https://…) to auto-start geometra-proxy; pass `browserMode: "stock" | "cloakbrowser"` for explicit authorized testing modes; can inline `formSchema` and/or `pageModel`, or defer the page model for a faster first connect response |
-| `geometra_prepare_browser` | Pre-launch and pre-navigate a reusable proxy/browser for `pageUrl` without creating an active session; supports the same headed/headless/stealth browser settings as `geometra_connect` |
+| `geometra_prepare_browser` | Pre-launch and pre-navigate a reusable proxy/browser for `pageUrl` without creating an active session; the consuming connect must pass `isolated: false` explicitly |
 | `geometra_query` | Find elements by stable id, role, name, text content, prompt/section/item context, current value, or semantic state such as `invalid`, `required`, or `busy` |
 | `geometra_wait_for` | Wait for a semantic condition instead of guessing sleeps (`busy`, `disabled`, alerts, values, etc.). **Strict parameters** — use `text` plus `present: false` to wait until a substring disappears (e.g. “Parsing your resume”); there is no `textGone` field |
 | `geometra_wait_for_resume_parse` | Convenience wait until a parsing banner is gone (defaults: `text`: `"Parsing"`, `present` implied false). Same engine as `geometra_wait_for` |

@@ -1,4 +1,4 @@
-import { randomBytes, timingSafeEqual } from 'node:crypto'
+import { createHash, randomBytes, timingSafeEqual } from 'node:crypto'
 import { performance } from 'node:perf_hooks'
 import type { Page } from 'playwright'
 import { WebSocketServer, type WebSocket } from 'ws'
@@ -29,6 +29,7 @@ import {
   isFillOtpMessage,
   isFileMessage,
   isKeyMessage,
+  isTypeTextMessage,
   isListboxPickMessage,
   isNavigateMessage,
   isResizeMessage,
@@ -47,10 +48,16 @@ import {
 const DOM_OBSERVER_BINDINGS = new WeakSet<Page>()
 const DEFAULT_PROXY_HOST = '127.0.0.1'
 const DEFAULT_MAX_PAYLOAD_BYTES = 4 * 1024 * 1024
+const DEFAULT_ACTION_REQUEST_LEDGER_ENTRIES = 65_536
+/** A completed action must not be starved by a page that mutates forever. */
+const MAX_INPUT_ACK_LATENCY_MS = 250
 const PROXY_PROTOCOL_CAPABILITIES = {
   transport: 'proxy',
   authenticatedController: true,
   requestScopedAcks: true,
+  actionDeadlines: true,
+  idempotentRequestIds: true,
+  atomicTypeText: true,
   proxyActions: true,
   exactFieldIdentity: true,
 } as const
@@ -119,6 +126,119 @@ interface PendingInputAck {
    * newer extraction so callers never treat a pre-action snapshot as fresh.
    */
   afterExtractSequence: number
+}
+
+type ActionRequestReservation = 'accepted' | 'duplicate' | 'conflict' | 'capacity'
+
+/**
+ * Hub-scoped, bounded request-id memory. The ledger retains only fixed-size
+ * SHA-256 digests, never action payloads or field values.
+ */
+export interface ActionRequestLedger {
+  remember: (requestId: string, payload: ParsedClientMessage) => ActionRequestReservation
+  complete: (requestId: string) => void
+}
+
+function canonicalJson(value: unknown): string {
+  if (Array.isArray(value)) {
+    return `[${value.map(canonicalJson).join(',')}]`
+  }
+  if (value !== null && typeof value === 'object') {
+    const record = value as Record<string, unknown>
+    return `{${Object.keys(record)
+      .sort()
+      .map(key => `${JSON.stringify(key)}:${canonicalJson(record[key])}`)
+      .join(',')}}`
+  }
+  return JSON.stringify(value) ?? 'null'
+}
+
+function sha256(value: string): string {
+  return createHash('sha256').update(value).digest('hex')
+}
+
+const ACTION_FINGERPRINT_TRANSPORT_KEYS = new Set([
+  'requestId',
+  'actionTimeoutMs',
+  'protocolVersion',
+  'geometryProtocolVersion',
+  'proxyActionProtocolVersion',
+])
+
+function actionPayloadFingerprint(payload: ParsedClientMessage): string {
+  const semanticPayload = Object.fromEntries(
+    Object.entries(payload).filter(([key]) => !ACTION_FINGERPRINT_TRANSPORT_KEYS.has(key)),
+  )
+  return sha256(canonicalJson(semanticPayload))
+}
+
+export function createActionRequestLedger(
+  maxEntries = DEFAULT_ACTION_REQUEST_LEDGER_ENTRIES,
+): ActionRequestLedger {
+  if (!Number.isSafeInteger(maxEntries) || maxEntries < 1) {
+    throw new Error('Action request ledger size must be a positive safe integer')
+  }
+  const entries = new Map<string, { fingerprint: string; state: 'live' | 'terminal' }>()
+  return {
+    remember(requestId, payload) {
+      // Hash request IDs as well as payloads so every retained entry has a
+      // fixed upper memory bound even when a peer sends an unusually long ID.
+      const requestKey = sha256(requestId)
+      const payloadFingerprint = actionPayloadFingerprint(payload)
+      const remembered = entries.get(requestKey)
+      if (remembered !== undefined) {
+        return remembered.fingerprint === payloadFingerprint ? 'duplicate' : 'conflict'
+      }
+      if (entries.size >= maxEntries) {
+        // Terminal means only that the handler returned; it does not prove
+        // the controller received the correlated ACK. Never evict a request
+        // ID within a runtime, or an ambiguous retry could mutate twice.
+        return 'capacity'
+      }
+      entries.set(requestKey, { fingerprint: payloadFingerprint, state: 'live' })
+      return 'accepted'
+    },
+    complete(requestId) {
+      const requestKey = sha256(requestId)
+      const remembered = entries.get(requestKey)
+      if (!remembered || remembered.state === 'terminal') return
+      entries.delete(requestKey)
+      entries.set(requestKey, { ...remembered, state: 'terminal' })
+    },
+  }
+}
+
+const MUTATING_CLIENT_MESSAGE_TYPES = new Set([
+  'event',
+  'key',
+  'typeText',
+  'resize',
+  'navigate',
+  'composition',
+  'file',
+  'setFieldText',
+  'setFieldChoice',
+  'fillFields',
+  'fillOtp',
+  'listboxPick',
+  'selectOption',
+  'setChecked',
+  'wheel',
+  'pdfGenerate',
+])
+
+function isMutatingClientMessage(msg: ParsedClientMessage): boolean {
+  return MUTATING_CLIENT_MESSAGE_TYPES.has(msg.type)
+}
+
+class ActionDeadlineExpiredError extends Error {}
+
+function assertActionDeadline(msg: ParsedClientMessage, receivedAt: number): void {
+  if (!isMutatingClientMessage(msg)) return
+  const actionTimeoutMs = (msg as { actionTimeoutMs?: number }).actionTimeoutMs
+  if (actionTimeoutMs !== undefined && performance.now() - receivedAt >= actionTimeoutMs) {
+    throw new ActionDeadlineExpiredError('Action deadline expired; request was not executed')
+  }
 }
 
 function isProtocolCompatible(peerVersion: number | undefined): boolean {
@@ -221,12 +341,18 @@ export async function handleClientMessage(
   waitForBeforeInput: () => Promise<void>,
   onViewportOrInput: (kind: 'resize' | 'input', requestId?: string, result?: unknown) => void,
   onHandlerError: (err: unknown) => void,
-  security?: { allowedFileRoots?: string[] },
+  security?: { allowedFileRoots?: string[]; actionRequestLedger?: ActionRequestLedger; receivedAt?: number },
 ): Promise<void> {
-  const sendWireError = (message: string, requestId?: string) => {
+  const receivedAt = security?.receivedAt ?? performance.now()
+  const sendWireError = (
+    message: string,
+    requestId?: string,
+    code?: 'DUPLICATE_REQUEST' | 'REQUEST_ID_CONFLICT' | 'REQUEST_LEDGER_CAPACITY' | 'ACTION_EXPIRED' | 'ACTION_OUTCOME_AMBIGUOUS',
+  ) => {
     ws.send(JSON.stringify({
       type: 'error',
       message,
+      ...(code ? { code } : {}),
       ...(requestId ? { requestId } : {}),
       ...PROXY_ACTION_METADATA,
     }))
@@ -260,20 +386,57 @@ export async function handleClientMessage(
     return
   }
 
+  // Reserve the request ID before consulting its deadline. An expired replay
+  // must be reported as a duplicate/conflict and must never become eligible
+  // to mutate merely because the original deadline elapsed.
+  let acceptedRequestId: string | undefined
+  if (requestId && isMutatingClientMessage(msg) && security?.actionRequestLedger) {
+    const reservation = security.actionRequestLedger.remember(requestId, msg)
+    if (reservation === 'duplicate') {
+      sendWireError('Duplicate requestId; action was not repeated', requestId, 'DUPLICATE_REQUEST')
+      return
+    }
+    if (reservation === 'conflict') {
+      sendWireError(
+        'requestId was already used with a different payload; action was not executed',
+        requestId,
+        'REQUEST_ID_CONFLICT',
+      )
+      return
+    }
+    if (reservation === 'capacity') {
+      sendWireError(
+        'Action request ledger is at capacity; action was not executed. Close and reconnect the proxy runtime before sending more actions.',
+        requestId,
+        'REQUEST_LEDGER_CAPACITY',
+      )
+      return
+    }
+    acceptedRequestId = requestId
+  }
+
   try {
+    // These guards do not cancel an action that already started. They prevent
+    // queued work from beginning after the receipt-relative timeout.
+    assertActionDeadline(msg, receivedAt)
     const page = await waitForPage()
+    assertActionDeadline(msg, receivedAt)
     if (isResizeMessage(msg)) {
       const w = Math.max(1, Math.floor(msg.width))
       const h = Math.max(1, Math.floor(msg.height))
+      assertActionDeadline(msg, receivedAt)
       await page.setViewportSize({ width: w, height: h })
       onViewportOrInput('resize', requestId)
       return
     }
 
+    assertActionDeadline(msg, receivedAt)
     await waitForBeforeInput()
+    assertActionDeadline(msg, receivedAt)
 
     if (isNavigateMessage(msg)) {
       clearFillLookupCache(fieldLookupCache)
+      assertActionDeadline(msg, receivedAt)
       await page.goto(msg.url, { waitUntil: 'domcontentloaded', timeout: 60_000 })
       onViewportOrInput('input', requestId, { pageUrl: page.url() })
       return
@@ -291,6 +454,7 @@ export async function handleClientMessage(
         // "session crashed for unknown reason". Bug surfaced by JobForge
         // round-2 marathon — Cloudflare FDE NYC #312 and Airtable PM AI #94.
         const urlBefore = page.url()
+        assertActionDeadline(msg, receivedAt)
         await page.mouse.click(x, y)
         // Give the navigation a brief window to start. We don't await
         // waitForNavigation here because most clicks DON'T navigate, and
@@ -320,7 +484,15 @@ export async function handleClientMessage(
     }
 
     if (isKeyMessage(msg)) {
+      assertActionDeadline(msg, receivedAt)
       await applyKeyPhase(page, msg)
+      onViewportOrInput('input', requestId)
+      return
+    }
+
+    if (isTypeTextMessage(msg)) {
+      assertActionDeadline(msg, receivedAt)
+      await page.keyboard.type(msg.text)
       onViewportOrInput('input', requestId)
       return
     }
@@ -328,6 +500,7 @@ export async function handleClientMessage(
     if (isCompositionMessage(msg)) {
       const data = typeof msg.data === 'string' ? msg.data : ''
       if (msg.eventType === 'onCompositionUpdate' || msg.eventType === 'onCompositionEnd') {
+        assertActionDeadline(msg, receivedAt)
         await page.keyboard.insertText(data)
         onViewportOrInput('input', requestId)
       }
@@ -336,6 +509,7 @@ export async function handleClientMessage(
 
     if (isFileMessage(msg)) {
       const paths = resolveExistingFiles(msg.paths, security?.allowedFileRoots)
+      assertActionDeadline(msg, receivedAt)
       await attachFiles(page, paths, {
         clickX: msg.x,
         clickY: msg.y,
@@ -354,6 +528,7 @@ export async function handleClientMessage(
     }
 
     if (isSetFieldTextMessage(msg)) {
+      assertActionDeadline(msg, receivedAt)
       await setFieldText(page, msg.fieldLabel, msg.value, {
         fieldId: msg.fieldId,
         fieldKey: msg.fieldKey,
@@ -367,6 +542,7 @@ export async function handleClientMessage(
     }
 
     if (isSetFieldChoiceMessage(msg)) {
+      assertActionDeadline(msg, receivedAt)
       await setFieldChoice(page, msg.fieldLabel, msg.value, {
         fieldId: msg.fieldId,
         fieldKey: msg.fieldKey,
@@ -384,6 +560,7 @@ export async function handleClientMessage(
       const authorizedFields = msg.fields.map(field => field.kind === 'file'
         ? { ...field, paths: resolveExistingFiles(field.paths, security?.allowedFileRoots) }
         : field)
+      assertActionDeadline(msg, receivedAt)
       await fillFields(page, authorizedFields, fieldLookupCache)
       const result = await fillFieldsAckResult(page)
       onViewportOrInput('input', requestId, result)
@@ -391,6 +568,7 @@ export async function handleClientMessage(
     }
 
     if (isFillOtpMessage(msg)) {
+      assertActionDeadline(msg, receivedAt)
       const result = await fillOtp(page, msg.value, {
         fieldLabel: msg.fieldLabel,
         perCharDelayMs: msg.perCharDelayMs,
@@ -404,6 +582,7 @@ export async function handleClientMessage(
     }
 
     if (isListboxPickMessage(msg)) {
+      assertActionDeadline(msg, receivedAt)
       await pickListboxOption(page, msg.label, {
         exact: msg.exact,
         openX: msg.openX,
@@ -419,6 +598,7 @@ export async function handleClientMessage(
     }
 
     if (isSelectOptionMessage(msg)) {
+      assertActionDeadline(msg, receivedAt)
       await selectNativeOption(page, msg.x, msg.y, {
         value: msg.value,
         label: msg.label,
@@ -429,6 +609,7 @@ export async function handleClientMessage(
     }
 
     if (isSetCheckedMessage(msg)) {
+      assertActionDeadline(msg, receivedAt)
       await setCheckedControl(page, msg.label, {
         fieldKey: msg.fieldKey,
         checked: msg.checked,
@@ -446,6 +627,7 @@ export async function handleClientMessage(
       const dy = typeof msg.deltaY === 'number' && Number.isFinite(msg.deltaY) ? msg.deltaY : 0
       const x = typeof msg.x === 'number' && Number.isFinite(msg.x) ? msg.x : undefined
       const y = typeof msg.y === 'number' && Number.isFinite(msg.y) ? msg.y : undefined
+      assertActionDeadline(msg, receivedAt)
       await wheelAt(page, dx, dy, x, y)
       onViewportOrInput('input', requestId)
       return
@@ -466,9 +648,11 @@ export async function handleClientMessage(
       const margin = { top: marginValue, right: marginValue, bottom: marginValue, left: marginValue }
 
       if (msg.html) {
+        assertActionDeadline(msg, receivedAt)
         await page.setContent(msg.html, { waitUntil: 'networkidle', timeout: 30_000 })
       }
 
+      assertActionDeadline(msg, receivedAt)
       const buffer = await page.pdf({
         format,
         landscape,
@@ -482,8 +666,18 @@ export async function handleClientMessage(
 
     sendWireError(`Unsupported client message type "${msg.type}"`, requestId)
   } catch (err) {
-    onHandlerError(err)
-    sendWireError(err instanceof Error ? err.message : String(err), requestId)
+    if (!(err instanceof ActionDeadlineExpiredError)) onHandlerError(err)
+    sendWireError(
+      err instanceof Error ? err.message : String(err),
+      requestId,
+      err instanceof ActionDeadlineExpiredError
+        ? 'ACTION_EXPIRED'
+        : acceptedRequestId
+          ? 'ACTION_OUTCOME_AMBIGUOUS'
+          : undefined,
+    )
+  } finally {
+    if (acceptedRequestId) security?.actionRequestLedger?.complete(acceptedRequestId)
   }
 }
 
@@ -705,6 +899,7 @@ export function startGeometryWebSocket(options: {
   let prevTreeJson: string | null = null
 
   let debounceTimer: ReturnType<typeof setTimeout> | null = null
+  let inputAckFlushTimer: ReturnType<typeof setTimeout> | null = null
   let extracting = false
   let pendingExtract = false
   let extractSequence = 0
@@ -712,6 +907,7 @@ export function startGeometryWebSocket(options: {
   let actionQueue: Promise<void> = Promise.resolve()
   let pendingInputAcks: PendingInputAck[] = []
   const fieldLookupCache = createFillLookupCache()
+  const actionRequestLedger = createActionRequestLedger()
   const beforeInput = options.beforeInput?.then(() => undefined)
   const trace: GeometryWsTrace = { extractCount: 0 }
   const pagePromise = Promise.resolve(options.page)
@@ -749,6 +945,11 @@ export function startGeometryWebSocket(options: {
         }))
       }
     }
+    if (pendingInputAcks.length === 0) {
+      clearInputAckFlushTimer()
+    } else {
+      armInputAckFlushTimer()
+    }
   }
 
   function sendPendingInputErrors(message: string) {
@@ -762,11 +963,13 @@ export function startGeometryWebSocket(options: {
 
     const pending = pendingInputAcks
     pendingInputAcks = []
+    clearInputAckFlushTimer()
     for (const { ws, requestId } of pending) {
       if (ws.readyState === ws.OPEN) {
         ws.send(JSON.stringify({
           type: 'error',
           message,
+          code: 'ACTION_OUTCOME_AMBIGUOUS',
           ...(requestId ? { requestId } : {}),
           ...PROXY_ACTION_METADATA,
         }))
@@ -885,16 +1088,49 @@ export function startGeometryWebSocket(options: {
     return changed
   }
 
+  function clearDebounceTimer() {
+    if (debounceTimer !== null) {
+      clearTimeout(debounceTimer)
+      debounceTimer = null
+    }
+  }
+
+  function clearInputAckFlushTimer() {
+    if (inputAckFlushTimer !== null) {
+      clearTimeout(inputAckFlushTimer)
+      inputAckFlushTimer = null
+    }
+  }
+
+  function runScheduledExtract() {
+    void runExtractQueued()
+      .then(() => {
+        sendPendingInputAcks()
+      })
+      .catch(err => options.onError?.(err))
+  }
+
+  function flushDebouncedExtract() {
+    clearDebounceTimer()
+    runScheduledExtract()
+  }
+
+  function armInputAckFlushTimer() {
+    if (pendingInputAcks.length === 0 || inputAckFlushTimer !== null) return
+    // This timer is anchored to the first pending action ack and is never
+    // reset by page mutations. Mutation-only traffic does not arm it, so an
+    // animated page retains the normal trailing-edge debounce behavior.
+    inputAckFlushTimer = setTimeout(() => {
+      inputAckFlushTimer = null
+      if (pendingInputAcks.length === 0) return
+      clearDebounceTimer()
+      runScheduledExtract()
+    }, MAX_INPUT_ACK_LATENCY_MS)
+  }
+
   function scheduleExtract() {
     if (debounceTimer !== null) clearTimeout(debounceTimer)
-    debounceTimer = setTimeout(() => {
-      debounceTimer = null
-      void runExtractQueued()
-        .then(() => {
-          sendPendingInputAcks()
-        })
-        .catch(err => options.onError?.(err))
-    }, debounceMs)
+    debounceTimer = setTimeout(flushDebouncedExtract, debounceMs)
   }
 
   wss.on('listening', () => {
@@ -931,6 +1167,10 @@ export function startGeometryWebSocket(options: {
       if (ws.readyState === ws.OPEN) ws.send(text)
     }
     ws.on('message', (raw) => {
+      // Capture receipt before queueing so actionTimeoutMs includes time spent
+      // waiting behind earlier Playwright work and uses this host's monotonic
+      // clock rather than trusting the controller's wall clock.
+      const receivedAt = performance.now()
       actionQueue = actionQueue
         .then(() =>
           handleClientMessage(
@@ -941,7 +1181,16 @@ export function startGeometryWebSocket(options: {
             waitForBeforeInput,
             (kind, requestId, result) => {
               if (kind === 'resize') {
+                if (requestId) {
+                  pendingInputAcks.push({
+                    ws,
+                    requestId,
+                    afterExtractSequence: extractSequence,
+                  })
+                }
                 void runExtractQueued()
+                  .then(() => sendPendingInputAcks())
+                  .catch(err => options.onError?.(err))
               } else {
                 pendingInputAcks.push({
                   ws,
@@ -950,10 +1199,11 @@ export function startGeometryWebSocket(options: {
                   ...(result !== undefined ? { result } : {}),
                 })
                 scheduleExtract()
+                armInputAckFlushTimer()
               }
             },
             err => options.onError?.(err),
-            { allowedFileRoots: options.allowedFileRoots },
+            { allowedFileRoots: options.allowedFileRoots, actionRequestLedger, receivedAt },
           ),
         )
         .catch(err => options.onError?.(err))
@@ -962,6 +1212,7 @@ export function startGeometryWebSocket(options: {
       clients.delete(ws)
       controllerClaimed = clients.size > 0
       pendingInputAcks = pendingInputAcks.filter(entry => entry.ws !== ws)
+      if (pendingInputAcks.length === 0) clearInputAckFlushTimer()
     })
   })
 
@@ -971,10 +1222,8 @@ export function startGeometryWebSocket(options: {
     scheduleExtract,
     flushExtract: async () => {
       await actionQueue.catch(() => {})
-      if (debounceTimer !== null) {
-        clearTimeout(debounceTimer)
-        debounceTimer = null
-      }
+      clearDebounceTimer()
+      clearInputAckFlushTimer()
       await runExtractQueued()
       sendPendingInputAcks()
     },
@@ -982,6 +1231,8 @@ export function startGeometryWebSocket(options: {
     close: () =>
       new Promise((resolve, reject) => {
         void axSessionManager.close().finally(() => {
+          clearDebounceTimer()
+          clearInputAckFlushTimer()
           for (const ws of clients) {
             ws.close()
           }

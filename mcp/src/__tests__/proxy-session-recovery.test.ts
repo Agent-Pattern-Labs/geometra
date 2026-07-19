@@ -12,7 +12,7 @@ vi.mock('../proxy-spawn.js', () => ({
   spawnGeometraProxy: mockState.spawnGeometraProxy,
 }))
 
-const { connectThroughProxy, disconnect, prewarmProxy } = await import('../session.js')
+const { connectThroughProxy, disconnect, listSessions, prewarmProxy, shutdownAllSessionsAndProxies } = await import('../session.js')
 
 const AUTH_TOKEN = 'proxy-session-recovery-capability-000000000000'
 const PROXY_METADATA = {
@@ -91,7 +91,7 @@ async function createProxyPeer(options?: {
 }
 
 afterEach(async () => {
-  disconnect({ closeProxy: true })
+  shutdownAllSessionsAndProxies()
   vi.clearAllMocks()
 })
 
@@ -146,12 +146,15 @@ describe('connectThroughProxy recovery', () => {
       const firstSession = await connectThroughProxy({
         pageUrl: 'https://jobs.example.com/original',
         headless: true,
+        isolated: false,
       })
       expect(firstSession.proxyRuntime).toBe(staleRuntime)
+      disconnect({ sessionId: firstSession.id, closeProxy: false })
 
       const recoveredSession = await connectThroughProxy({
         pageUrl: 'https://jobs.example.com/recovered',
         headless: true,
+        isolated: false,
       })
 
       expect(recoveredSession.proxyRuntime).toBe(freshRuntime)
@@ -159,9 +162,123 @@ describe('connectThroughProxy recovery', () => {
       expect(staleRuntime.close).toHaveBeenCalledTimes(1)
       expect(mockState.spawnGeometraProxy).not.toHaveBeenCalled()
     } finally {
-      disconnect({ closeProxy: true })
+      shutdownAllSessionsAndProxies()
       await closePeer(stalePeer.wss)
       await closePeer(freshPeer.wss)
+    }
+  })
+
+  it('reserves ownership before simultaneous fresh browser startups', async () => {
+    const peers = await Promise.all(Array.from({ length: 5 }, (_, index) => createProxyPeer({
+      pageUrl: `https://jobs.example.com/capacity-${index}`,
+    })))
+    const runtimes = peers.map((peer) => {
+      const runtime = {
+        wsUrl: peer.wsUrl,
+        authToken: AUTH_TOKEN,
+        ready: Promise.resolve(),
+        closed: false,
+        close: vi.fn(async () => {
+          runtime.closed = true
+        }),
+      }
+      return runtime
+    })
+    let runtimeIndex = 0
+    mockState.startEmbeddedGeometraProxy.mockImplementation(async () => {
+      const runtime = runtimes[runtimeIndex++]
+      if (!runtime) throw new Error('capacity guard allowed an excess browser startup')
+      return { runtime, wsUrl: runtime.wsUrl }
+    })
+    mockState.spawnGeometraProxy.mockRejectedValue(new Error('spawn fallback should not be used'))
+
+    try {
+      const results = await Promise.allSettled(Array.from({ length: 6 }, (_, index) => connectThroughProxy({
+        pageUrl: `https://jobs.example.com/capacity-${index}`,
+        headless: true,
+      })))
+      const fulfilled = results.filter(
+        (result): result is PromiseFulfilledResult<Awaited<ReturnType<typeof connectThroughProxy>>> => result.status === 'fulfilled',
+      )
+      const rejected = results.filter(
+        (result): result is PromiseRejectedResult => result.status === 'rejected',
+      )
+
+      expect(fulfilled).toHaveLength(5)
+      expect(rejected).toHaveLength(1)
+      expect((rejected[0]!.reason as Error).message).toMatch(/pending connection.*limit 5/i)
+      expect(mockState.startEmbeddedGeometraProxy).toHaveBeenCalledTimes(5)
+      expect(mockState.spawnGeometraProxy).not.toHaveBeenCalled()
+      expect(listSessions().map(session => session.id).sort()).toEqual(
+        fulfilled.map(result => result.value.id).sort(),
+      )
+    } finally {
+      shutdownAllSessionsAndProxies()
+      for (const runtime of runtimes) expect(runtime.close).toHaveBeenCalledTimes(1)
+      await Promise.all(peers.map(peer => closePeer(peer.wss)))
+    }
+  })
+
+  it('settles the losing embedded connect before reusing its lease for child fallback', async () => {
+    const embeddedPeer = await createProxyPeer({
+      pageUrl: 'https://jobs.example.com/embedded-failure',
+      sendInitialFrame: false,
+    })
+    const childPeer = await createProxyPeer({
+      pageUrl: 'https://jobs.example.com/child-fallback',
+    })
+    let embeddedPeerClosed = false
+    const readyFailure = new Error('embedded runtime failed before its first frame')
+    const embeddedRuntime = {
+      wsUrl: embeddedPeer.wsUrl,
+      authToken: AUTH_TOKEN,
+      ready: Promise.reject(readyFailure),
+      closed: false,
+      close: vi.fn(async () => {
+        embeddedRuntime.closed = true
+        await closePeer(embeddedPeer.wss)
+        embeddedPeerClosed = true
+      }),
+    }
+    // The session installs a rejection observer immediately, but retain an
+    // explicit test observer as well so Vitest never treats this deliberate
+    // ready failure as an unhandled rejection.
+    void embeddedRuntime.ready.catch(() => {})
+    const child = {
+      killed: false,
+      exitCode: null,
+      signalCode: null,
+      kill: vi.fn(() => {
+        child.killed = true
+        return true
+      }),
+      once: vi.fn(),
+    }
+    mockState.startEmbeddedGeometraProxy.mockResolvedValue({
+      runtime: embeddedRuntime,
+      wsUrl: embeddedPeer.wsUrl,
+    })
+    mockState.spawnGeometraProxy.mockResolvedValue({
+      child,
+      wsUrl: childPeer.wsUrl,
+      authToken: AUTH_TOKEN,
+    })
+
+    try {
+      const session = await connectThroughProxy({
+        pageUrl: 'https://jobs.example.com/child-fallback',
+        headless: true,
+      })
+
+      expect(session.proxyChild).toBe(child)
+      expect(session.proxyRuntime).toBeUndefined()
+      expect(embeddedRuntime.close).toHaveBeenCalledTimes(1)
+      expect(mockState.spawnGeometraProxy).toHaveBeenCalledTimes(1)
+      expect(listSessions()).toEqual([{ id: session.id, url: childPeer.wsUrl }])
+    } finally {
+      shutdownAllSessionsAndProxies()
+      if (!embeddedPeerClosed) await closePeer(embeddedPeer.wss)
+      await closePeer(childPeer.wss)
     }
   })
 
@@ -201,6 +318,7 @@ describe('connectThroughProxy recovery', () => {
       const headedSession = await connectThroughProxy({
         pageUrl: 'https://jobs.example.com/headed',
         headless: false,
+        isolated: false,
       })
       expect(headedSession.proxyRuntime).toBe(headedRuntime)
 
@@ -209,6 +327,7 @@ describe('connectThroughProxy recovery', () => {
       const headlessSession = await connectThroughProxy({
         pageUrl: 'https://jobs.example.com/headless',
         headless: true,
+        isolated: false,
       })
       expect(headlessSession.proxyRuntime).toBe(headlessRuntime)
 
@@ -217,6 +336,7 @@ describe('connectThroughProxy recovery', () => {
       const reusedHeadedSession = await connectThroughProxy({
         pageUrl: 'https://jobs.example.com/headed',
         headless: false,
+        isolated: false,
       })
 
       expect(reusedHeadedSession.proxyRuntime).toBe(headedRuntime)
@@ -224,7 +344,7 @@ describe('connectThroughProxy recovery', () => {
       expect(headedRuntime.close).not.toHaveBeenCalled()
       expect(headlessRuntime.close).not.toHaveBeenCalled()
     } finally {
-      disconnect({ closeProxy: true })
+      shutdownAllSessionsAndProxies()
       expect(headedRuntime.close).toHaveBeenCalledTimes(1)
       expect(headlessRuntime.close).toHaveBeenCalledTimes(1)
       await closePeer(headedPeer.wss)
@@ -269,6 +389,7 @@ describe('connectThroughProxy recovery', () => {
         pageUrl: 'https://jobs.example.com/application',
         headless: true,
         stealth: false,
+        isolated: false,
       })
       expect(stockSession.proxyRuntime).toBe(stockRuntime)
 
@@ -278,6 +399,7 @@ describe('connectThroughProxy recovery', () => {
         pageUrl: 'https://jobs.example.com/application',
         headless: true,
         stealth: true,
+        isolated: false,
       })
       expect(stealthSession.proxyRuntime).toBe(stealthRuntime)
 
@@ -287,6 +409,7 @@ describe('connectThroughProxy recovery', () => {
         pageUrl: 'https://jobs.example.com/application',
         headless: true,
         stealth: false,
+        isolated: false,
       })
 
       expect(reusedStockSession.proxyRuntime).toBe(stockRuntime)
@@ -295,7 +418,7 @@ describe('connectThroughProxy recovery', () => {
       expect(stockRuntime.close).not.toHaveBeenCalled()
       expect(stealthRuntime.close).not.toHaveBeenCalled()
     } finally {
-      disconnect({ closeProxy: true })
+      shutdownAllSessionsAndProxies()
       expect(stockRuntime.close).toHaveBeenCalledTimes(1)
       expect(stealthRuntime.close).toHaveBeenCalledTimes(1)
       await closePeer(stockPeer.wss)
@@ -339,13 +462,14 @@ describe('connectThroughProxy recovery', () => {
       const session = await connectThroughProxy({
         pageUrl: 'https://jobs.example.com/prepared',
         headless: true,
+        isolated: false,
       })
 
       expect(session.proxyRuntime).toBe(preparedRuntime)
       expect(mockState.startEmbeddedGeometraProxy).toHaveBeenCalledTimes(1)
       expect(mockState.spawnGeometraProxy).not.toHaveBeenCalled()
     } finally {
-      disconnect({ closeProxy: true })
+      shutdownAllSessionsAndProxies()
       expect(preparedRuntime.close).toHaveBeenCalledTimes(1)
       await closePeer(preparedPeer.wss)
     }
@@ -389,7 +513,7 @@ describe('connectThroughProxy recovery', () => {
         stealth: false,
       })
     } finally {
-      disconnect({ closeProxy: true })
+      shutdownAllSessionsAndProxies()
       expect(preparedRuntime.close).toHaveBeenCalledTimes(1)
       await closePeer(preparedPeer.wss)
     }
@@ -421,6 +545,7 @@ describe('connectThroughProxy recovery', () => {
       const session = await connectThroughProxy({
         pageUrl: 'https://jobs.example.com/lazy',
         headless: true,
+        isolated: false,
         awaitInitialFrame: false,
       })
 
@@ -432,7 +557,7 @@ describe('connectThroughProxy recovery', () => {
       }))
       expect(session.tree).toBeNull()
     } finally {
-      disconnect({ closeProxy: true })
+      shutdownAllSessionsAndProxies()
       expect(lazyRuntime.close).toHaveBeenCalledTimes(1)
       await closePeer(lazyPeer.wss)
     }

@@ -1,6 +1,7 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 
 const mockState = vi.hoisted(() => ({
+  disconnect: vi.fn(),
   pruneDisconnectedSessions: vi.fn(() => [] as string[]),
   resolveSession: vi.fn<(id?: string) => unknown>(() => ({ kind: 'none' as const })),
 }))
@@ -8,7 +9,8 @@ const mockState = vi.hoisted(() => ({
 vi.mock('../session.js', () => ({
   connect: vi.fn(),
   connectThroughProxy: vi.fn(),
-  disconnect: vi.fn(),
+  ensureSessionConnected: vi.fn(),
+  disconnect: mockState.disconnect,
   pruneDisconnectedSessions: mockState.pruneDisconnectedSessions,
   resolveSession: mockState.resolveSession,
   listSessions: vi.fn(() => []),
@@ -95,5 +97,33 @@ describe('server session resolution', () => {
     expect(result.content[0]!.text).toContain('isolated: s2')
     expect(mockState.pruneDisconnectedSessions).toHaveBeenCalledTimes(1)
     expect(mockState.resolveSession).toHaveBeenCalledWith(undefined)
+  })
+
+  it('refuses an unscoped disconnect when multiple sessions are active', async () => {
+    const handler = getToolHandler('geometra_disconnect')
+    mockState.resolveSession.mockReturnValue({
+      kind: 'ambiguous' as const,
+      activeIds: ['s1', 's2'],
+      isolatedIds: [],
+    })
+
+    const result = await handler({ closeBrowser: true })
+
+    expect(result.isError).toBe(true)
+    expect(result.content[0]!.text).toContain('multiple_active_sessions_provide_id')
+    expect(mockState.disconnect).not.toHaveBeenCalled()
+  })
+
+  it('disconnects only the explicitly resolved session browser', async () => {
+    const handler = getToolHandler('geometra_disconnect')
+    const session = { id: 's1', isolated: false }
+    mockState.resolveSession.mockReturnValue({ kind: 'ok' as const, session })
+
+    const result = await handler({ sessionId: 's1', closeBrowser: true })
+
+    expect(result.isError).not.toBe(true)
+    expect(result.content[0]!.text).toContain('Disconnected session s1 and closed its browser')
+    expect(mockState.disconnect).toHaveBeenCalledTimes(1)
+    expect(mockState.disconnect).toHaveBeenCalledWith({ sessionId: 's1', closeProxy: true })
   })
 })
