@@ -2921,6 +2921,10 @@ describe('setFieldChoice', () => {
         </optgroup>
         <option value="nyc">New York</option>
       </select>
+      <script>
+        window.selectClickCount = 0
+        office.addEventListener('click', () => { window.selectClickCount += 1 })
+      </script>
     `)
     const box = await page.locator('#office').boundingBox()
     if (!box) throw new Error('expected select bounds')
@@ -2932,6 +2936,36 @@ describe('setFieldChoice', () => {
 
     await expect(selectNativeOption(page, x, y, { index: 2, value: 'legacy' })).rejects.toThrow('selectOption:')
     expect(await page.locator('#office').evaluate(el => (el as HTMLSelectElement).selectedIndex)).toBe(0)
+    expect(await page.evaluate(() => (window as unknown as { selectClickCount: number }).selectClickCount)).toBe(0)
+    await page.close()
+  })
+
+  it('rejects non-select coordinates without clicking a submit control', async () => {
+    const page = await browser.newPage({ viewport: { width: 900, height: 700 } })
+    await page.setContent(`
+      <form id="application">
+        <button id="submit" type="submit" style="margin:24px;width:240px;height:40px">Submit application</button>
+      </form>
+      <script>
+        window.submitClickCount = 0
+        window.submitEventCount = 0
+        submit.addEventListener('click', () => { window.submitClickCount += 1 })
+        application.addEventListener('submit', event => {
+          event.preventDefault()
+          window.submitEventCount += 1
+        })
+      </script>
+    `)
+    const box = await page.locator('#submit').boundingBox()
+    if (!box) throw new Error('expected submit bounds')
+
+    await expect(selectNativeOption(page, box.x + box.width / 2, box.y + box.height / 2, {
+      label: 'United States',
+    })).rejects.toThrow('do not target a native <select>')
+    expect(await page.evaluate(() => ({
+      clicks: (window as unknown as { submitClickCount: number }).submitClickCount,
+      submits: (window as unknown as { submitEventCount: number }).submitEventCount,
+    }))).toEqual({ clicks: 0, submits: 0 })
     await page.close()
   })
 

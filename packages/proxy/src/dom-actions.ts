@@ -599,6 +599,66 @@ async function assertPointMutable(
   }
 }
 
+async function elementOwnsPagePoint(
+  element: ElementHandle<Element>,
+  x: number,
+  y: number,
+): Promise<boolean> {
+  try {
+    const bounds = await element.boundingBox()
+    if (
+      !bounds || bounds.width <= 0 || bounds.height <= 0 ||
+      x < bounds.x || y < bounds.y || x >= bounds.x + bounds.width || y >= bounds.y + bounds.height
+    ) {
+      return false
+    }
+    return await element.evaluate((target, payload) => {
+      const rect = target.getBoundingClientRect()
+      if (rect.width <= 0 || rect.height <= 0) return false
+      const clientX = rect.left + ((payload.x - payload.bounds.x) / payload.bounds.width) * rect.width
+      const clientY = rect.top + ((payload.y - payload.bounds.y) / payload.bounds.height) * rect.height
+      const hit = document.elementFromPoint(clientX, clientY)
+      return hit === target || (hit !== null && target.contains(hit))
+    }, { x, y, bounds })
+  } catch {
+    return false
+  }
+}
+
+async function frameChainOwnsPagePoint(frame: Frame, x: number, y: number): Promise<boolean> {
+  let current = frame
+  while (true) {
+    const parent = current.parentFrame()
+    if (!parent) return true
+    let frameElement: ElementHandle<Element> | null = null
+    try {
+      frameElement = await current.frameElement() as ElementHandle<Element>
+      if (!(await elementOwnsPagePoint(frameElement, x, y))) return false
+    } catch {
+      return false
+    } finally {
+      await frameElement?.dispose()
+    }
+    current = parent
+  }
+}
+
+async function nativeSelectAtPoint(page: Page, x: number, y: number): Promise<ElementHandle<Element> | null> {
+  for (const frame of page.frames()) {
+    const selects = await frame.locator('select').elementHandles() as Array<ElementHandle<Element>>
+    let match: ElementHandle<Element> | null = null
+    for (const select of selects) {
+      if (!match && await elementOwnsPagePoint(select, x, y) && await frameChainOwnsPagePoint(frame, x, y)) {
+        match = select
+      } else {
+        await select.dispose()
+      }
+    }
+    if (match) return match
+  }
+  return null
+}
+
 async function locatorAnchorY(locator: Locator): Promise<number | undefined> {
   const bounds = await locator.boundingBox()
   return bounds ? bounds.y + bounds.height / 2 : undefined
@@ -6329,51 +6389,116 @@ export async function selectNativeOption(page: Page, x: number, y: number, opt: 
   if (opt.index !== undefined && (!Number.isFinite(opt.index) || !Number.isInteger(opt.index) || opt.index < 0)) {
     throw new Error('selectOption: index must be a non-negative integer')
   }
-  await assertPointMutable(page, x, y, 'select', 'selectOption')
-  await page.mouse.click(x, y)
-  await delay(40)
-  for (const frame of page.frames()) {
-    const applied = await frame.evaluate(
-      async (payload: { value: string | null; label: string | null; index: number | undefined }) => {
+  const select = await nativeSelectAtPoint(page, x, y)
+  if (!select) {
+    throw new Error('selectOption: supplied coordinates do not target a native <select>')
+  }
+
+  const payload = {
+    value: opt.value ?? null,
+    label: opt.label ?? null,
+    index: typeof opt.index === 'number' && Number.isFinite(opt.index) ? opt.index : undefined,
+  }
+
+  try {
+    const reason = await select.evaluate(mutationBlockReasonInPage, 'select')
+    if (reason) throw new Error(`selectOption: matched control is not mutable (${reason})`)
+
+    const optionReady = await select.evaluate(
+      (target, requested: { value: string | null; label: string | null; index: number | undefined }) => {
+        if (!(target instanceof HTMLSelectElement)) return false
         const normalize = (input: string | undefined | null) => input?.replace(/\s+/g, ' ').trim().toLowerCase() ?? ''
         const enabled = (o: HTMLOptionElement): boolean =>
           !o.disabled && !(o.parentElement instanceof HTMLOptGroupElement && o.parentElement.disabled)
         const optionMatchesPayload = (o: HTMLOptionElement): boolean => {
           if (o.disabled || (o.parentElement instanceof HTMLOptGroupElement && o.parentElement.disabled)) return false
-          if (payload.value !== null && normalize(o.value) !== normalize(payload.value)) return false
-          if (payload.label !== null && normalize(o.textContent) !== normalize(payload.label)) return false
-          if (payload.index !== undefined && o.index !== payload.index) return false
+          if (requested.value !== null && normalize(o.value) !== normalize(requested.value)) return false
+          if (requested.label !== null && normalize(o.textContent) !== normalize(requested.label)) return false
+          if (requested.index !== undefined && o.index !== requested.index) return false
           return true
         }
 
-        const a = document.activeElement
-        if (!a || a.tagName !== 'SELECT') return false
-        const sel = a as HTMLSelectElement
-        if (sel.matches(':disabled') || sel.getAttribute('aria-disabled') === 'true' || sel.getAttribute('aria-readonly') === 'true') return false
-        if (sel.closest('[inert], [aria-disabled="true"], [aria-readonly="true"]')) return false
-        const candidate = payload.index !== undefined
-          ? sel.options.item(payload.index)
-          : Array.from(sel.options).find(optionMatchesPayload) ?? null
+        const candidate = requested.index !== undefined
+          ? target.options.item(requested.index)
+          : Array.from(target.options).find(optionMatchesPayload) ?? null
+        return !!candidate && enabled(candidate) && optionMatchesPayload(candidate)
+      },
+      payload,
+    )
+    if (!optionReady) {
+      throw new Error('selectOption: no enabled <option> matches the requested identity')
+    }
+
+    const applied = await select.evaluate(
+      async (target, requested: { value: string | null; label: string | null; index: number | undefined }) => {
+        if (!(target instanceof HTMLSelectElement)) return false
+        function commitMutationBlockReason(control: Element): string | null {
+          function composedParent(node: Element): Element | null {
+            if (node.parentElement) return node.parentElement
+            const root = node.getRootNode()
+            return root instanceof ShadowRoot ? root.host : null
+          }
+
+          function composedDescendantOf(node: Element, ancestor: Element): boolean {
+            let current: Element | null = node
+            while (current) {
+              if (current === ancestor) return true
+              current = composedParent(current)
+            }
+            return false
+          }
+
+          try {
+            if (control.matches(':disabled')) return 'disabled'
+          } catch { /* non-HTML namespaces may reject pseudo classes */ }
+
+          let current: Element | null = control
+          while (current) {
+            if (current.hasAttribute('inert')) return 'inert'
+            if (current.getAttribute('aria-disabled')?.trim().toLowerCase() === 'true') return 'aria-disabled'
+            if (current.getAttribute('aria-readonly')?.trim().toLowerCase() === 'true') return 'aria-readonly'
+            if (current instanceof HTMLFieldSetElement && current.disabled) {
+              const firstLegend = Array.from(current.children).find(child => child instanceof HTMLLegendElement)
+              if (!(firstLegend instanceof HTMLLegendElement) || !composedDescendantOf(control, firstLegend)) {
+                return 'disabled fieldset'
+              }
+            }
+            current = composedParent(current)
+          }
+          return null
+        }
+
+        if (commitMutationBlockReason(target)) return false
+        const normalize = (input: string | undefined | null) => input?.replace(/\s+/g, ' ').trim().toLowerCase() ?? ''
+        const enabled = (o: HTMLOptionElement): boolean =>
+          !o.disabled && !(o.parentElement instanceof HTMLOptGroupElement && o.parentElement.disabled)
+        const optionMatchesPayload = (o: HTMLOptionElement): boolean => {
+          if (!enabled(o)) return false
+          if (requested.value !== null && normalize(o.value) !== normalize(requested.value)) return false
+          if (requested.label !== null && normalize(o.textContent) !== normalize(requested.label)) return false
+          if (requested.index !== undefined && o.index !== requested.index) return false
+          return true
+        }
+
+        const candidate = requested.index !== undefined
+          ? target.options.item(requested.index)
+          : Array.from(target.options).find(optionMatchesPayload) ?? null
         if (!candidate || !enabled(candidate) || !optionMatchesPayload(candidate)) return false
 
-        sel.selectedIndex = candidate.index
-        sel.dispatchEvent(new Event('input', { bubbles: true }))
-        sel.dispatchEvent(new Event('change', { bubbles: true }))
+        target.selectedIndex = candidate.index
+        target.dispatchEvent(new Event('input', { bubbles: true }))
+        target.dispatchEvent(new Event('change', { bubbles: true }))
         await new Promise<void>(resolveTimer => setTimeout(resolveTimer, 40))
-        const selected = sel.selectedOptions[0]
-        return sel.selectedIndex === candidate.index && selected === candidate && optionMatchesPayload(selected)
+        const selected = target.selectedOptions[0]
+        return target.selectedIndex === candidate.index && selected === candidate && optionMatchesPayload(selected)
       },
-      {
-        value: opt.value ?? null,
-        label: opt.label ?? null,
-        index: typeof opt.index === 'number' && Number.isFinite(opt.index) ? opt.index : undefined,
-      },
+      payload,
     )
     if (applied) return
+  } finally {
+    await select.dispose()
   }
-  throw new Error(
-    'selectOption: no focused <select> after click — use geometra_pick_listbox_option for custom dropdowns',
-  )
+  throw new Error('selectOption: native <select> or requested option changed before commit')
 }
 
 /**
