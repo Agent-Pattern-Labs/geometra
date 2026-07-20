@@ -1,5 +1,5 @@
 import { afterAll, describe, expect, it, vi } from 'vitest'
-import { WebSocket as WsClient, WebSocketServer } from 'ws'
+import { WebSocket as WsClient, WebSocketServer, type RawData } from 'ws'
 
 const lifecycleMocks = vi.hoisted(() => ({
   recordSessionSnapshot: vi.fn(),
@@ -41,6 +41,50 @@ const MODERN_PROXY_METADATA = {
   },
 } as const
 const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i
+
+function deferredSignal(): { promise: Promise<void>; release: () => void } {
+  let release!: () => void
+  const promise = new Promise<void>(resolve => {
+    release = resolve
+  })
+  return { promise, release }
+}
+
+function waitForInboundWireMessage(
+  socket: WsClient,
+  predicate: (message: Record<string, unknown>) => boolean,
+): Promise<Record<string, unknown>> {
+  return new Promise((resolve, reject) => {
+    const onMessage = (raw: RawData) => {
+      let message: Record<string, unknown>
+      try {
+        message = JSON.parse(String(raw)) as Record<string, unknown>
+      } catch {
+        return
+      }
+      if (!predicate(message)) return
+      cleanup()
+      resolve(message)
+    }
+    const onClose = () => {
+      cleanup()
+      reject(new Error('Original action socket closed before the gated terminal message arrived'))
+    }
+    const onError = (error: Error) => {
+      cleanup()
+      reject(error)
+    }
+    const cleanup = () => {
+      socket.off('message', onMessage)
+      socket.off('close', onClose)
+      socket.off('error', onError)
+    }
+
+    socket.on('message', onMessage)
+    socket.once('close', onClose)
+    socket.once('error', onError)
+  })
+}
 
 describe('proxy-backed MCP actions', () => {
   afterAll(() => {
@@ -685,6 +729,7 @@ describe('proxy-backed MCP actions', () => {
   it('never resends after timeout and promotes a later ACK under the original identity', async () => {
     const wss = new WebSocketServer({ port: 0 })
     const actions: Array<Record<string, unknown>> = []
+    const lateAckGate = deferredSignal()
     wss.on('connection', ws => {
       ws.on('message', raw => {
         const msg = JSON.parse(String(raw)) as { type?: string; requestId?: string }
@@ -701,14 +746,15 @@ describe('proxy-backed MCP actions', () => {
 
         actions.push(msg as Record<string, unknown>)
         if (actions.length === 1) {
-          setTimeout(() => {
+          void lateAckGate.promise.then(() => {
+            if (ws.readyState !== ws.OPEN) return
             ws.send(JSON.stringify({
               type: 'ack',
               requestId: msg.requestId,
               result: { originalCompleted: true },
               ...MODERN_PROXY_METADATA,
             }))
-          }, 90)
+          })
         } else {
           ws.send(JSON.stringify({
             type: 'error',
@@ -745,7 +791,12 @@ describe('proxy-backed MCP actions', () => {
         requestId: first.requestId,
         actionId: first.actionId,
       })
-      await new Promise(resolve => setTimeout(resolve, 75))
+      const lateAckDelivered = waitForInboundWireMessage(
+        session.ws,
+        message => message.type === 'ack' && message.requestId === first.requestId,
+      )
+      lateAckGate.release()
+      await lateAckDelivered
       const settledRetry = await sendClick(session, 8, 9, 200)
       expect(settledRetry).toMatchObject({
         status: 'acknowledged',
@@ -765,6 +816,7 @@ describe('proxy-backed MCP actions', () => {
   it('returns a cached late acknowledgement without replaying the mutation', async () => {
     const wss = new WebSocketServer({ port: 0 })
     let actionCount = 0
+    const lateAckGate = deferredSignal()
     wss.on('connection', ws => {
       ws.on('message', raw => {
         const msg = JSON.parse(String(raw)) as { type?: string; requestId?: string }
@@ -779,14 +831,15 @@ describe('proxy-backed MCP actions', () => {
         }
         if (msg.type !== 'event') return
         actionCount += 1
-        setTimeout(() => {
+        void lateAckGate.promise.then(() => {
+          if (ws.readyState !== ws.OPEN) return
           ws.send(JSON.stringify({
             type: 'ack',
             requestId: msg.requestId,
             result: { late: true },
             ...MODERN_PROXY_METADATA,
           }))
-        }, 55)
+        })
       })
     })
     const port = await new Promise<number>((resolve, reject) => {
@@ -802,7 +855,12 @@ describe('proxy-backed MCP actions', () => {
       const session = await connect(`ws://127.0.0.1:${port}`)
       const first = await sendClick(session, 11, 12, 20)
       expect(first.status).toBe('timed_out')
-      await new Promise(resolve => setTimeout(resolve, 70))
+      const lateAckDelivered = waitForInboundWireMessage(
+        session.ws,
+        message => message.type === 'ack' && message.requestId === first.requestId,
+      )
+      lateAckGate.release()
+      await lateAckDelivered
 
       const retry = await sendClick(session, 11, 12, 20)
       expect(retry).toMatchObject({
@@ -821,6 +879,7 @@ describe('proxy-backed MCP actions', () => {
   it('compacts an oversized late terminal result under the ambiguity retention cap', async () => {
     const wss = new WebSocketServer({ port: 0 })
     let actionCount = 0
+    const lateAckGate = deferredSignal()
     wss.on('connection', ws => {
       ws.on('message', raw => {
         const msg = JSON.parse(String(raw)) as { type?: string; requestId?: string }
@@ -835,12 +894,15 @@ describe('proxy-backed MCP actions', () => {
         }
         if (msg.type !== 'event') return
         actionCount += 1
-        setTimeout(() => ws.send(JSON.stringify({
-          type: 'ack',
-          requestId: msg.requestId,
-          result: { pdf: 'x'.repeat(1_100_000) },
-          ...MODERN_PROXY_METADATA,
-        })), 25)
+        void lateAckGate.promise.then(() => {
+          if (ws.readyState !== ws.OPEN) return
+          ws.send(JSON.stringify({
+            type: 'ack',
+            requestId: msg.requestId,
+            result: { pdf: 'x'.repeat(1_100_000) },
+            ...MODERN_PROXY_METADATA,
+          }))
+        })
       })
     })
     const port = await new Promise<number>((resolve, reject) => {
@@ -856,7 +918,12 @@ describe('proxy-backed MCP actions', () => {
       const session = await connect(`ws://127.0.0.1:${port}`)
       const first = await sendClick(session, 29, 30, 10)
       expect(first.status).toBe('timed_out')
-      await new Promise(resolve => setTimeout(resolve, 40))
+      const lateAckDelivered = waitForInboundWireMessage(
+        session.ws,
+        message => message.type === 'ack' && message.requestId === first.requestId,
+      )
+      lateAckGate.release()
+      await lateAckDelivered
 
       const retained = await sendClick(session, 29, 30, 30)
       expect(retained).toMatchObject({
@@ -879,6 +946,7 @@ describe('proxy-backed MCP actions', () => {
   it('keeps a late terminal error ambiguity-classified under the original identity', async () => {
     const wss = new WebSocketServer({ port: 0 })
     let actionCount = 0
+    const lateErrorGate = deferredSignal()
     wss.on('connection', ws => {
       ws.on('message', raw => {
         const msg = JSON.parse(String(raw)) as { type?: string; requestId?: string }
@@ -893,7 +961,8 @@ describe('proxy-backed MCP actions', () => {
         }
         if (msg.type !== 'event') return
         actionCount += 1
-        setTimeout(() => {
+        void lateErrorGate.promise.then(() => {
+          if (ws.readyState !== ws.OPEN) return
           ws.send(JSON.stringify({
             type: 'error',
             code: 'SNAPSHOT_FAILED',
@@ -901,7 +970,7 @@ describe('proxy-backed MCP actions', () => {
             message: 'snapshot failed after the browser action',
             ...MODERN_PROXY_METADATA,
           }))
-        }, 45)
+        })
       })
     })
     const port = await new Promise<number>((resolve, reject) => {
@@ -917,7 +986,14 @@ describe('proxy-backed MCP actions', () => {
       const session = await connect(`ws://127.0.0.1:${port}`)
       const first = await sendClick(session, 21, 22, 15)
       expect(first.status).toBe('timed_out')
-      await new Promise(resolve => setTimeout(resolve, 65))
+      const lateErrorDelivered = waitForInboundWireMessage(
+        session.ws,
+        message => message.type === 'error' &&
+          message.code === 'SNAPSHOT_FAILED' &&
+          message.requestId === first.requestId,
+      )
+      lateErrorGate.release()
+      await lateErrorDelivered
 
       let retryError: unknown
       try {
@@ -943,6 +1019,7 @@ describe('proxy-backed MCP actions', () => {
   it('keeps a late protocol-mismatch acknowledgement ambiguity-classified', async () => {
     const wss = new WebSocketServer({ port: 0 })
     let actionCount = 0
+    const lateAckGate = deferredSignal()
     wss.on('connection', ws => {
       ws.on('message', raw => {
         const msg = JSON.parse(String(raw)) as { type?: string; requestId?: string }
@@ -957,14 +1034,15 @@ describe('proxy-backed MCP actions', () => {
         }
         if (msg.type !== 'file') return
         actionCount += 1
-        setTimeout(() => {
+        void lateAckGate.promise.then(() => {
+          if (ws.readyState !== ws.OPEN) return
           ws.send(JSON.stringify({
             type: 'ack',
             requestId: msg.requestId,
             ...MODERN_PROXY_METADATA,
             proxyActionProtocolVersion: 1,
           }))
-        }, 45)
+        })
       })
     })
     const port = await new Promise<number>((resolve, reject) => {
@@ -983,7 +1061,12 @@ describe('proxy-backed MCP actions', () => {
         fieldLabel: 'Resume',
       }, 15)
       expect(first.status).toBe('timed_out')
-      await new Promise(resolve => setTimeout(resolve, 65))
+      const lateAckDelivered = waitForInboundWireMessage(
+        session.ws,
+        message => message.type === 'ack' && message.requestId === first.requestId,
+      )
+      lateAckGate.release()
+      await lateAckDelivered
 
       await expect(sendFileUpload(session, ['/tmp/resume.pdf'], {
         fieldKey: 'ff:0.0',
@@ -1007,6 +1090,7 @@ describe('proxy-backed MCP actions', () => {
     const wss = new WebSocketServer({ port: 0 })
     let actionCount = 0
     const requestIds: string[] = []
+    const lateErrorGate = deferredSignal()
     wss.on('connection', ws => {
       ws.on('message', raw => {
         const msg = JSON.parse(String(raw)) as { type?: string; requestId?: string }
@@ -1022,21 +1106,25 @@ describe('proxy-backed MCP actions', () => {
         if (msg.type !== 'event') return
         actionCount += 1
         requestIds.push(msg.requestId!)
-        if (actionCount === 1) setTimeout(() => {
+        if (actionCount === 1) {
+          void lateErrorGate.promise.then(() => {
+            if (ws.readyState !== ws.OPEN) return
+            ws.send(JSON.stringify({
+              type: 'error',
+              code: 'ACTION_EXPIRED',
+              requestId: msg.requestId,
+              message: 'action expired before execution',
+              ...MODERN_PROXY_METADATA,
+            }))
+          })
+        } else {
           ws.send(JSON.stringify({
-            type: 'error',
-            code: 'ACTION_EXPIRED',
+            type: 'ack',
             requestId: msg.requestId,
-            message: 'action expired before execution',
+            result: { executedFreshIntent: true },
             ...MODERN_PROXY_METADATA,
           }))
-        }, 45)
-        else ws.send(JSON.stringify({
-          type: 'ack',
-          requestId: msg.requestId,
-          result: { executedFreshIntent: true },
-          ...MODERN_PROXY_METADATA,
-        }))
+        }
       })
     })
     const port = await new Promise<number>((resolve, reject) => {
@@ -1052,7 +1140,14 @@ describe('proxy-backed MCP actions', () => {
       const session = await connect(`ws://127.0.0.1:${port}`)
       const first = await sendClick(session, 23, 24, 15)
       expect(first.status).toBe('timed_out')
-      await new Promise(resolve => setTimeout(resolve, 65))
+      const lateErrorDelivered = waitForInboundWireMessage(
+        session.ws,
+        message => message.type === 'error' &&
+          message.code === 'ACTION_EXPIRED' &&
+          message.requestId === first.requestId,
+      )
+      lateErrorGate.release()
+      await lateErrorDelivered
 
       let retryError: unknown
       try {
@@ -1206,6 +1301,7 @@ describe('proxy-backed MCP actions', () => {
   it('never resends a multi-phase type after its outcome times out', async () => {
     const wss = new WebSocketServer({ port: 0 })
     const keyMessages: Array<Record<string, unknown>> = []
+    const lateAckGate = deferredSignal()
     wss.on('connection', ws => {
       ws.on('message', raw => {
         const msg = JSON.parse(String(raw)) as { type?: string; requestId?: string; eventType?: string; key?: string }
@@ -1222,14 +1318,15 @@ describe('proxy-backed MCP actions', () => {
 
         keyMessages.push(msg as Record<string, unknown>)
         if (keyMessages.length === 4) {
-          setTimeout(() => {
+          void lateAckGate.promise.then(() => {
+            if (ws.readyState !== ws.OPEN) return
             ws.send(JSON.stringify({
               type: 'ack',
               requestId: msg.requestId,
               result: { typedOnce: true },
               ...MODERN_PROXY_METADATA,
             }))
-          }, 90)
+          })
         } else if (keyMessages.length > 4) {
           ws.send(JSON.stringify({
             type: 'error',
@@ -1261,7 +1358,12 @@ describe('proxy-backed MCP actions', () => {
         requestId: first.requestId,
         actionId: first.actionId,
       })
-      await new Promise(resolve => setTimeout(resolve, 75))
+      const lateAckDelivered = waitForInboundWireMessage(
+        session.ws,
+        message => message.type === 'ack' && message.requestId === first.requestId,
+      )
+      lateAckGate.release()
+      await lateAckDelivered
       const settledRetry = await sendType(session, 'ab', 200)
       expect(settledRetry).toMatchObject({
         status: 'acknowledged',
@@ -1490,6 +1592,7 @@ describe('proxy-backed MCP actions', () => {
 
   it('ignores invalid patch paths instead of mutating ancestor layout nodes', async () => {
     const wss = new WebSocketServer({ port: 0 })
+    const invalidPatchGate = deferredSignal()
     wss.on('connection', ws => {
       ws.on('message', raw => {
         const msg = JSON.parse(String(raw)) as { type?: string }
@@ -1511,12 +1614,13 @@ describe('proxy-backed MCP actions', () => {
               children: [{ kind: 'box', props: {}, semantic: { tag: 'div', role: 'group' }, children: [] }],
             },
           }))
-          setTimeout(() => {
+          void invalidPatchGate.promise.then(() => {
+            if (ws.readyState !== ws.OPEN) return
             ws.send(JSON.stringify({
               type: 'patch',
               patches: [{ path: [9], x: 999, y: 999 }],
             }))
-          }, 10)
+          })
         }
       })
     })
@@ -1531,7 +1635,12 @@ describe('proxy-backed MCP actions', () => {
 
     try {
       const session = await connect(`ws://127.0.0.1:${port}`)
-      await new Promise(resolve => setTimeout(resolve, 30))
+      const invalidPatchDelivered = waitForInboundWireMessage(
+        session.ws,
+        message => message.type === 'patch',
+      )
+      invalidPatchGate.release()
+      await invalidPatchDelivered
       expect(session.layout).toMatchObject({
         x: 0,
         y: 0,
@@ -1619,6 +1728,7 @@ describe('proxy-backed MCP actions', () => {
   it('does not promote a late navigation ACK without a fresh post-action frame', async () => {
     const wss = new WebSocketServer({ port: 0 })
     const navigateMessages: Array<Record<string, unknown>> = []
+    const lateAckGate = deferredSignal()
     wss.on('connection', ws => {
       ws.on('message', raw => {
         const msg = JSON.parse(String(raw)) as { type?: string; requestId?: string; url?: string }
@@ -1634,12 +1744,15 @@ describe('proxy-backed MCP actions', () => {
         if (msg.type !== 'navigate') return
         navigateMessages.push(msg as Record<string, unknown>)
         if (navigateMessages.length === 1) {
-          setTimeout(() => ws.send(JSON.stringify({
-            type: 'ack',
-            requestId: msg.requestId,
-            result: { pageUrl: msg.url },
-            ...MODERN_PROXY_METADATA,
-          })), 35)
+          void lateAckGate.promise.then(() => {
+            if (ws.readyState !== ws.OPEN) return
+            ws.send(JSON.stringify({
+              type: 'ack',
+              requestId: msg.requestId,
+              result: { pageUrl: msg.url },
+              ...MODERN_PROXY_METADATA,
+            }))
+          })
         } else {
           ws.send(JSON.stringify({
             type: 'error',
@@ -1664,7 +1777,12 @@ describe('proxy-backed MCP actions', () => {
       const session = await connect(`ws://127.0.0.1:${port}`)
       const first = await sendNavigate(session, 'https://jobs.example.com/late', 15)
       expect(first.status).toBe('timed_out')
-      await new Promise(resolve => setTimeout(resolve, 45))
+      const lateAckDelivered = waitForInboundWireMessage(
+        session.ws,
+        message => message.type === 'ack' && message.requestId === first.requestId,
+      )
+      lateAckGate.release()
+      await lateAckDelivered
       const retry = await sendNavigate(session, 'https://jobs.example.com/late', 25)
       expect(retry).toMatchObject({
         status: 'timed_out',
