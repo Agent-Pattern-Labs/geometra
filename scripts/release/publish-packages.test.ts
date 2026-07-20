@@ -13,11 +13,19 @@ class FakeRegistry {
   readonly events: string[] = []
   readonly artifacts = new Map<string, { version: string; integrity: string }>()
   readonly tagsByName = new Map<string, Record<string, string>>()
+  readonly hiddenArtifactReads = new Map<string, number>()
   publishFailure: 'before' | 'after' | undefined
   promotionFailure: 'before' | 'after' | undefined
+  visibilityDelayReads = 0
 
   artifact(name: string, version: string) {
-    return this.artifacts.get(`${name}@${version}`) ?? null
+    const key = `${name}@${version}`
+    const hiddenReads = this.hiddenArtifactReads.get(key) ?? 0
+    if (hiddenReads > 0) {
+      this.hiddenArtifactReads.set(key, hiddenReads - 1)
+      return null
+    }
+    return this.artifacts.get(key) ?? null
   }
 
   tags(name: string) {
@@ -27,7 +35,9 @@ class FakeRegistry {
   publish(pkg: PackageRecord, tag: string) {
     this.events.push(`publish:${pkg.name}:${tag}`)
     if (this.publishFailure === 'before') throw new Error('publish rejected')
-    this.artifacts.set(`${pkg.name}@${pkg.version}`, { version: pkg.version, integrity: pkg.integrity })
+    const key = `${pkg.name}@${pkg.version}`
+    this.artifacts.set(key, { version: pkg.version, integrity: pkg.integrity })
+    this.hiddenArtifactReads.set(key, this.visibilityDelayReads)
     this.tagsByName.set(pkg.name, { ...this.tags(pkg.name), [tag]: pkg.version })
     if (this.publishFailure === 'after') throw new Error('publish acknowledgement lost')
   }
@@ -103,6 +113,17 @@ describe('staged package publishing', () => {
     const registry = new FakeRegistry()
     registry.publishFailure = 'after'
     registry.promotionFailure = 'after'
+
+    expect(() =>
+      publishRelease({ packages, registry, expectedVersion: '2.0.0', log: () => {}, wait: () => {} }),
+    ).not.toThrow()
+    expect(registry.tags('@geometra/core')).toEqual({ latest: '2.0.0' })
+    expect(registry.tags('@geometra/client')).toEqual({ latest: '2.0.0' })
+  })
+
+  it('waits through delayed npm registry propagation before failing publication', () => {
+    const registry = new FakeRegistry()
+    registry.visibilityDelayReads = 10
 
     expect(() =>
       publishRelease({ packages, registry, expectedVersion: '2.0.0', log: () => {}, wait: () => {} }),

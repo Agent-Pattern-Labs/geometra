@@ -243,7 +243,7 @@ export function publishRelease({
   log = console.log,
   warn = console.warn,
   wait = sleep,
-  visibilityAttempts = 6,
+  visibilityAttempts = 31,
 }) {
   const version = resolveReleaseVersion(packages, expectedVersion)
   const stagingTag = stagingTagFor(version)
