@@ -1683,6 +1683,8 @@ describe('proxy-backed MCP actions', () => {
     const wss = new WebSocketServer({ port: 0 })
     let resolveEventSeen!: () => void
     const eventSeen = new Promise<void>(resolve => { resolveEventSeen = resolve })
+    let releaseStaleAck!: () => void
+    const staleAckReleased = new Promise<void>(resolve => { releaseStaleAck = resolve })
     wss.on('connection', ws => {
       ws.on('message', raw => {
         const msg = JSON.parse(String(raw)) as { type?: string; requestId?: string }
@@ -1697,7 +1699,7 @@ describe('proxy-backed MCP actions', () => {
         }
         if (msg.type !== 'event') return
         resolveEventSeen()
-        setTimeout(() => ws.send(JSON.stringify({
+        void staleAckReleased.then(() => ws.send(JSON.stringify({
           type: 'ack',
           requestId: msg.requestId,
           protocolVersion: 1,
@@ -1707,7 +1709,7 @@ describe('proxy-backed MCP actions', () => {
             requestScopedAcks: false,
             proxyActions: false,
           },
-        })), 15)
+        })))
       })
     })
     const port = await new Promise<number>((resolve, reject) => {
@@ -1724,17 +1726,39 @@ describe('proxy-backed MCP actions', () => {
       const url = `ws://127.0.0.1:${port}`
       const session = await connect(url)
       original = session.ws
-      const pending = sendClick(session, 9, 10, 45)
-      await eventSeen
       const replacement = new WsClient(url)
       await new Promise<void>((resolve, reject) => {
         replacement.once('open', resolve)
         replacement.once('error', reject)
       })
+      let pendingSettled = false
+      const pending = sendClick(session, 9, 10, 500).then(result => {
+        pendingSettled = true
+        return result
+      })
+      await eventSeen
       session.ws = replacement
+      const staleAckObserved = new Promise<void>(resolve => original!.once('message', () => resolve()))
+      releaseStaleAck()
+      await staleAckObserved
 
+      expect(pendingSettled).toBe(false)
       await expect(pending).resolves.toMatchObject({ status: 'timed_out' })
-      expect(session.peerTransport).toBe('proxy')
+      expect(session).toMatchObject({
+        peerTransport: 'proxy',
+        peerGeometryProtocolVersion: MODERN_PROXY_METADATA.geometryProtocolVersion,
+        peerProxyActionProtocolVersion: MODERN_PROXY_METADATA.proxyActionProtocolVersion,
+        peerAdvertisedSplitProtocol: true,
+        peerProtocolCapabilities: {
+          authenticatedController: true,
+          requestScopedAcks: true,
+          actionDeadlines: true,
+          idempotentRequestIds: true,
+          proxyActions: true,
+          exactFieldIdentity: true,
+          verifiedFileUploads: true,
+        },
+      })
     } finally {
       disconnect()
       original?.close()
