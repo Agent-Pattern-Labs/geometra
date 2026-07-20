@@ -47,12 +47,12 @@ Note: `tsc` builds may show pre-existing module resolution errors (`nodenext`/Ty
 
 Releases are done via GitHub Releases, **not** `npm publish` directly.
 
-1. Bump all 16 publishable packages atomically: `node scripts/release/bump-version.mjs <old> <new>` (refuses to proceed if any package has drifted from `<old>`).
+1. Bump all 18 publishable packages and both workspace lockfiles atomically: `node scripts/release/bump-version.mjs <old> <new>` (refuses to proceed if any package or lockfile has drifted from `<old>`).
 2. Verify the bump: `node scripts/release/check-source.mjs <new>`.
 3. Commit + push to `main` (`chore(release): vX.Y.Z — <summary>`).
 4. Wait for the `quality` check-run on that commit to go green.
 5. `gh release create vX.Y.Z --title "..." --notes "..."`.
-6. `.github/workflows/release.yml` triggers on `release: published`, waits for quality to succeed, re-verifies source versions, builds in workspace order, normalizes publish-time `^x.y.z` deps, and publishes all 16 packages to npm with provenance (uses `NPM_TOKEN`).
+6. `.github/workflows/release.yml` triggers on `release: published`, waits for quality to succeed, re-verifies source versions, builds in workspace order, normalizes publish-time `^x.y.z` deps, and publishes all 18 packages to npm with provenance (uses `NPM_TOKEN`).
 
 **Do not run `npm publish` manually. Do not hand-edit individual `package.json` versions.** `bump-version.mjs` is the single source of truth for lockstep version bumps — it's the only thing that keeps `check-source.mjs` and `release.yml`'s `PUBLISH_PACKAGES` list in sync.
 

@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest'
-import { rewritePackageManifest } from './bump-version.mjs'
+import { rewriteBunWorkspaceLock, rewriteNpmWorkspaceLock, rewritePackageManifest } from './bump-version.mjs'
 import { publishablePackageNames, publishTimeDependencyUpdates } from './package-manifest.mjs'
 
 describe('release version bump', () => {
@@ -33,6 +33,53 @@ describe('release version bump', () => {
         '@geometra/proxy': '^2.0.0',
       }),
     ).toThrow(/missing dependencies/)
+  })
+
+  it('updates workspace lock metadata without touching unrelated matching versions', () => {
+    const previousPackage = {
+      name: '@geometra/mcp',
+      version: '1.64.0',
+      dependencies: { '@geometra/proxy': '^1.64.0', zod: '^4.0.0' },
+    }
+    const nextPackage = {
+      ...previousPackage,
+      version: '1.65.0',
+      dependencies: { ...previousPackage.dependencies, '@geometra/proxy': '^1.65.0' },
+    }
+    const packageUpdates = [{ path: 'mcp', previousPackage, nextPackage }]
+    const npmLock = JSON.stringify({
+      packages: {
+        mcp: { ...previousPackage },
+        'node_modules/unrelated': { version: '1.64.0' },
+      },
+    })
+    const bunLock = `{
+  "workspaces": {
+    "mcp": {
+      "name": "@geometra/mcp",
+      "version": "1.64.0",
+      "dependencies": {
+        "@geometra/proxy": "^1.64.0",
+        "zod": "^4.0.0",
+      },
+    },
+  },
+  "packages": {
+    "unrelated": ["unrelated@1.64.0"],
+  },
+}\n`
+
+    const nextNpmLock = JSON.parse(rewriteNpmWorkspaceLock(npmLock, packageUpdates))
+    expect(nextNpmLock.packages.mcp).toMatchObject({
+      version: '1.65.0',
+      dependencies: { '@geometra/proxy': '^1.65.0' },
+    })
+    expect(nextNpmLock.packages['node_modules/unrelated'].version).toBe('1.64.0')
+
+    const nextBunLock = rewriteBunWorkspaceLock(bunLock, packageUpdates)
+    expect(nextBunLock).toContain('"version": "1.65.0"')
+    expect(nextBunLock).toContain('"@geometra/proxy": "^1.65.0"')
+    expect(nextBunLock).toContain('"unrelated@1.64.0"')
   })
 
   it('updates every renderer-canvas runtime edge together', () => {
