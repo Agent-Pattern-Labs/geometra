@@ -4361,11 +4361,16 @@ function normalizedFieldValue(value: string): string {
   return value.replace(/\s+/g, ' ').trim().toLowerCase()
 }
 
-function fieldValueMatches(actual: string | null | undefined, expected: string): boolean {
+function fieldValueMatches(actual: string | null | undefined, expected: string, inputType?: string): boolean {
   if (!actual) return false
   const normalizedActual = normalizedFieldValue(actual)
   const normalizedExpected = normalizedFieldValue(expected)
   if (!normalizedActual || !normalizedExpected) return false
+  if (inputType?.toLowerCase() === 'tel') {
+    const actualDigits = normalizedActual.replace(/\D/g, '')
+    const expectedDigits = normalizedExpected.replace(/\D/g, '')
+    return actualDigits.length > 0 && actualDigits === expectedDigits
+  }
   return normalizedActual === normalizedExpected
 }
 
@@ -5646,10 +5651,10 @@ export async function setFieldText(
 
   await delay(40)
   const current = await locatorCurrentValue(locator)
-  if (fieldValueMatches(current, normalized)) return
+  if (fieldValueMatches(current, normalized, inputType)) return
 
   const displayed = await locatorDisplayedValues(locator)
-  if (displayed.some(candidate => fieldValueMatches(candidate, normalized))) return
+  if (displayed.some(candidate => fieldValueMatches(candidate, normalized, inputType))) return
 
   throw new Error(`setFieldText: set "${fieldLabel}" but could not confirm value ${JSON.stringify(value)}`)
 }

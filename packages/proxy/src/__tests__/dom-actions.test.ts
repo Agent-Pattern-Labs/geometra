@@ -2694,6 +2694,28 @@ describe('setFieldText', () => {
     expect(await page.locator('#name').inputValue()).toBe('WRONG:Alice')
     await page.close()
   })
+
+  it('accepts formatting-only telephone readback without relaxing ordinary text matching', async () => {
+    const page = await browser.newPage({ viewport: { width: 900, height: 700 } })
+    await page.setContent(`
+      <label>Phone <input id="phone" type="tel" /></label>
+      <label>Reference <input id="reference" type="text" /></label>
+      <script>
+        const setter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value').set
+        for (const id of ['phone', 'reference']) {
+          const input = document.getElementById(id)
+          input.addEventListener('input', () => setter.call(input, '+1 929-608-1737'), { once: true })
+        }
+      </script>
+    `)
+
+    await expect(setFieldText(page, 'Phone', '+19296081737', { exact: true })).resolves.toBeUndefined()
+    expect(await page.locator('#phone').inputValue()).toBe('+1 929-608-1737')
+
+    await expect(setFieldText(page, 'Reference', '+19296081737', { exact: true })).rejects.toThrow('could not confirm value')
+    expect(await page.locator('#reference').inputValue()).toBe('+1 929-608-1737')
+    await page.close()
+  })
 })
 
 describe('setFieldChoice', () => {
