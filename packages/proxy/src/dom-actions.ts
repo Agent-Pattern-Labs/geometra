@@ -3538,6 +3538,7 @@ async function commitFilesToExactInput(
   handle: ElementHandle<Element>,
   paths: string[],
   targetName: 'matched input' | 'chooser input',
+  setFiles: (paths: string[]) => Promise<void> = async selectedPaths => handle.setInputFiles(selectedPaths),
 ): Promise<void> {
   const { guard, initial } = await beginFileInputCommitGuard(handle)
   try {
@@ -3558,7 +3559,7 @@ async function commitFilesToExactInput(
 
     let operationError: unknown
     try {
-      await handle.setInputFiles(paths)
+      await setFiles(paths)
     } catch (error) {
       operationError = error
     }
@@ -3650,7 +3651,15 @@ async function attachViaChooser(page: Page, paths: string[], clickX: number, cli
     page.mouse.click(clickX, clickY),
   ])
   const input = chooser.element() as ElementHandle<Element>
-  await commitFilesToExactInput(input, paths, 'chooser input')
+  try {
+    await commitFilesToExactInput(input, paths, 'chooser input', async selectedPaths => {
+      await chooser.setFiles(selectedPaths)
+    })
+  } finally {
+    // Playwright transfers ownership of this ElementHandle to the file-chooser
+    // listener. Release it on success and every preflight/error path.
+    await input.dispose().catch(() => {})
+  }
 }
 
 /**

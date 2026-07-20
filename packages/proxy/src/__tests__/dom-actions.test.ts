@@ -1702,6 +1702,39 @@ describe('attachFiles', () => {
       </script>
     `)
 
+    // Accept/preflight semantics do not depend on Chromium's native chooser
+    // scheduling, which has separate real-chooser coverage below. A fresh real
+    // input handle per call also proves every chooser handle is released.
+    let disposedChooserHandles = 0
+    Object.defineProperty(page.mouse, 'click', {
+      configurable: true,
+      value: async () => {},
+    })
+    Object.defineProperty(page, 'waitForEvent', {
+      configurable: true,
+      value: async (eventName: string) => {
+        if (eventName !== 'filechooser') throw new Error(`unexpected event ${eventName}`)
+        const handle = await page.locator('#chooser-accept').elementHandle()
+        if (!handle) throw new Error('expected chooser input handle')
+        const trackedHandle = new Proxy(handle, {
+          get(target, property) {
+            if (property === 'dispose') {
+              return async () => {
+                disposedChooserHandles++
+                await target.dispose()
+              }
+            }
+            const value = Reflect.get(target, property, target)
+            return typeof value === 'function' ? value.bind(target) : value
+          },
+        })
+        return {
+          element: () => trackedHandle,
+          setFiles: (files: string[]) => handle.setInputFiles(files),
+        }
+      },
+    })
+
     try {
       const box = await page.locator('#choose-file').boundingBox()
       if (!box) throw new Error('expected chooser bounds')
@@ -1713,9 +1746,11 @@ describe('attachFiles', () => {
       await attachFiles(page, [pdfFile], chooserTarget)
       await expect(attachFiles(page, [textFile], chooserTarget)).rejects.toThrow('did not match input accept=')
       await expect(attachFiles(page, [unknownFile], chooserTarget)).rejects.toThrow('cannot safely infer MIME type')
+      await attachFiles(page, [pdfFile], chooserTarget)
       expect(await page.locator('#chooser-accept').evaluate((el: HTMLInputElement) =>
         Array.from(el.files ?? []).map(file => file.name),
       )).toEqual([pdfFile.split('/').pop()])
+      expect(disposedChooserHandles).toBe(4)
     } finally {
       await Promise.all([pdfFile, textFile, unknownFile].map(path => rm(path, { force: true })))
       await page.close()
@@ -2100,8 +2135,13 @@ describe('attachFiles', () => {
         <script>
           const uploadButton = document.getElementById('upload')
           const chooserInput = document.getElementById('chooser-input')
+          globalThis.__geometraChooserEvents = { input: 0, change: 0 }
           uploadButton.addEventListener('click', () => chooserInput.click())
-          chooserInput.addEventListener('change', () => setTimeout(() => { chooserInput.value = '' }, 0))
+          chooserInput.addEventListener('input', () => { globalThis.__geometraChooserEvents.input++ })
+          chooserInput.addEventListener('change', () => {
+            globalThis.__geometraChooserEvents.change++
+            setTimeout(() => { chooserInput.value = '' }, 0)
+          })
         </script>
       `)
       const box = await page.locator('#upload').boundingBox()
@@ -2112,6 +2152,9 @@ describe('attachFiles', () => {
         clickY: box.y + box.height / 2,
       })).rejects.toThrow('upload outcome is ambiguous')
       expect(await page.locator('#chooser-input').evaluate((el: HTMLInputElement) => el.files?.length ?? 0)).toBe(0)
+      expect(await page.evaluate(() => (globalThis as unknown as {
+        __geometraChooserEvents: { input: number; change: number }
+      }).__geometraChooserEvents)).toEqual({ input: 1, change: 1 })
 
       await page.setContent(`
         <button id="blocked-upload" type="button">Upload blocked resume</button>
@@ -2309,37 +2352,27 @@ describe('attachFiles', () => {
     try {
       // Force the state transition at the exact Playwright protocol boundary:
       // after Geometra has installed its commit guard, immediately before the
-      // underlying ElementHandle.setInputFiles call.
-      const nativeWaitForEvent = page.waitForEvent.bind(page)
+      // underlying FileChooser.setFiles call. Native chooser scheduling has
+      // separate integration coverage and must not race this guard contract.
+      const input = await page.locator('#racing-chooser-input').elementHandle()
+      if (!input) throw new Error('expected racing chooser input handle')
+      Object.defineProperty(page.mouse, 'click', {
+        configurable: true,
+        value: async () => {},
+      })
       Object.defineProperty(page, 'waitForEvent', {
         configurable: true,
-        value: async (...args: unknown[]) => {
-          const chooser = await Reflect.apply(nativeWaitForEvent, page, args)
-          return new Proxy(chooser, {
-            get(target, property) {
-              if (property === 'element') {
-                return () => {
-                  const input = target.element()
-                  return new Proxy(input, {
-                    get(handle, handleProperty) {
-                      if (handleProperty === 'setInputFiles') {
-                        return async (...setArgs: unknown[]) => {
-                          await handle.evaluate((el: Element) => {
-                            if (el instanceof HTMLInputElement) el.disabled = true
-                          })
-                          return Reflect.apply(handle.setInputFiles, handle, setArgs)
-                        }
-                      }
-                      const value = Reflect.get(handle, handleProperty, handle)
-                      return typeof value === 'function' ? value.bind(handle) : value
-                    },
-                  })
-                }
-              }
-              const value = Reflect.get(target, property, target)
-              return typeof value === 'function' ? value.bind(target) : value
+        value: async (eventName: string) => {
+          if (eventName !== 'filechooser') throw new Error(`unexpected event ${eventName}`)
+          return {
+            element: () => input,
+            setFiles: async (paths: string[]) => {
+              await input.evaluate((el: Element) => {
+                if (el instanceof HTMLInputElement) el.disabled = true
+              })
+              await input.setInputFiles(paths)
             },
-          })
+          }
         },
       })
       const box = await page.locator('#racing-chooser-button').boundingBox()
