@@ -1,13 +1,13 @@
 export const publishablePackages = [
   { name: 'textura', path: 'packages/textura' },
   { name: '@geometra/core', path: 'packages/core' },
+  { name: '@geometra/client', path: 'packages/client' },
   { name: '@geometra/renderer-canvas', path: 'packages/renderer-canvas' },
   { name: '@geometra/renderer-terminal', path: 'packages/renderer-terminal' },
   { name: '@geometra/renderer-webgpu', path: 'packages/renderer-webgpu' },
   { name: '@geometra/renderer-pdf', path: 'packages/renderer-pdf' },
   { name: '@geometra/renderer-three', path: 'packages/renderer-three' },
   { name: '@geometra/server', path: 'packages/server' },
-  { name: '@geometra/client', path: 'packages/client' },
   { name: '@geometra/ui', path: 'packages/ui' },
   { name: '@geometra/router', path: 'packages/router' },
   { name: '@geometra/tw', path: 'packages/tw' },
@@ -22,15 +22,17 @@ export const publishablePackages = [
 export const packageJsonPath = (pkg) => `${pkg.path}/package.json`
 
 export function publishablePackageJsons() {
-  return publishablePackages.map(pkg => [pkg.name, packageJsonPath(pkg)])
+  return publishablePackages.map((pkg) => [pkg.name, packageJsonPath(pkg)])
 }
 
 export function publishablePackageNames() {
-  return publishablePackages.map(pkg => pkg.name)
+  return publishablePackages.map((pkg) => pkg.name)
 }
 
 export function publishTimeDependencyUpdates(version) {
-  const updatesByName = new Map(publishablePackages.map(pkg => [pkg.name, { name: pkg.name, path: pkg.path, dependencies: {} }]))
+  const updatesByName = new Map(
+    publishablePackages.map((pkg) => [pkg.name, { name: pkg.name, path: pkg.path, dependencies: {} }]),
+  )
   const addDependency = (packageName, dependencyName, spec) => {
     const update = updatesByName.get(packageName)
     if (!update) throw new Error(`Unknown publishable package in dependency manifest: ${packageName}`)
@@ -60,6 +62,7 @@ export function publishTimeDependencyUpdates(version) {
 
   addDependency('@geometra/renderer-three', '@geometra/client', `^${version}`)
   addDependency('@geometra/renderer-three', '@geometra/renderer-canvas', `^${version}`)
+  addDependency('@geometra/renderer-canvas', '@geometra/client', `^${version}`)
   addDependency('@geometra/tw', 'textura', `^${version}`)
   addDependency('@geometra/agent', '@geometra/server', `^${version}`)
   addDependency('@geometra/agent', '@geometra/ui', `^${version}`)

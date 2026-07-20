@@ -1,6 +1,6 @@
 {
   "name": "@geometra/core",
-  "version": "1.64.0",
+  "version": "1.65.0",
   "description": "DOM-free UI framework core: components, signals, reconciler",
   "license": "MIT",
   "type": "module",
@@ -39,7 +39,7 @@
     "check": "tsc --noEmit"
   },
   "dependencies": {
-    "textura": "^1.6.0"
+    "textura": "^1.65.0"
   },
   "optionalDependencies": {
     "@napi-rs/canvas": "^0.1.65"

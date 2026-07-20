@@ -1,9 +1,9 @@
 import { execFile } from 'node:child_process'
-import { readFile } from 'node:fs/promises'
+import { readFile, readdir } from 'node:fs/promises'
 import path from 'node:path'
 import { promisify } from 'node:util'
 import { fileURLToPath } from 'node:url'
-import { publishablePackageJsons } from './package-manifest.mjs'
+import { publishablePackageJsons, publishablePackageNames, publishablePackages } from './package-manifest.mjs'
 
 const execFileAsync = promisify(execFile)
 const repoRoot = fileURLToPath(new URL('../../', import.meta.url))
@@ -126,15 +126,10 @@ export function assertWorkspaceLockGraph({ rootPackage, npmLock, bunLock, versio
     'bun.lock: @geometra/proxy must resolve to workspace:packages/proxy',
   )
   assert(
-    !Object.keys(bunLock?.packages ?? {}).some(
-      (key) => key !== '@geometra/proxy' && key.endsWith('/@geometra/proxy'),
-    ),
+    !Object.keys(bunLock?.packages ?? {}).some((key) => key !== '@geometra/proxy' && key.endsWith('/@geometra/proxy')),
     'bun.lock: mcp must not retain a nested registry copy of @geometra/proxy',
   )
-  assert(
-    !bunLock?.packages?.['@geometra/mcp/zod'],
-    'bun.lock: mcp and the MCP SDK must share one Zod type identity',
-  )
+  assert(!bunLock?.packages?.['@geometra/mcp/zod'], 'bun.lock: mcp and the MCP SDK must share one Zod type identity')
 }
 
 export function assertMcpProxyDependency(pkg, version) {
@@ -142,6 +137,79 @@ export function assertMcpProxyDependency(pkg, version) {
   assert(
     pkg?.dependencies?.['@geometra/proxy'] === expected,
     `mcp/package.json: @geometra/proxy must be ${expected}, found ${pkg?.dependencies?.['@geometra/proxy'] ?? 'missing'}`,
+  )
+}
+
+export function assertInternalRuntimeDependencies(pkg, version, packageNames = publishablePackageNames()) {
+  const expected = `^${version}`
+  const internalNames = packageNames instanceof Set ? packageNames : new Set(packageNames)
+  for (const [name, spec] of Object.entries(pkg?.dependencies ?? {})) {
+    if (!internalNames.has(name)) continue
+    assert(
+      spec === expected,
+      `${pkg?.name ?? 'unknown package'}: dependencies["${name}"] must be ${expected}, found ${spec}`,
+    )
+  }
+}
+
+export function assertPublishablePackageCoverage(discoveredPackages, listedPackages = publishablePackages) {
+  const listedNames = new Set()
+  const listedPaths = new Set()
+  for (const pkg of listedPackages) {
+    assert(!listedNames.has(pkg.name), `release manifest lists ${pkg.name} more than once`)
+    assert(!listedPaths.has(pkg.path), `release manifest lists ${pkg.path} more than once`)
+    listedNames.add(pkg.name)
+    listedPaths.add(pkg.path)
+
+    const discovered = discoveredPackages.find((candidate) => candidate.path === pkg.path)
+    assert(discovered, `release manifest lists missing workspace ${pkg.path}`)
+    assert(discovered.name === pkg.name, `${pkg.path}: release manifest name must be ${discovered.name}`)
+    assert(discovered.private !== true, `${pkg.name}: private workspaces must not be published`)
+  }
+
+  for (const pkg of discoveredPackages) {
+    if (pkg.private === true) continue
+    assert(
+      listedNames.has(pkg.name) && listedPaths.has(pkg.path),
+      `${pkg.path}: non-private workspace ${pkg.name ?? 'unknown'} is missing from the release manifest`,
+    )
+  }
+}
+
+export function assertWorkspaceManifestLocks({ pkg, workspacePath, npmLock, bunLock }) {
+  const npmWorkspace = npmLock?.packages?.[workspacePath]
+  const bunWorkspace = bunLock?.workspaces?.[workspacePath]
+  for (const [lockName, workspace] of [
+    ['package-lock.json', npmWorkspace],
+    ['bun.lock', bunWorkspace],
+  ]) {
+    assert(workspace, `${lockName}: missing workspace ${workspacePath}`)
+    assert(!workspace.name || workspace.name === pkg.name, `${lockName}: ${workspacePath} must be named ${pkg.name}`)
+    assert(
+      workspace.version === pkg.version,
+      `${lockName}: ${pkg.name} workspace version must be ${pkg.version}, found ${workspace.version ?? 'missing'}`,
+    )
+    for (const [name, spec] of Object.entries(pkg.dependencies ?? {})) {
+      assert(
+        workspace.dependencies?.[name] === spec,
+        `${lockName}: ${pkg.name} dependency ${name} must be ${spec}, found ${workspace.dependencies?.[name] ?? 'missing'}`,
+      )
+    }
+  }
+}
+
+async function discoverPackageWorkspaces() {
+  const packageEntries = await readdir(path.join(repoRoot, 'packages'), { withFileTypes: true })
+  const manifestPaths = packageEntries
+    .filter((entry) => entry.isDirectory())
+    .map((entry) => `packages/${entry.name}/package.json`)
+  manifestPaths.push('mcp/package.json')
+
+  return Promise.all(
+    manifestPaths.map(async (manifestPath) => {
+      const pkg = await readJson(manifestPath)
+      return { name: pkg.name, path: path.dirname(manifestPath), private: pkg.private }
+    }),
   )
 }
 
@@ -177,15 +245,18 @@ export async function run(version) {
     readJson('package-lock.json'),
     readFile(path.join(repoRoot, 'bun.lock'), 'utf8'),
   ])
+  const bunLock = parseBunLock(bunLockSource)
   assertWorkspaceLockGraph({
     rootPackage,
     npmLock,
-    bunLock: parseBunLock(bunLockSource),
+    bunLock,
     version,
   })
   assertMcpProxyDependency(mcpPackage, version)
   await assertNoTrackedMcpPackageLock()
+  assertPublishablePackageCoverage(await discoverPackageWorkspaces())
 
+  const publishableNames = new Set(publishablePackageNames())
   for (const [expectedName, manifestPath] of publishablePackageJsons()) {
     const raw = await readFile(path.join(repoRoot, manifestPath), 'utf8')
     const pkg = JSON.parse(raw)
@@ -195,6 +266,8 @@ export async function run(version) {
     if (pkg.version !== version) {
       throw new Error(`${pkg.name}: package.json version ${pkg.version ?? 'unknown'} expected ${version}`)
     }
+    assertWorkspaceManifestLocks({ pkg, workspacePath: path.dirname(manifestPath), npmLock, bunLock })
+    assertInternalRuntimeDependencies(pkg, version, publishableNames)
     assertNoFileProtocolDeps(pkg, manifestPath, version)
     console.log(`${pkg.name}: ${pkg.version}`)
   }

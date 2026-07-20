@@ -1,5 +1,12 @@
 import { describe, expect, it } from 'vitest'
-import { assertMcpProxyDependency, assertWorkspaceLockGraph, parseBunLock } from './check-source.mjs'
+import {
+  assertInternalRuntimeDependencies,
+  assertMcpProxyDependency,
+  assertPublishablePackageCoverage,
+  assertWorkspaceManifestLocks,
+  assertWorkspaceLockGraph,
+  parseBunLock,
+} from './check-source.mjs'
 
 const VERSION = '1.64.0'
 
@@ -68,12 +75,7 @@ describe('release source workspace guards', () => {
 
   it('rejects a nested Bun proxy resolution', () => {
     const graph = validGraph()
-    graph.bunLock.packages['@geometra/mcp/@geometra/proxy'] = [
-      '@geometra/proxy@1.57.0',
-      '',
-      {},
-      '',
-    ]
+    graph.bunLock.packages['@geometra/mcp/@geometra/proxy'] = ['@geometra/proxy@1.57.0', '', {}, '']
 
     expect(() => assertWorkspaceLockGraph({ ...graph, version: VERSION })).toThrow(/nested registry copy/)
   })
@@ -89,8 +91,65 @@ describe('release source workspace guards', () => {
     expect(() =>
       assertMcpProxyDependency({ dependencies: { '@geometra/proxy': `^${VERSION}` } }, VERSION),
     ).not.toThrow()
+    expect(() => assertMcpProxyDependency({ dependencies: { '@geometra/proxy': '^1.63.0' } }, VERSION)).toThrow(
+      /must be/,
+    )
+  })
+
+  it('requires every internal runtime dependency to target the current release', () => {
+    const packageNames = new Set(['@geometra/client', '@geometra/core', '@geometra/renderer-canvas'])
+    const current = {
+      name: '@geometra/renderer-canvas',
+      dependencies: { '@geometra/client': `^${VERSION}`, '@geometra/core': `^${VERSION}` },
+    }
+
+    expect(() => assertInternalRuntimeDependencies(current, VERSION, packageNames)).not.toThrow()
     expect(() =>
-      assertMcpProxyDependency({ dependencies: { '@geometra/proxy': '^1.63.0' } }, VERSION),
-    ).toThrow(/must be/)
+      assertInternalRuntimeDependencies(
+        { ...current, dependencies: { ...current.dependencies, '@geometra/client': '^1.6.0' } },
+        VERSION,
+        packageNames,
+      ),
+    ).toThrow(/@geometra\/client.*must be/)
+  })
+
+  it('requires every non-private package workspace to appear in the release manifest exactly once', () => {
+    const discovered = [
+      { name: '@geometra/core', path: 'packages/core' },
+      { name: '@geometra/demo', path: 'packages/demo', private: true },
+    ]
+    const listed = [{ name: '@geometra/core', path: 'packages/core' }]
+
+    expect(() => assertPublishablePackageCoverage(discovered, listed)).not.toThrow()
+    expect(() =>
+      assertPublishablePackageCoverage([...discovered, { name: '@geometra/new', path: 'packages/new' }], listed),
+    ).toThrow(/missing from the release manifest/)
+    expect(() => assertPublishablePackageCoverage(discovered, [...listed, ...listed])).toThrow(/more than once/)
+  })
+
+  it('requires both lockfiles to mirror every published runtime dependency', () => {
+    const pkg = {
+      name: '@geometra/renderer-canvas',
+      version: VERSION,
+      dependencies: { '@geometra/client': `^${VERSION}` },
+    }
+    const locks = {
+      pkg,
+      workspacePath: 'packages/renderer-canvas',
+      npmLock: { packages: { 'packages/renderer-canvas': { ...pkg } } },
+      bunLock: { workspaces: { 'packages/renderer-canvas': { ...pkg } } },
+    }
+
+    expect(() => assertWorkspaceManifestLocks(locks)).not.toThrow()
+    expect(() =>
+      assertWorkspaceManifestLocks({
+        ...locks,
+        bunLock: {
+          workspaces: {
+            'packages/renderer-canvas': { ...pkg, dependencies: { '@geometra/client': '^1.6.0' } },
+          },
+        },
+      }),
+    ).toThrow(/bun\.lock.*@geometra\/client must be/)
   })
 })

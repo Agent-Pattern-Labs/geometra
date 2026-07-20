@@ -1,6 +1,6 @@
 {
   "name": "textura",
-  "version": "1.64.0",
+  "version": "1.65.0",
   "description": "DOM-free layout engine combining Yoga flexbox with Pretext text measurement",
   "license": "MIT",
   "type": "module",
@@ -38,7 +38,7 @@
     "demo:build": "vite build --config demo/vite.config.ts"
   },
   "dependencies": {
-    "@chenglou/pretext": "^0.0.3",
+    "@chenglou/pretext": "^0.0.8",
     "yoga-layout": "^3.2.1"
   }
 }

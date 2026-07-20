@@ -17,7 +17,7 @@
     "@geometra/ui": "*"
   },
   "devDependencies": {
-    "tsx": "^4.19.0",
+    "tsx": "^4.23.1",
     "vite": "^8.0.3"
   }
 }
