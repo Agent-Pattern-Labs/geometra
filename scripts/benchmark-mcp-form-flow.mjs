@@ -305,7 +305,16 @@ async function startStaticServer(filePath) {
 }
 
 function getToolHandler(server, name) {
-  return server._registeredTools[name].handler
+  const handler = getOptionalToolHandler(server, name)
+  if (!handler) {
+    throw new Error(`Benchmark MCP server does not expose ${name}`)
+  }
+  return handler
+}
+
+function getOptionalToolHandler(server, name) {
+  const handler = server?._registeredTools?.[name]?.handler
+  return typeof handler === 'function' ? handler : undefined
 }
 
 async function invokeTool(handler, name, input) {
@@ -345,12 +354,92 @@ function variantUrl(rawUrl, variant) {
   return next.toString()
 }
 
-async function runGeometraFlow(url, createServer, scenario, options) {
+function payloadSessionId(payload, phase) {
+  const sessionId = payload?.sessionId
+  if (typeof sessionId !== 'string' || sessionId.length === 0) {
+    throw new Error(`${phase} geometra_fill_form did not return a sessionId`)
+  }
+  return sessionId
+}
+
+async function activeSessionIds(listSessions) {
+  const result = await listSessions({})
+  const output = contentText(result)
+  if (result?.isError === true) {
+    throw new Error(`geometra_list_sessions failed: ${output || 'unknown error'}`)
+  }
+
+  let payload
+  try {
+    payload = JSON.parse(output)
+  } catch {
+    throw new Error(`geometra_list_sessions returned invalid JSON: ${output || '(empty output)'}`)
+  }
+  if (!Array.isArray(payload?.sessions)) {
+    throw new Error('geometra_list_sessions response did not contain a sessions array')
+  }
+
+  return payload.sessions.map(session => {
+    if (typeof session?.id !== 'string' || session.id.length === 0) {
+      throw new Error('geometra_list_sessions returned a session without an id')
+    }
+    return session.id
+  })
+}
+
+export async function cleanupGeometraSessions({
+  disconnect,
+  listSessions,
+  sessionIds,
+  baselineSessionIds = [],
+}) {
+  const idsToClose = new Set(sessionIds)
+  const baselineIds = new Set(baselineSessionIds)
+
+  // If a tool call created a session but failed before its payload could be
+  // parsed, recover sessions that appeared after this benchmark began. Never
+  // claim or close a session that was already active at the ownership
+  // baseline; it belongs to another caller even though the registry is shared.
+  if (listSessions) {
+    try {
+      for (const sessionId of await activeSessionIds(listSessions)) {
+        if (!baselineIds.has(sessionId)) idsToClose.add(sessionId)
+      }
+    } catch {
+      // The post-cleanup read below remains the authoritative leak check.
+    }
+  }
+
+  for (const sessionId of idsToClose) {
+    try {
+      await disconnect({ sessionId, closeBrowser: true })
+    } catch {
+      // Keep closing the remaining exact sessions even if one teardown fails.
+    }
+  }
+
+  if (!listSessions) return
+
+  const remainingOwnedSessionIds = (await activeSessionIds(listSessions))
+    .filter(sessionId => idsToClose.has(sessionId))
+  if (remainingOwnedSessionIds.length > 0) {
+    throw new Error(
+      `Geometra benchmark leaked active sessions after cleanup: ${remainingOwnedSessionIds.join(', ')}`,
+    )
+  }
+}
+
+export async function runGeometraFlow(url, createServer, scenario, options) {
   const server = createServer()
   const disconnect = getToolHandler(server, 'geometra_disconnect')
   const fillForm = getToolHandler(server, 'geometra_fill_form')
+  const listSessions = getOptionalToolHandler(server, 'geometra_list_sessions')
   const warmUrl = variantUrl(url, 'warm')
-  let browserOpen = false
+  const sessionIds = []
+  // Establish ownership before the first mutating tool call. If the registry
+  // cannot be read, fail before opening a browser rather than guessing that
+  // every later session belongs to this benchmark.
+  const baselineSessionIds = listSessions ? await activeSessionIds(listSessions) : []
   try {
     const fillStep = await invokeTool(fillForm, 'geometra_fill_form', {
       pageUrl: url,
@@ -363,14 +452,16 @@ async function runGeometraFlow(url, createServer, scenario, options) {
       includeSteps: false,
       detail: 'minimal',
       failOnInvalid: true,
+      isolated: false,
     })
     if (!fillStep.outputText.startsWith('{')) {
       throw new Error(`geometra_fill_form failed: ${fillStep.outputText}`)
     }
-    browserOpen = true
 
     const fillPayload = JSON.parse(fillStep.outputText)
-    await disconnect({})
+    const coldSessionId = payloadSessionId(fillPayload, 'cold')
+    sessionIds.push(coldSessionId)
+    await disconnect({ sessionId: coldSessionId })
 
     const warmStep = await invokeTool(fillForm, 'geometra_fill_form', {
       pageUrl: warmUrl,
@@ -383,12 +474,14 @@ async function runGeometraFlow(url, createServer, scenario, options) {
       includeSteps: false,
       detail: 'minimal',
       failOnInvalid: true,
+      isolated: false,
     })
     if (!warmStep.outputText.startsWith('{')) {
       throw new Error(`warm geometra_fill_form failed: ${warmStep.outputText}`)
     }
 
     const warmPayload = JSON.parse(warmStep.outputText)
+    sessionIds.push(payloadSessionId(warmPayload, 'warm'))
 
     return {
       steps: [fillStep],
@@ -401,13 +494,12 @@ async function runGeometraFlow(url, createServer, scenario, options) {
       },
     }
   } finally {
-    if (browserOpen) {
-      try {
-        await disconnect({ closeBrowser: true })
-      } catch {
-        /* best effort cleanup */
-      }
-    }
+    await cleanupGeometraSessions({
+      disconnect,
+      listSessions,
+      sessionIds,
+      baselineSessionIds,
+    })
   }
 }
 
@@ -702,7 +794,9 @@ async function main() {
   }
 }
 
-main().catch(error => {
-  console.error(error)
-  process.exit(1)
-})
+if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
+  main().catch(error => {
+    console.error(error)
+    process.exit(1)
+  })
+}

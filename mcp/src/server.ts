@@ -4,6 +4,7 @@ import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js'
 import { z } from 'zod'
 import { formatConnectFailureMessage, isHttpUrl, normalizeConnectTarget } from './connect-utils.js'
 import { REDACTED_STATE_URL, sanitizeUrlToOrigin } from './state-privacy.js'
+import { SERVER_IMPLEMENTATION } from './version.js'
 import {
   connect,
   connectThroughProxy,
@@ -895,7 +896,7 @@ type BatchAction = z.infer<typeof batchActionSchema>
 
 export function createServer(): McpServer {
   const server = new McpServer(
-    { name: 'geometra', version: '1.19.26' },
+    SERVER_IMPLEMENTATION,
     { capabilities: { tools: {} } },
   )
 
@@ -1723,6 +1724,7 @@ Pass \`valuesById\` with field ids from \`geometra_form_schema\` for the most st
       let fallbackFromBatch: { attempted: true; used: true; reason: 'batched-threw' | 'batched-invalid-readback'; attempts: number } | undefined
       if (!includeSteps) {
         let usedBatch = false
+        let batchReadbackSnapshot: A11yNode | undefined
         try {
           const startRevision = session.updateRevision
           const wait = await sendFillFields(session, toProxyFillFields(planned.fields))
@@ -1790,8 +1792,20 @@ Pass \`valuesById\` with field ids from \`geometra_form_schema\` for the most st
             }
           }
           await waitForDeferredBatchUpdate(session, startRevision, wait)
-          await waitForBatchFieldReadback(session, planned.fields)
-          usedBatch = true
+          batchReadbackSnapshot = await waitForBatchFieldReadback(session, planned.fields)
+          if (!batchReadbackSnapshot) {
+            if (!sessionA11y(session)) {
+              throw new AmbiguousActionOutcomeError(
+                'Batched form fill',
+                wait,
+                'Batched form fill was sent, but its read-back evidence became unavailable before confirmation. The fields may already have changed. Do not retry blindly.',
+              )
+            }
+            usedBatch = false
+            fallbackFromBatch = { attempted: true, used: true, reason: 'batched-invalid-readback', attempts: 2 }
+          } else {
+            usedBatch = true
+          }
         } catch (e) {
           const ambiguity = ambiguousOutcomeDetails(e)
           if (ambiguity) {
@@ -1811,7 +1825,7 @@ Pass \`valuesById\` with field ids from \`geometra_form_schema\` for the most st
         }
 
         if (usedBatch) {
-          const after = sessionA11y(session)
+          const after = batchReadbackSnapshot
           const signals = after
             ? scopeSessionSignalsToForm(
                 after,
@@ -1827,7 +1841,7 @@ Pass \`valuesById\` with field ids from \`geometra_form_schema\` for the most st
         }
 
         if (usedBatch) {
-          const after = sessionA11y(session)
+          const after = batchReadbackSnapshot
           const signals = after
             ? scopeSessionSignalsToForm(
                 after,
@@ -1836,7 +1850,9 @@ Pass \`valuesById\` with field ids from \`geometra_form_schema\` for the most st
               )
             : undefined
           const invalidRemaining = signals?.invalidFields.length ?? 0
-          const verification = verifyFills ? verifyFormFills(session, planned.planned) : undefined
+          const verification = verifyFills
+            ? verifyFormFills(session, planned.planned, batchReadbackSnapshot)
+            : undefined
           const payload = {
             ...connection,
             completed: true,
@@ -5748,7 +5764,13 @@ async function tryBatchedResolvedFields(
   fields: ResolvedFillFieldInput[],
   detail: ResponseDetail,
 ): Promise<
-  | { ok: true; finalSource: 'proxy' | 'session'; final: ProxyFillAckResult | Record<string, unknown>; invalidRemaining: number }
+  | {
+      ok: true
+      finalSource: 'proxy' | 'session'
+      final: ProxyFillAckResult | Record<string, unknown>
+      invalidRemaining: number
+      readbackSnapshot?: A11yNode
+    }
   | { ok: false }
 > {
   let batchAckResult: ProxyFillAckResult | undefined
@@ -5782,25 +5804,34 @@ async function tryBatchedResolvedFields(
       }
     }
     await waitForDeferredBatchUpdate(session, startRevision, wait)
-    await waitForBatchFieldReadback(session, fields)
+    const readbackSnapshot = await waitForBatchFieldReadback(session, fields)
+    if (!readbackSnapshot) {
+      if (!sessionA11y(session)) {
+        throw new AmbiguousActionOutcomeError(
+          'Batched field fill',
+          wait,
+          'Batched field fill was sent, but its read-back evidence became unavailable before confirmation. The fields may already have changed. Do not retry blindly.',
+        )
+      }
+      return { ok: false }
+    }
+
+    const signals = collectSessionSignals(readbackSnapshot)
+    const invalidRemaining = signals.invalidFields.length
+    if ((!batchAckResult || batchAckResult.invalidCount > 0) && invalidRemaining > 0) {
+      return { ok: false }
+    }
+
+    return {
+      ok: true,
+      finalSource: 'session',
+      final: sessionSignalsPayload(signals, detail),
+      invalidRemaining,
+      readbackSnapshot,
+    }
   } catch (e) {
     if (canFallbackToSequentialFill(e)) return { ok: false }
     throw e
-  }
-
-  const after = sessionA11y(session)
-  if (!after) return { ok: false }
-  const signals = collectSessionSignals(after)
-  const invalidRemaining = signals.invalidFields.length
-  if ((!batchAckResult || batchAckResult.invalidCount > 0) && invalidRemaining > 0) {
-    return { ok: false }
-  }
-
-  return {
-    ok: true,
-    finalSource: 'session',
-    final: sessionSignalsPayload(signals, detail),
-    invalidRemaining,
   }
 }
 
@@ -5813,12 +5844,19 @@ async function waitForDeferredBatchUpdate(
   await waitForUiCondition(session, () => session.updateRevision > startRevision, 750)
 }
 
-async function waitForBatchFieldReadback(session: Session, fields: ResolvedFillFieldInput[]): Promise<void> {
+async function waitForBatchFieldReadback(
+  session: Session,
+  fields: ResolvedFillFieldInput[],
+): Promise<A11yNode | undefined> {
+  let matchingSnapshot: A11yNode | undefined
   await waitForUiCondition(session, () => {
     const a11y = sessionA11y(session)
     if (!a11y) return false
-    return fields.every(field => batchFieldReadbackMatches(a11y, field))
+    if (!fields.every(field => batchFieldReadbackMatches(a11y, field))) return false
+    matchingSnapshot = a11y
+    return true
   }, 1500)
+  return matchingSnapshot
 }
 
 function batchFieldReadbackMatches(a11y: A11yNode, field: ResolvedFillFieldInput): boolean {
@@ -6257,16 +6295,17 @@ async function executeBatchAction(
       const resolvedFields = resolveFillFieldInputs(session, action.fields)
       if (!resolvedFields.ok) throw new Error(resolvedFields.error)
       const verifyFillsFn = action.verifyFills
-        ? () => verifyFormFills(
+        ? (readbackSnapshot?: A11yNode) => verifyFormFills(
             session,
             resolvedFields.fields.map(field => ({ field, confidence: 1.0, matchMethod: 'label-exact' as const })),
+            readbackSnapshot,
           )
         : undefined
       let fallbackFromBatch: { attempted: true; used: true; reason: 'batched-unavailable'; attempts: number } | undefined
       if (!includeSteps) {
         const batched = await tryBatchedResolvedFields(session, resolvedFields.fields, detail)
         if (batched.ok) {
-          const verification = verifyFillsFn?.()
+          const verification = verifyFillsFn?.(batched.readbackSnapshot)
           return {
             summary: `Filled ${resolvedFields.fields.length} field(s) in one proxy batch.`,
             compact: {
@@ -6439,8 +6478,9 @@ export function valuesEquivalent(expected: string, actual: string): boolean {
 function verifyFormFills(
   session: Session,
   planned: PlannedFillField[],
+  readbackSnapshot?: A11yNode,
 ): { verified: number; mismatches: Array<{ fieldLabel: string; expected: string; actual?: string; fieldId?: string }> } {
-  const a11y = sessionA11y(session)
+  const a11y = readbackSnapshot ?? sessionA11y(session)
   if (!a11y) return { verified: 0, mismatches: [] }
 
   const mismatches: Array<{ fieldLabel: string; expected: string; actual?: string; fieldId?: string }> = []

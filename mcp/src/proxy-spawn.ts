@@ -182,6 +182,44 @@ export interface SpawnProxyParams {
   proxy?: SpawnProxyConfig
 }
 
+export interface RuntimeDrainOptions {
+  /** Override the environment-derived debug decision, primarily for embedders and tests. */
+  debug?: boolean
+  /** Receive already-prefixed proxy stderr chunks when debug forwarding is enabled. */
+  forwardStderr?: (text: string) => void
+}
+
+export interface SpawnedProxyReadyOptions {
+  /** Override the production ready deadline, primarily for focused process tests. */
+  readyTimeoutMs?: number
+  /** Override post-ready output handling, primarily for embedders and tests. */
+  runtimeDrains?: RuntimeDrainOptions
+}
+
+/**
+ * Consume a spawned proxy's output after its ready signal so full stdio pipes
+ * cannot block the child. Runtime logs remain quiet unless debug forwarding is
+ * explicitly enabled.
+ */
+export function attachRuntimeDrains(
+  child: Pick<ChildProcess, 'stdout' | 'stderr'>,
+  options: RuntimeDrainOptions = {},
+): void {
+  child.stdout?.resume()
+
+  const debug = options.debug ?? process.env.GEOMETRA_PROXY_DEBUG === '1'
+  if (!debug) {
+    child.stderr?.resume()
+    return
+  }
+
+  const forwardStderr = options.forwardStderr ?? ((text: string) => { process.stderr.write(text) })
+  child.stderr?.on('data', chunk => {
+    const text = chunk.toString()
+    forwardStderr(/^\[geometra-proxy\](?:\s|$)/.test(text) ? text : `[geometra-proxy] ${text}`)
+  })
+}
+
 export function resolveStealthMode(stealth?: boolean): boolean {
   if (stealth !== undefined) return stealth
 
@@ -322,20 +360,32 @@ export function spawnGeometraProxy(
     ...(opts.proxy?.bypass !== undefined ? { GEOMETRA_PROXY_BYPASS: opts.proxy.bypass } : {}),
   }
 
-  return new Promise((resolve, reject) => {
-    const child = spawn(process.execPath, args, {
-      stdio: ['ignore', 'pipe', 'pipe'],
-      env: childEnv,
-    })
+  const child = spawn(process.execPath, args, {
+    stdio: ['ignore', 'pipe', 'pipe'],
+    env: childEnv,
+  })
+  return waitForSpawnedProxyReady(child, opts, authToken)
+}
 
+/**
+ * Wait for a spawned proxy's structured ready signal, then hand both output
+ * pipes to their lifetime drains before returning the child to its caller.
+ */
+export function waitForSpawnedProxyReady(
+  child: ChildProcess,
+  opts: SpawnProxyParams,
+  authToken: string,
+  options: SpawnedProxyReadyOptions = {},
+): Promise<{ child: ChildProcess; wsUrl: string; authToken: string }> {
+  return new Promise((resolve, reject) => {
     let settled = false
     let stdoutBuf = ''
     let stderrBuf = ''
 
     const cleanup = () => {
       clearTimeout(deadline)
-      child.stdout?.removeAllListeners('data')
-      child.stderr?.removeAllListeners('data')
+      child.stdout?.off('data', consumeStdout)
+      child.stderr?.off('data', consumeStderr)
     }
 
     const tryResolveReady = (line: string) => {
@@ -343,6 +393,7 @@ export function spawnGeometraProxy(
       if (!wsUrl || settled) return false
       settled = true
       cleanup()
+      attachRuntimeDrains(child, options.runtimeDrains)
       resolve({ child, wsUrl, authToken })
       return true
     }
@@ -376,7 +427,7 @@ export function spawnGeometraProxy(
           ),
         )
       }
-    }, READY_TIMEOUT_MS)
+    }, options.readyTimeoutMs ?? READY_TIMEOUT_MS)
 
     child.stdout?.on('data', consumeStdout)
     child.stderr?.on('data', consumeStderr)

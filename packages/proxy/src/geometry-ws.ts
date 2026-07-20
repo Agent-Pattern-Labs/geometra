@@ -1097,9 +1097,11 @@ async function fillFieldsAckResult(page: Page): Promise<Record<string, unknown>>
   // or similar. Counting both gives fill_form a reliable signal for whether
   // a custom dropdown commit actually landed, which is the authoritative
   // check used throughout the listbox pick pipeline (see readAriaInvalid in
-  // dom-actions.ts). The `:is()` selector de-duplicates the two passes so
-  // elements that match both just count once.
-  const invalidSelector = ':is(:invalid, [aria-invalid="true"]:is(input, textarea, select, [role="combobox"], [role="listbox"], [role="spinbutton"], [role="searchbox"], [role="textbox"]))'
+  // dom-actions.ts). Restrict native validity to actual controls because
+  // `:invalid` also matches ancestor <form> and <fieldset> elements whenever
+  // one descendant is invalid. The outer `:is()` de-duplicates controls that
+  // also advertise aria-invalid.
+  const invalidSelector = ':is(:is(input, textarea, select):invalid, [aria-invalid="true"]:is(input, textarea, select, [role="combobox"], [role="listbox"], [role="spinbutton"], [role="searchbox"], [role="textbox"]))'
   const [invalidCount, alertCount, dialogCount, busyCount] = await Promise.all([
     countAcrossFrames(frames, invalidSelector),
     countAcrossFrames(frames, '[role="alert"], [role="alertdialog"]'),

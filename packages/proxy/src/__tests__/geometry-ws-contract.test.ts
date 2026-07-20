@@ -302,6 +302,92 @@ function wireMessageHasX(message: Record<string, unknown>, expected: number): bo
 }
 
 describe('proxy action acknowledgement liveness', () => {
+  it('returns structured fillFields counts on the correlated ack after committing exact DOM values', async () => {
+    const browser = await chromium.launch({ headless: true })
+    const page = await browser.newPage({ viewport: { width: 640, height: 480 } })
+    await page.setContent(`
+      <form>
+        <fieldset>
+          <label for="full-name">Full name</label>
+          <input id="full-name" />
+          <label for="email">Email</label>
+          <input id="email" type="email" />
+          <label for="current-role">Current role</label>
+          <input id="current-role" required />
+          <div role="combobox" aria-invalid="true">Unresolved location</div>
+          <p role="alert">One application warning</p>
+          <section role="dialog" aria-label="Application help">Dialog content</section>
+          <div aria-busy="true">Saving draft</div>
+        </fieldset>
+      </form>
+    `)
+    let resolvePort!: (port: number) => void
+    const portPromise = new Promise<number>(resolve => { resolvePort = resolve })
+    const hub = startGeometryWebSocket({
+      port: 0,
+      authToken: AUTH_TOKEN,
+      page,
+      debounceMs: 20,
+      onListening: resolvePort,
+    })
+    let controller: WsClient | undefined
+
+    try {
+      await installDomObserver(page, hub.scheduleExtract)
+      controller = await openAuthorized(`ws://127.0.0.1:${await portPromise}`)
+      const requestId = 'fill-fields-structured-result'
+      const ackPromise = nextWireMessage(
+        controller,
+        message => message.type === 'ack' && message.requestId === requestId,
+        5_000,
+      )
+
+      controller.send(JSON.stringify({
+        type: 'fillFields',
+        requestId,
+        actionTimeoutMs: 4_000,
+        protocolVersion: 2,
+        geometryProtocolVersion: 1,
+        proxyActionProtocolVersion: 2,
+        fields: [
+          {
+            kind: 'text',
+            fieldKey: 'id:full-name',
+            fieldLabel: 'Full name',
+            value: 'Taylor Applicant',
+            exact: true,
+          },
+          {
+            kind: 'text',
+            fieldKey: 'id:email',
+            fieldLabel: 'Email',
+            value: 'taylor@example.com',
+            exact: true,
+          },
+        ],
+      }))
+
+      await expect(ackPromise).resolves.toMatchObject({
+        type: 'ack',
+        requestId,
+        result: {
+          // One native invalid control plus one ARIA-invalid combobox. The
+          // invalid ancestor <form>/<fieldset> must not inflate this count.
+          invalidCount: 2,
+          alertCount: 1,
+          dialogCount: 1,
+          busyCount: 1,
+        },
+      })
+      await expect(page.locator('#full-name').inputValue()).resolves.toBe('Taylor Applicant')
+      await expect(page.locator('#email').inputValue()).resolves.toBe('taylor@example.com')
+    } finally {
+      controller?.close()
+      await hub.close()
+      await browser.close()
+    }
+  })
+
   it('keeps one idempotency ledger for the lifetime of a hub', async () => {
     const browser = await chromium.launch({ headless: true })
     const page = await browser.newPage({ viewport: { width: 640, height: 480 } })

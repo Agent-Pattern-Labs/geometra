@@ -1043,19 +1043,43 @@ async function locatorMatchesControlLabel(locator: Locator, fieldLabel: string, 
       if (root instanceof Document) return root.getElementById(id)
       return null
     }
-    function referencedText(owner: Element, ids: string | null): string {
+    function textWithoutNestedControls(node: Node): string {
+      if (node.nodeType === Node.TEXT_NODE) return node.textContent ?? ''
+      if (!(node instanceof Element)) return ''
+      const tag = node.tagName.toLowerCase()
+      if (tag === 'input' || tag === 'select' || tag === 'textarea' || tag === 'button') return ''
+      return Array.from(node.childNodes).map(textWithoutNestedControls).join('')
+    }
+    function referencedText(owner: Element, ids: string | null, visited?: Set<string>): string {
       if (!ids) return ''
-      return ids.split(/\s+/).map(id => rootScopedElementById(owner, id)?.textContent?.trim() ?? '').filter(Boolean).join(' ')
+      const seen = visited ?? new Set<string>()
+      return ids
+        .split(/\s+/)
+        .map(id => {
+          if (seen.has(id)) return ''
+          seen.add(id)
+          const target = rootScopedElementById(owner, id)
+          if (!target) return ''
+          const chained = target.getAttribute('aria-labelledby')
+          if (chained) return referencedText(target, chained, seen)
+          return textWithoutNestedControls(target).replace(/\s+/g, ' ').trim()
+        })
+        .filter(Boolean)
+        .join(' ')
     }
     const explicit = el.getAttribute('aria-label')?.trim() || referencedText(el, el.getAttribute('aria-labelledby'))
     if (explicit) return explicit
     if (el instanceof HTMLInputElement || el instanceof HTMLSelectElement || el instanceof HTMLTextAreaElement) {
-      const associated = Array.from(el.labels ?? []).map(label => label.textContent?.trim() ?? '').find(Boolean)
+      const associated = Array.from(el.labels ?? [])
+        .map(label => textWithoutNestedControls(label).replace(/\s+/g, ' ').trim())
+        .find(Boolean)
       if (associated) return associated
       const placeholder = el.getAttribute('placeholder')?.trim()
       if (placeholder) return placeholder
     }
-    if (el.parentElement instanceof HTMLLabelElement) return el.parentElement.textContent?.trim() || ''
+    if (el.parentElement instanceof HTMLLabelElement) {
+      return textWithoutNestedControls(el.parentElement).replace(/\s+/g, ' ').trim()
+    }
     return el.getAttribute('title')?.trim() || el.textContent?.trim() || ''
   }).catch(() => '')
   const candidate = normalizedOptionLabel(accessibleName)

@@ -3522,6 +3522,174 @@ describe('query and reveal tools', () => {
     })
   })
 
+  it('preserves an exact batched fill_form readback if the UI disappears before result shaping', async () => {
+    const handler = getToolHandler('geometra_fill_form')
+    mockState.sendFillFields.mockResolvedValueOnce({
+      status: 'updated',
+      timeoutMs: 6000,
+      requestId: 'fill-form-captured-request',
+      actionId: 'fill-form-captured-action',
+      result: undefined,
+    })
+    mockState.formSchemas = [{
+      formId: 'fm:0',
+      name: 'Application',
+      fieldCount: 1,
+      requiredCount: 1,
+      invalidCount: 0,
+      fields: [
+        { id: 'ff:0.0', kind: 'text', label: 'Full name', required: true },
+      ],
+    }]
+    mockState.currentA11yRoot = node('group', undefined, {
+      meta: { pageUrl: 'https://jobs.example.com/application', scrollX: 0, scrollY: 640 },
+      children: [
+        node('form', 'Application', {
+          path: [0],
+          children: [
+            node('textbox', 'Full name', {
+              path: [0, 0],
+              value: 'Taylor Applicant',
+              state: { required: true },
+            }),
+          ],
+        }),
+      ],
+    })
+    mockState.waitForUiCondition.mockImplementationOnce(async (_session, check) => {
+      const matched = check()
+      expect(matched).toBe(true)
+      mockState.session.ws.readyState = 3
+      mockState.session.hasFreshFrame = false
+      return matched
+    })
+
+    const result = await handler({
+      valuesById: { 'ff:0.0': 'Taylor Applicant' },
+      includeSteps: false,
+      verifyFills: true,
+      detail: 'minimal',
+    })
+    const payload = JSON.parse(result.content[0]!.text) as Record<string, unknown>
+
+    expect(result.isError).toBeUndefined()
+    expect(payload).toMatchObject({
+      completed: true,
+      execution: 'batched',
+      finalSource: 'session',
+      formId: 'fm:0',
+      successCount: 1,
+      errorCount: 0,
+      verification: { verified: 1, mismatches: [] },
+      final: { invalidCount: 0 },
+    })
+    expect(mockState.sendFillFields).toHaveBeenCalledOnce()
+    expect(mockState.sendFieldText).not.toHaveBeenCalled()
+  })
+
+  it('does not replay compact fill_form when post-batch evidence disappears unconfirmed', async () => {
+    const handler = getToolHandler('geometra_fill_form')
+    mockState.sendFillFields.mockResolvedValueOnce({
+      status: 'updated',
+      timeoutMs: 6000,
+      requestId: 'fill-form-missing-request',
+      actionId: 'fill-form-missing-action',
+      result: undefined,
+    })
+    mockState.formSchemas = [{
+      formId: 'fm:0',
+      name: 'Application',
+      fieldCount: 1,
+      requiredCount: 1,
+      invalidCount: 1,
+      fields: [
+        { id: 'ff:0.0', kind: 'text', label: 'Full name', required: true, invalid: true },
+      ],
+    }]
+    mockState.currentA11yRoot = node('group', undefined, {
+      meta: { pageUrl: 'https://jobs.example.com/application', scrollX: 0, scrollY: 640 },
+      children: [
+        node('form', 'Application', {
+          path: [0],
+          children: [
+            node('textbox', 'Full name', {
+              path: [0, 0],
+              state: { required: true, invalid: true },
+            }),
+          ],
+        }),
+      ],
+    })
+    mockState.waitForUiCondition.mockImplementationOnce(async (_session, check) => {
+      expect(check()).toBe(false)
+      mockState.session.ws.readyState = 3
+      mockState.session.hasFreshFrame = false
+      return false
+    })
+
+    const result = await handler({
+      valuesById: { 'ff:0.0': 'Taylor Applicant' },
+      includeSteps: false,
+      detail: 'minimal',
+    })
+    const payload = JSON.parse(result.content[0]!.text) as Record<string, unknown>
+
+    expect(result.isError).toBe(true)
+    expect(payload).toMatchObject({
+      completed: false,
+      execution: 'batched',
+      formId: 'fm:0',
+      outcome: 'unconfirmed',
+      retrySafety: 'inspect-first',
+      wait: 'updated',
+      requestId: 'fill-form-missing-request',
+      actionId: 'fill-form-missing-action',
+    })
+    expect(mockState.sendFillFields).toHaveBeenCalledOnce()
+    expect(mockState.sendFieldText).not.toHaveBeenCalled()
+  })
+
+  it('does not replay compact fill_fields when post-batch evidence disappears unconfirmed', async () => {
+    const handler = getToolHandler('geometra_fill_fields')
+    mockState.sendFillFields.mockResolvedValueOnce({
+      status: 'updated',
+      timeoutMs: 6000,
+      requestId: 'fill-fields-missing-request',
+      actionId: 'fill-fields-missing-action',
+      result: undefined,
+    })
+    mockState.currentA11yRoot = node('group', undefined, {
+      meta: { pageUrl: 'https://jobs.example.com/application', scrollX: 0, scrollY: 640 },
+      children: [node('textbox', 'Full name', { path: [0], value: '' })],
+    })
+    mockState.waitForUiCondition.mockImplementationOnce(async (_session, check) => {
+      expect(check()).toBe(false)
+      mockState.session.ws.readyState = 3
+      mockState.session.hasFreshFrame = false
+      return false
+    })
+
+    const result = await handler({
+      fields: [{ kind: 'text', fieldLabel: 'Full name', value: 'Taylor Applicant' }],
+      includeSteps: false,
+      detail: 'minimal',
+    })
+    const payload = JSON.parse(result.content[0]!.text) as Record<string, unknown>
+
+    expect(result.isError).toBe(true)
+    expect(payload).toMatchObject({
+      completed: false,
+      execution: 'batched',
+      outcome: 'unconfirmed',
+      retrySafety: 'inspect-first',
+      wait: 'updated',
+      requestId: 'fill-fields-missing-request',
+      actionId: 'fill-fields-missing-action',
+    })
+    expect(mockState.sendFillFields).toHaveBeenCalledOnce()
+    expect(mockState.sendFieldText).not.toHaveBeenCalled()
+  })
+
   it('falls back to sequential fill when a batched fill ends without a clean ack and invalid fields remain', async () => {
     const handler = getToolHandler('geometra_fill_form')
     mockState.sendFillFields.mockResolvedValueOnce({

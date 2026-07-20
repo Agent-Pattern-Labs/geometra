@@ -2693,6 +2693,58 @@ describe('setFieldChoice', () => {
     await page.close()
   })
 
+  it('accepts an extractor fieldKey and exact label for a wrapped native select', async () => {
+    const page = await browser.newPage({ viewport: { width: 900, height: 700 } })
+    await page.setContent(`
+      <label>
+        Preferred location
+        <select id="location">
+          <option value="">Choose one</option>
+          <option>Berlin, Germany</option>
+        </select>
+      </label>
+    `)
+
+    await setFieldChoice(page, 'Preferred location', 'Berlin, Germany', {
+      fieldKey: 'id:location',
+      choiceType: 'select',
+      exact: true,
+    })
+
+    expect(await page.locator('#location').inputValue()).toBe('Berlin, Germany')
+    await page.close()
+  })
+
+  it('does not let an authored key target a differently labeled native select', async () => {
+    const page = await browser.newPage({ viewport: { width: 900, height: 700 } })
+    await page.setContent(`
+      <label>
+        Billing location
+        <select id="location">
+          <option value="">Choose one</option>
+          <option>Berlin, Germany</option>
+        </select>
+      </label>
+      <label>
+        Preferred location
+        <select id="preferred-location">
+          <option value="">Choose one</option>
+          <option>Berlin, Germany</option>
+        </select>
+      </label>
+    `)
+
+    await expect(setFieldChoice(page, 'Preferred location', 'Berlin, Germany', {
+      fieldKey: 'id:location',
+      choiceType: 'select',
+      exact: true,
+    })).rejects.toThrow('fieldKey "id:location" did not match field label "Preferred location"')
+
+    expect(await page.locator('#location').inputValue()).toBe('')
+    expect(await page.locator('#preferred-location').inputValue()).toBe('')
+    await page.close()
+  })
+
   it('chooses repeated yes/no answers by question label', async () => {
     const page = await browser.newPage({ viewport: { width: 900, height: 900 } })
     await page.setContent(`
@@ -3132,6 +3184,31 @@ describe('fillFields auto', () => {
       sponsorshipNo: true,
       hybridNo: true,
     })
+    await page.close()
+  })
+
+  it('fills a wrapped native select through the extractor fieldKey and exact label pair', async () => {
+    const page = await browser.newPage({ viewport: { width: 900, height: 700 } })
+    await page.setContent(`
+      <label>
+        Preferred location
+        <select id="location">
+          <option value="">Choose one</option>
+          <option>Berlin, Germany</option>
+        </select>
+      </label>
+    `)
+
+    await fillFields(page, [{
+      kind: 'choice',
+      fieldKey: 'id:location',
+      fieldLabel: 'Preferred location',
+      value: 'Berlin, Germany',
+      choiceType: 'select',
+      exact: true,
+    }])
+
+    expect(await page.locator('#location').inputValue()).toBe('Berlin, Germany')
     await page.close()
   })
 
