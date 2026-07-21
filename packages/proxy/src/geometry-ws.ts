@@ -1520,12 +1520,13 @@ export function startGeometryWebSocket(options: {
         changed = (await runExtract()) || changed
       }
     } finally {
+      // A timer can be armed against an older completion while a separate
+      // debounce/action path starts this extraction. Preserve that coalesced
+      // request, but rebase it below so it cannot bypass the new cooldown.
+      const rearmImmediateExtract = takePendingImmediateExtract()
       extracting = false
       lastExtractCompletedAtMs = performance.now()
-      if (immediateExtractRequestedAfterActive) {
-        immediateExtractRequestedAfterActive = false
-        armImmediateExtract()
-      }
+      if (rearmImmediateExtract) armImmediateExtract()
     }
     return changed
   }
@@ -1544,12 +1545,18 @@ export function startGeometryWebSocket(options: {
     }
   }
 
-  function clearImmediateExtractTimer() {
+  function takePendingImmediateExtract(): boolean {
+    const hadPendingRequest = immediateExtractTimer !== null || immediateExtractRequestedAfterActive
     if (immediateExtractTimer !== null) {
       clearTimeout(immediateExtractTimer)
       immediateExtractTimer = null
     }
     immediateExtractRequestedAfterActive = false
+    return hadPendingRequest
+  }
+
+  function clearImmediateExtractTimer() {
+    takePendingImmediateExtract()
   }
 
   function clearAxRetryTimer() {

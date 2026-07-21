@@ -869,6 +869,61 @@ describe('proxy geometry freshness instrumentation', () => {
     }
   })
 
+  it('rebases a pending immediate hint after an intervening extraction completes', async () => {
+    const browser = await chromium.launch({ headless: true })
+    const page = await browser.newPage({ viewport: { width: 640, height: 480 } })
+    await page.setContent('<main><button>Rebase bridge target</button></main>')
+    const hub = startGeometryWebSocket({
+      port: 0,
+      authToken: AUTH_TOKEN,
+      page,
+      debounceMs: 25,
+    })
+    const realSetTimeout = globalThis.setTimeout.bind(globalThis)
+    const realNow = Date.now.bind(Date)
+    let fakeTimersActive = false
+
+    const waitForExtractCount = async (minimum: number) => {
+      const deadline = realNow() + 5_000
+      while (hub.getTrace().extractCount < minimum && realNow() < deadline) {
+        await new Promise(resolve => realSetTimeout(resolve, 5))
+      }
+      expect(hub.getTrace().extractCount).toBeGreaterThanOrEqual(minimum)
+    }
+
+    try {
+      // Warm the AX session and drain its one-time readiness refresh before
+      // taking control of the host scheduler clock.
+      await hub.flushExtract()
+      await new Promise(resolve => realSetTimeout(resolve, 300))
+      await hub.flushExtract()
+      const baseline = hub.getTrace().extractCount
+
+      vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout', 'performance'] })
+      fakeTimersActive = true
+      hub.scheduleExtract(true)
+      hub.scheduleExtract()
+
+      await vi.advanceTimersByTimeAsync(25)
+      await waitForExtractCount(baseline + 1)
+      const afterInterveningExtract = hub.getTrace().extractCount
+
+      // The original hint was due 250ms after the older baseline. It must be
+      // preserved, but the intervening completion moves its eligibility to
+      // 250ms after the new extraction instead of only 225ms later.
+      await vi.advanceTimersByTimeAsync(225)
+      await new Promise(resolve => realSetTimeout(resolve, 25))
+      expect(hub.getTrace().extractCount).toBe(afterInterveningExtract)
+
+      await vi.advanceTimersByTimeAsync(25)
+      await waitForExtractCount(afterInterveningExtract + 1)
+    } finally {
+      if (fakeTimersActive) vi.useRealTimers()
+      await hub.close()
+      await browser.close()
+    }
+  })
+
   it('keeps a post-completion cooldown under sustained immediate page spam', async () => {
     const browser = await chromium.launch({ headless: true })
     const page = await browser.newPage({ viewport: { width: 640, height: 480 } })
