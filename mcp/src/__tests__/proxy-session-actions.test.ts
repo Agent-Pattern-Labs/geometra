@@ -1086,7 +1086,10 @@ describe('proxy-backed MCP actions', () => {
     }
   })
 
-  it('keeps a late safe non-execution error non-ambiguous', async () => {
+  it.each([
+    'ACTION_EXPIRED',
+    'FILE_UPLOAD_PRECONDITION_FAILED',
+  ] as const)('keeps a late %s error non-ambiguous', async safeErrorCode => {
     const wss = new WebSocketServer({ port: 0 })
     let actionCount = 0
     const requestIds: string[] = []
@@ -1103,7 +1106,7 @@ describe('proxy-backed MCP actions', () => {
           }))
           return
         }
-        if (msg.type !== 'event') return
+        if (msg.type !== 'file') return
         actionCount += 1
         requestIds.push(msg.requestId!)
         if (actionCount === 1) {
@@ -1111,9 +1114,9 @@ describe('proxy-backed MCP actions', () => {
             if (ws.readyState !== ws.OPEN) return
             ws.send(JSON.stringify({
               type: 'error',
-              code: 'ACTION_EXPIRED',
+              code: safeErrorCode,
               requestId: msg.requestId,
-              message: 'action expired before execution',
+              message: 'action rejected before execution',
               ...MODERN_PROXY_METADATA,
             }))
           })
@@ -1138,12 +1141,15 @@ describe('proxy-backed MCP actions', () => {
 
     try {
       const session = await connect(`ws://127.0.0.1:${port}`)
-      const first = await sendClick(session, 23, 24, 15)
+      const first = await sendFileUpload(session, ['/tmp/resume.pdf'], {
+        fieldKey: 'ff:0.0',
+        fieldLabel: 'Resume',
+      }, 15)
       expect(first.status).toBe('timed_out')
       const lateErrorDelivered = waitForInboundWireMessage(
         session.ws,
         message => message.type === 'error' &&
-          message.code === 'ACTION_EXPIRED' &&
+          message.code === safeErrorCode &&
           message.requestId === first.requestId,
       )
       lateErrorGate.release()
@@ -1151,17 +1157,23 @@ describe('proxy-backed MCP actions', () => {
 
       let retryError: unknown
       try {
-        await sendClick(session, 23, 24, 30)
+        await sendFileUpload(session, ['/tmp/resume.pdf'], {
+          fieldKey: 'ff:0.0',
+          fieldLabel: 'Resume',
+        }, 30)
       } catch (error) {
         retryError = error
       }
       expect(retryError).toMatchObject({
-        code: 'ACTION_EXPIRED',
+        code: safeErrorCode,
         requestId: first.requestId,
         actionId: first.actionId,
       })
-      expect((retryError as Error).message).toBe('action expired before execution')
-      const fresh = await sendClick(session, 23, 24, 30)
+      expect((retryError as Error).message).toBe('action rejected before execution')
+      const fresh = await sendFileUpload(session, ['/tmp/resume.pdf'], {
+        fieldKey: 'ff:0.0',
+        fieldLabel: 'Resume',
+      }, 30)
       expect(fresh).toMatchObject({
         status: 'acknowledged',
         result: { executedFreshIntent: true },

@@ -1186,4 +1186,62 @@ describe('proxy upload file policy', () => {
       await rm(base, { recursive: true, force: true })
     }
   })
+
+  it('reports unauthorized upload inputs as proven non-execution', async () => {
+    const base = await mkdtemp(join(tmpdir(), 'geometra-file-policy-wire-'))
+    const resume = join(base, 'resume.pdf')
+    await writeFile(resume, 'resume')
+    const sent: string[] = []
+    const ws = { send: (value: string) => sent.push(value) } as unknown as WebSocket
+    const waitForPage = vi.fn(async () => ({} as Page))
+    const onViewportOrInput = vi.fn()
+    const onHandlerError = vi.fn()
+    const ledger = createActionRequestLedger()
+    const payloads = [
+      {
+        type: 'file',
+        paths: [resume],
+        fieldLabel: 'Resume',
+        requestId: 'rejected-file',
+        actionTimeoutMs: 1_000,
+      },
+      {
+        type: 'fillFields',
+        fields: [{ kind: 'file', fieldLabel: 'Resume', paths: [resume] }],
+        requestId: 'rejected-fill-fields',
+        actionTimeoutMs: 1_000,
+      },
+    ]
+
+    try {
+      for (const payload of payloads) {
+        for (let attempt = 0; attempt < 2; attempt += 1) {
+          await handleClientMessage(
+            waitForPage,
+            ws,
+            JSON.stringify(payload),
+            createFillLookupCache(),
+            async () => {},
+            onViewportOrInput,
+            onHandlerError,
+            { actionRequestLedger: ledger },
+          )
+        }
+      }
+
+      expect(sent.map(value => JSON.parse(value))).toEqual([
+        expect.objectContaining({ type: 'error', code: 'FILE_UPLOAD_PRECONDITION_FAILED', requestId: 'rejected-file' }),
+        expect.objectContaining({ type: 'error', code: 'DUPLICATE_REQUEST', requestId: 'rejected-file' }),
+        expect.objectContaining({ type: 'error', code: 'FILE_UPLOAD_PRECONDITION_FAILED', requestId: 'rejected-fill-fields' }),
+        expect.objectContaining({ type: 'error', code: 'DUPLICATE_REQUEST', requestId: 'rejected-fill-fields' }),
+      ])
+      expect(JSON.parse(sent[0]!).message).toContain('uploads are disabled')
+      expect(JSON.parse(sent[2]!).message).toContain('uploads are disabled')
+      expect(waitForPage).toHaveBeenCalledTimes(2)
+      expect(onViewportOrInput).not.toHaveBeenCalled()
+      expect(onHandlerError).not.toHaveBeenCalled()
+    } finally {
+      await rm(base, { recursive: true, force: true })
+    }
+  })
 })

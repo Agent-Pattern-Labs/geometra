@@ -606,6 +606,49 @@ describe('batch MCP result shaping', () => {
     expect(mockState.sendClick).toHaveBeenCalledOnce()
   })
 
+  it('stops on an upload precondition failure without marking the batch ambiguous', async () => {
+    const handler = getToolHandler('geometra_run_actions')
+    mockState.sendFileUpload.mockRejectedValueOnce(Object.assign(
+      new Error('file uploads are disabled; configure GEOMETRA_PROXY_FILE_ROOTS'),
+      {
+        code: 'FILE_UPLOAD_PRECONDITION_FAILED',
+        requestId: 'upload-request-1',
+        actionId: 'upload-action-1',
+      },
+    ))
+
+    const result = await handler({
+      actions: [
+        { type: 'upload_files', paths: ['/tmp/resume.pdf'], fieldLabel: 'Resume' },
+        { type: 'click', x: 40, y: 50 },
+      ],
+      stopOnError: true,
+      includeSteps: true,
+      detail: 'terse',
+    })
+
+    const payload = JSON.parse(result.content[0]!.text) as Record<string, unknown>
+    const steps = payload.steps as Array<Record<string, unknown>>
+    expect(payload).toMatchObject({
+      completed: false,
+      stepCount: 2,
+      successCount: 0,
+      errorCount: 1,
+    })
+    expect(payload).not.toHaveProperty('ambiguous')
+    expect(payload).not.toHaveProperty('ambiguousAt')
+    expect(payload).not.toHaveProperty('resumeBlocked')
+    expect(steps).toHaveLength(1)
+    expect(steps[0]).toMatchObject({
+      index: 0,
+      type: 'upload_files',
+      ok: false,
+      error: expect.stringContaining('uploads are disabled'),
+    })
+    expect(mockState.sendFileUpload).toHaveBeenCalledOnce()
+    expect(mockState.sendClick).not.toHaveBeenCalled()
+  })
+
   it('keeps fill_fields minimal output structured and does not echo long essay text', async () => {
     const longAnswer = 'A'.repeat(180)
     const handler = getToolHandler('geometra_fill_fields')

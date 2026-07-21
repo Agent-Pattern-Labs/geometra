@@ -639,6 +639,15 @@ function isMutatingClientMessage(msg: ParsedClientMessage): boolean {
 }
 
 class ActionDeadlineExpiredError extends Error {}
+class FileUploadPreconditionError extends Error {}
+
+function resolveUploadFiles(rawPaths: unknown[], allowedRoots?: string[]): string[] {
+  try {
+    return resolveExistingFiles(rawPaths, allowedRoots)
+  } catch (err) {
+    throw new FileUploadPreconditionError(err instanceof Error ? err.message : String(err))
+  }
+}
 
 function assertActionDeadline(msg: ParsedClientMessage, receivedAt: number): void {
   if (!isMutatingClientMessage(msg)) return
@@ -754,7 +763,7 @@ export async function handleClientMessage(
   const sendWireError = (
     message: string,
     requestId?: string,
-    code?: 'DUPLICATE_REQUEST' | 'REQUEST_ID_CONFLICT' | 'REQUEST_LEDGER_CAPACITY' | 'ACTION_EXPIRED' | 'ACTION_OUTCOME_AMBIGUOUS',
+    code?: 'DUPLICATE_REQUEST' | 'REQUEST_ID_CONFLICT' | 'REQUEST_LEDGER_CAPACITY' | 'ACTION_EXPIRED' | 'FILE_UPLOAD_PRECONDITION_FAILED' | 'ACTION_OUTCOME_AMBIGUOUS',
   ) => {
     ws.send(JSON.stringify({
       type: 'error',
@@ -915,7 +924,7 @@ export async function handleClientMessage(
     }
 
     if (isFileMessage(msg)) {
-      const paths = resolveExistingFiles(msg.paths, security?.allowedFileRoots)
+      const paths = resolveUploadFiles(msg.paths, security?.allowedFileRoots)
       assertActionDeadline(msg, receivedAt)
       await attachFiles(page, paths, {
         clickX: msg.x,
@@ -965,7 +974,7 @@ export async function handleClientMessage(
 
     if (isFillFieldsMessage(msg)) {
       const authorizedFields = msg.fields.map(field => field.kind === 'file'
-        ? { ...field, paths: resolveExistingFiles(field.paths, security?.allowedFileRoots) }
+        ? { ...field, paths: resolveUploadFiles(field.paths, security?.allowedFileRoots) }
         : field)
       assertActionDeadline(msg, receivedAt)
       await fillFields(page, authorizedFields, fieldLookupCache)
@@ -1073,12 +1082,16 @@ export async function handleClientMessage(
 
     sendWireError(`Unsupported client message type "${msg.type}"`, requestId)
   } catch (err) {
-    if (!(err instanceof ActionDeadlineExpiredError)) onHandlerError(err)
+    if (!(err instanceof ActionDeadlineExpiredError) && !(err instanceof FileUploadPreconditionError)) {
+      onHandlerError(err)
+    }
     sendWireError(
       err instanceof Error ? err.message : String(err),
       requestId,
       err instanceof ActionDeadlineExpiredError
         ? 'ACTION_EXPIRED'
+        : err instanceof FileUploadPreconditionError
+          ? 'FILE_UPLOAD_PRECONDITION_FAILED'
         : acceptedRequestId
           ? 'ACTION_OUTCOME_AMBIGUOUS'
           : undefined,

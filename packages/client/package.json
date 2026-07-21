@@ -1,6 +1,6 @@
 {
   "name": "@geometra/client",
-  "version": "1.65.2",
+  "version": "1.65.3",
   "description": "Thin client that receives server-computed geometry and paints via renderer",
   "license": "MIT",
   "type": "module",
@@ -33,6 +33,6 @@
     "check": "tsc --noEmit"
   },
   "dependencies": {
-    "@geometra/core": "^1.65.2"
+    "@geometra/core": "^1.65.3"
   }
 }
