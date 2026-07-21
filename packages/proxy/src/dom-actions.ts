@@ -3544,6 +3544,12 @@ async function beginFileInputCommitGuard(
           control.getAttribute('title') ??
           control.textContent ?? ''
         ).replace(/\s+/g, ' ').trim()
+        if (/^(?:box|dropbox|google drive|iCloud(?: drive)?|one ?drive)$/i.test(accessibleText)) {
+          return false
+        }
+        if (/^(?:enter|paste|type)(?: (?:the )?(?:file|document|resume|cv|cover letter|text))? manually$/i.test(accessibleText)) {
+          return false
+        }
         const action = /^(attach|upload|browse|choose|select|add)\b/i.exec(accessibleText)
         if (!action) return true
         const remainder = accessibleText.slice(action[0].length).trim()
@@ -3568,29 +3574,98 @@ async function beginFileInputCommitGuard(
       })
     }
 
+    function localFileGroupReceiptBranch(scope: Element, exactInput: HTMLInputElement): Element | null {
+      if (scope.getAttribute('role')?.trim().toLowerCase() !== 'group') return null
+      if (
+        scope instanceof HTMLFormElement ||
+        scope instanceof HTMLBodyElement ||
+        scope instanceof HTMLHtmlElement ||
+        scope.querySelectorAll('input[type="file"]').length !== 1
+      ) return null
+
+      const broadContainerSelector =
+        'main, nav, aside, article, section, header, footer, ' +
+        '[role="main"], [role="application"], [role="document"], [role="navigation"]'
+      if (scope.matches(broadContainerSelector) || scope.querySelector(broadContainerSelector)) {
+        return null
+      }
+
+      const labelledBy = scope.getAttribute('aria-labelledby')?.trim().split(/\s+/).filter(Boolean) ?? []
+      const labels = labelledBy.map(id => {
+        const label = exactInput.ownerDocument.getElementById(id)
+        return label && (scope.contains(label) || label === scope.previousElementSibling)
+          ? label
+          : null
+      }).filter((label): label is HTMLElement => label !== null)
+      if (labels.length === 0) return null
+
+      const ignoredIdentityTokens = new Set([
+        'add', 'application', 'attach', 'browse', 'button', 'candidate',
+        'choose', 'control', 'field', 'file', 'form', 'input', 'job',
+        'label', 'select', 'upload',
+      ])
+      const identityTokens = (values: Array<string | null | undefined>): Set<string> => new Set(
+        values.flatMap(value => value?.toLowerCase().match(/[a-z0-9]+/g) ?? [])
+          .filter(token => token.length >= 2 && !ignoredIdentityTokens.has(token)),
+      )
+      const groupIdentity = identityTokens(labels.flatMap(label => [label.id, label.textContent]))
+      const inputLabelledBy = exactInput.getAttribute('aria-labelledby')?.trim().split(/\s+/).filter(Boolean) ?? []
+      const inputIdentity = identityTokens([
+        exactInput.id,
+        exactInput.getAttribute('name'),
+        exactInput.getAttribute('aria-label'),
+        exactInput.getAttribute('title'),
+        ...Array.from(exactInput.labels ?? []).flatMap(label => [label.id, label.textContent]),
+        ...inputLabelledBy.flatMap(id => {
+          const label = exactInput.ownerDocument.getElementById(id)
+          return label ? [label.id, label.textContent] : []
+        }),
+      ])
+      if (!Array.from(groupIdentity).some(token => inputIdentity.has(token))) return null
+
+      let branch: Element = exactInput
+      let parent = composedParent(branch)
+      while (parent && parent !== scope) {
+        branch = parent
+        parent = composedParent(branch)
+      }
+      if (parent !== scope || branch === exactInput) return null
+      if (branch.matches(broadContainerSelector) || branch.querySelector(broadContainerSelector)) return null
+      if (branch.querySelectorAll('input[type="file"]').length !== 1) return null
+      if (labels.some(label => branch.contains(label))) return null
+      if (!explicitlyAssociatesFileInput(branch, exactInput)) return null
+      return branch
+    }
+
     const input = element instanceof HTMLInputElement && element.type === 'file' ? element : null
     const guardedAncestors = new Set<Element>()
     const receiptScopes: Array<{ element: Element; initialExactTexts: string[] }> = []
     let capturedReceiptScope = false
+    let capturedFieldGroupReceiptScope = false
     let current: Element | null = input
     while (current) {
       guardedAncestors.add(current)
-      if (
+      const associatedLocalWrapper =
         !capturedReceiptScope &&
+        input !== null &&
         current !== input &&
         !(current instanceof HTMLFormElement) &&
         !(current instanceof HTMLBodyElement) &&
         !(current instanceof HTMLHtmlElement) &&
-        input !== null &&
-        explicitlyAssociatesFileInput(current, input) &&
-        current.querySelectorAll('input[type="file"]').length === 1
-      ) {
-        const initialExactTexts = [current, ...Array.from(current.querySelectorAll('*'))]
+        current.querySelectorAll('input[type="file"]').length === 1 &&
+        explicitlyAssociatesFileInput(current, input)
+      const fieldGroupReceiptBranch = !capturedFieldGroupReceiptScope && input !== null
+        ? localFileGroupReceiptBranch(current, input)
+        : null
+      const receiptScope = associatedLocalWrapper ? current : fieldGroupReceiptBranch
+      if (receiptScope && !receiptScopes.some(entry => entry.element === receiptScope)) {
+        const initialExactTexts = [receiptScope, ...Array.from(receiptScope.querySelectorAll('*'))]
           .map(candidate => candidate.textContent?.replace(/\s+/g, ' ').trim() ?? '')
           .filter(Boolean)
-        receiptScopes.push({ element: current, initialExactTexts })
-        capturedReceiptScope = true
+        receiptScopes.push({ element: receiptScope, initialExactTexts })
       }
+      if (associatedLocalWrapper) capturedReceiptScope = true
+      if (fieldGroupReceiptBranch) capturedFieldGroupReceiptScope = true
       if (current instanceof HTMLFormElement) break
       current = composedParent(current)
     }
@@ -3709,8 +3784,9 @@ async function readReactiveFileReceipt(
     const normalize = (text: string | null | undefined): string =>
       (text ?? '').replace(/\s+/g, ' ').trim()
 
-    // The guard snapshots at most the exact input's nearest local wrapper.
-    // Never combine its evidence with controls or filenames from an ancestor.
+    // Each scope is either the exact input's nearest local wrapper or the
+    // input-bearing branch of an explicitly labelled field group. Never scan
+    // the group itself or combine evidence from sibling/ancestor controls.
     const candidate = value.receiptScopes.find(
       (entry: { element: Element; initialExactTexts: string[] }) => entry.element.isConnected,
     ) as { element: Element; initialExactTexts: string[] } | undefined
@@ -3754,9 +3830,15 @@ async function readReactiveFileReceipt(
       if (names.some(name => remainder.toLowerCase().includes(name.toLowerCase()))) return true
       return /^(?:(?:this|the|selected|uploaded|current)\s+)?(?:file|attachment|upload|document|resume|cv|cover letter)\b/i.test(remainder)
     })
-    const hasProgress = descendants.some(element =>
-      visible(element) && element.matches('[role="progressbar"], progress, [aria-busy="true"]'),
-    )
+    const hasProgress = descendants.some((element) => {
+      if (!visible(element)) return false
+      if (element.matches('[role="progressbar"], progress, [aria-busy="true"]')) return true
+      for (const attribute of ['data-state', 'data-status', 'data-upload-state', 'data-file-state']) {
+        const state = element.getAttribute(attribute)?.trim().toLowerCase()
+        if (state && /^(?:uploading|pending|processing|in[-_ ]?progress|queued)$/.test(state)) return true
+      }
+      return false
+    })
     const hasError = descendants.some((element) => {
       if (!visible(element)) return false
       const role = normalize(element.getAttribute('role')).toLowerCase()
