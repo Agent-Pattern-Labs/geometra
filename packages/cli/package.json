@@ -1,6 +1,6 @@
 {
   "name": "@geometra/cli",
-  "version": "1.65.4",
+  "version": "1.65.5",
   "description": "CLI to view any Geometra-powered site in the terminal",
   "license": "MIT",
   "type": "module",
@@ -35,9 +35,9 @@
     "check": "tsc --noEmit"
   },
   "dependencies": {
-    "@geometra/core": "^1.65.4",
-    "@geometra/renderer-terminal": "^1.65.4",
-    "textura": "^1.65.4",
+    "@geometra/core": "^1.65.5",
+    "@geometra/renderer-terminal": "^1.65.5",
+    "textura": "^1.65.5",
     "ws": "^8.21.0"
   },
   "devDependencies": {

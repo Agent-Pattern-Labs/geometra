@@ -1,6 +1,6 @@
 {
   "name": "@geometra/renderer-canvas",
-  "version": "1.65.4",
+  "version": "1.65.5",
   "description": "Canvas2D renderer for Geometra — the geometry protocol for UI",
   "license": "MIT",
   "type": "module",
@@ -34,7 +34,7 @@
     "check": "tsc --noEmit"
   },
   "dependencies": {
-    "@geometra/client": "^1.65.4",
-    "@geometra/core": "^1.65.4"
+    "@geometra/client": "^1.65.5",
+    "@geometra/core": "^1.65.5"
   }
 }

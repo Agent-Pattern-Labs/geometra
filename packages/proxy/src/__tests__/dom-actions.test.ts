@@ -1,4 +1,4 @@
-import { writeFile, rm } from 'node:fs/promises'
+import { mkdir, writeFile, rm } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { afterAll, beforeAll, describe, expect, it } from 'vitest'
@@ -2289,6 +2289,210 @@ describe('attachFiles', () => {
       })
     } finally {
       await rm(tempFile, { force: true })
+      await page.close()
+    }
+  })
+
+  it('confirms a reactive upload through a stable field-scoped filename receipt', async () => {
+    const page = await browser.newPage({ viewport: { width: 900, height: 700 } })
+    const tempFile = join(tmpdir(), `geometra-upload-receipt-${Date.now()}.txt`)
+    const fileName = tempFile.split('/').pop()!
+    await writeFile(tempFile, 'resume')
+    await page.setContent(`
+      <div id="resume-field" role="group" aria-labelledby="resume-label">
+        <div id="resume-label">Resume</div>
+        <div id="resume-wrapper">
+          <label for="resume">Attach</label>
+          <input id="resume" type="file" accept=".txt" />
+        </div>
+      </div>
+      <script>
+        const input = document.getElementById('resume')
+        const wrapper = document.getElementById('resume-wrapper')
+        input.addEventListener('change', () => {
+          const name = input.files[0].name
+          wrapper.innerHTML = '<div role="progressbar" aria-valuenow="20">Uploading</div>'
+          setTimeout(() => {
+            wrapper.innerHTML = '<p class="file-name">' + name + '</p>' +
+              '<button type="button" aria-label="Remove file">Remove</button>'
+          }, 80)
+        })
+      </script>
+    `)
+
+    try {
+      await attachFiles(page, [tempFile], {
+        fieldKey: 'id:resume',
+        strategy: 'hidden',
+      })
+      expect(await page.locator('#resume-wrapper').textContent()).toContain(fileName)
+      expect(await page.locator('#resume-wrapper [aria-label="Remove file"]').count()).toBe(1)
+    } finally {
+      await rm(tempFile, { force: true })
+      await page.close()
+    }
+  })
+
+  it('does not mistake a reactive upload error containing the filename for a receipt', async () => {
+    const page = await browser.newPage({ viewport: { width: 900, height: 700 } })
+    const tempFile = join(tmpdir(), `geometra-upload-receipt-error-${Date.now()}.txt`)
+    await writeFile(tempFile, 'resume')
+    await page.setContent(`
+      <div id="resume-field" role="group" aria-labelledby="resume-label">
+        <div id="resume-label">Resume</div>
+        <div id="resume-wrapper">
+          <input id="resume" type="file" accept=".txt" />
+        </div>
+      </div>
+      <script>
+        const input = document.getElementById('resume')
+        const wrapper = document.getElementById('resume-wrapper')
+        input.addEventListener('change', () => {
+          const name = input.files[0].name
+          wrapper.innerHTML = '<div role="alert">Could not upload ' + name + '</div>' +
+            '<button type="button">Try again</button>'
+        })
+      </script>
+    `)
+
+    try {
+      await expect(attachFiles(page, [tempFile], {
+        fieldKey: 'id:resume',
+        strategy: 'hidden',
+      })).rejects.toThrow(/upload outcome is ambiguous.*Do not retry/i)
+    } finally {
+      await rm(tempFile, { force: true })
+      await page.close()
+    }
+  })
+
+  it('does not widen receipt proof to document-level unrelated filename and control evidence', async () => {
+    const page = await browser.newPage({ viewport: { width: 900, height: 700 } })
+    const tempFile = join(tmpdir(), `geometra-upload-unrelated-receipt-${Date.now()}.txt`)
+    await writeFile(tempFile, 'resume')
+    await page.setContent(`
+      <input id="resume" type="file" accept=".txt" />
+      <section><p id="unrelated-filename"></p></section>
+      <aside><button type="button" aria-label="Remove file">Remove</button></aside>
+      <script>
+        const input = document.getElementById('resume')
+        input.addEventListener('change', () => {
+          const name = input.files[0].name
+          input.remove()
+          document.getElementById('unrelated-filename').textContent = name
+        })
+      </script>
+    `)
+
+    try {
+      await expect(attachFiles(page, [tempFile], {
+        fieldKey: 'id:resume',
+        strategy: 'hidden',
+      })).rejects.toThrow(/upload outcome is ambiguous.*Do not retry/i)
+    } finally {
+      await rm(tempFile, { force: true })
+      await page.close()
+    }
+  })
+
+  it('does not treat a broad associated app container as a field-local receipt scope', async () => {
+    const page = await browser.newPage({ viewport: { width: 900, height: 700 } })
+    const tempFile = join(tmpdir(), `geometra-upload-broad-container-${Date.now()}.txt`)
+    await writeFile(tempFile, 'resume')
+    await page.setContent(`
+      <div id="application-shell">
+        <label for="resume">Resume</label>
+        <input id="resume" type="file" accept=".txt" />
+        <section><p id="unrelated-filename"></p></section>
+        <aside><button type="button">Change preferences</button></aside>
+      </div>
+      <script>
+        const input = document.getElementById('resume')
+        input.addEventListener('change', () => {
+          const name = input.files[0].name
+          input.remove()
+          document.getElementById('unrelated-filename').textContent = name
+        })
+      </script>
+    `)
+
+    try {
+      await expect(attachFiles(page, [tempFile], {
+        fieldKey: 'id:resume',
+        strategy: 'hidden',
+      })).rejects.toThrow(/upload outcome is ambiguous.*Do not retry/i)
+    } finally {
+      await rm(tempFile, { force: true })
+      await page.close()
+    }
+  })
+
+  it('treats an upload-error receipt with an exact filename and Remove control as failed', async () => {
+    const page = await browser.newPage({ viewport: { width: 900, height: 700 } })
+    const tempFile = join(tmpdir(), `geometra-upload-class-error-${Date.now()}.txt`)
+    await writeFile(tempFile, 'resume')
+    await page.setContent(`
+      <div id="resume-wrapper">
+        <label for="resume">Attach</label>
+        <input id="resume" type="file" accept=".txt" />
+      </div>
+      <script>
+        const input = document.getElementById('resume')
+        const wrapper = document.getElementById('resume-wrapper')
+        input.addEventListener('change', () => {
+          const name = input.files[0].name
+          wrapper.innerHTML = '<p class="upload-error">' + name + '</p>' +
+            '<button type="button" aria-label="Remove file">Remove</button>'
+        })
+      </script>
+    `)
+
+    try {
+      await expect(attachFiles(page, [tempFile], {
+        fieldKey: 'id:resume',
+        strategy: 'hidden',
+      })).rejects.toThrow(/upload outcome is ambiguous.*Do not retry/i)
+    } finally {
+      await rm(tempFile, { force: true })
+      await page.close()
+    }
+  })
+
+  it('requires reactive receipts to prove duplicate basename multiplicity', async () => {
+    const page = await browser.newPage({ viewport: { width: 900, height: 700 } })
+    const tempRoot = join(tmpdir(), `geometra-upload-duplicate-receipt-${Date.now()}`)
+    const firstDir = join(tempRoot, 'first')
+    const secondDir = join(tempRoot, 'second')
+    const basename = 'resume.txt'
+    const firstFile = join(firstDir, basename)
+    const secondFile = join(secondDir, basename)
+    await mkdir(firstDir, { recursive: true })
+    await mkdir(secondDir, { recursive: true })
+    await writeFile(firstFile, 'first resume')
+    await writeFile(secondFile, 'second resume')
+    await page.setContent(`
+      <div id="resume-wrapper">
+        <label for="resume">Attach</label>
+        <input id="resume" type="file" accept=".txt" multiple />
+      </div>
+      <script>
+        const input = document.getElementById('resume')
+        const wrapper = document.getElementById('resume-wrapper')
+        input.addEventListener('change', () => {
+          const name = input.files[0].name
+          wrapper.innerHTML = '<p class="file-name">' + name + '</p>' +
+            '<button type="button" aria-label="Remove file">Remove</button>'
+        })
+      </script>
+    `)
+
+    try {
+      await expect(attachFiles(page, [firstFile, secondFile], {
+        fieldKey: 'id:resume',
+        strategy: 'hidden',
+      })).rejects.toThrow(/upload outcome is ambiguous.*Do not retry/i)
+    } finally {
+      await rm(tempRoot, { recursive: true, force: true })
       await page.close()
     }
   })

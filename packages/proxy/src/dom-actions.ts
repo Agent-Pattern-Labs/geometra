@@ -3457,6 +3457,13 @@ interface FileInputCommitGuardFinalState {
   names: string[]
 }
 
+interface ReactiveFileReceiptState {
+  hasScope: boolean
+  hasReceipt: boolean
+  hasProgress: boolean
+  hasError: boolean
+}
+
 /**
  * Playwright owns local-path transfer, so there is no practical atomic
  * in-page check+commit that works for arbitrarily large files without first
@@ -3510,11 +3517,81 @@ async function beginFileInputCommitGuard(
       return null
     }
 
+    function explicitlyAssociatesFileInput(scope: Element, exactInput: HTMLInputElement): boolean {
+      const broadContainerSelector =
+        'main, nav, aside, article, section, header, footer, ' +
+        '[role="main"], [role="application"], [role="document"], [role="navigation"]'
+      if (scope.matches(broadContainerSelector) || scope.querySelector(broadContainerSelector)) {
+        return false
+      }
+
+      const labels = Array.from(exactInput.labels ?? [])
+      const interactiveElements = Array.from(scope.querySelectorAll(
+        'input, select, textarea, button, [role="button"], a[href], [contenteditable="true"]',
+      ))
+      const hasUnrelatedControl = interactiveElements.some((control) => {
+        if (control === exactInput) return false
+        if (control instanceof HTMLLabelElement && labels.includes(control)) return false
+        const style = getComputedStyle(control)
+        const visible = style.display !== 'none' &&
+          style.visibility !== 'hidden' &&
+          style.visibility !== 'collapse' &&
+          control.getClientRects().length > 0
+        if (!visible) return false
+        if (!control.matches('button, [role="button"], a[href]')) return true
+        const accessibleText = (
+          control.getAttribute('aria-label') ??
+          control.getAttribute('title') ??
+          control.textContent ?? ''
+        ).replace(/\s+/g, ' ').trim()
+        const action = /^(attach|upload|browse|choose|select|add)\b/i.exec(accessibleText)
+        if (!action) return true
+        const remainder = accessibleText.slice(action[0].length).trim()
+        if (!remainder) return !/^(attach|upload|browse|choose)$/i.test(action[1] ?? '')
+        return !/^(?:(?:a|an|the|this|new|your)\s+)?(?:files?|attachments?|upload|documents?|resume|cv|cover letter)\b/i.test(remainder)
+      })
+      if (hasUnrelatedControl) return false
+
+      if (
+        scope instanceof HTMLLabelElement &&
+        labels.includes(scope)
+      ) return true
+      if (labels.some(label => scope.contains(label))) return true
+      if (scope instanceof HTMLFieldSetElement) return true
+
+      if (scope.getAttribute('role')?.trim().toLowerCase() !== 'group') return false
+      if (scope.getAttribute('aria-label')?.trim()) return true
+      const labelledBy = scope.getAttribute('aria-labelledby')?.trim().split(/\s+/).filter(Boolean) ?? []
+      return labelledBy.some(id => {
+        const label = exactInput.ownerDocument.getElementById(id)
+        return Boolean(label && (scope.contains(label) || label === scope.previousElementSibling))
+      })
+    }
+
     const input = element instanceof HTMLInputElement && element.type === 'file' ? element : null
     const guardedAncestors = new Set<Element>()
+    const receiptScopes: Array<{ element: Element; initialExactTexts: string[] }> = []
+    let capturedReceiptScope = false
     let current: Element | null = input
     while (current) {
       guardedAncestors.add(current)
+      if (
+        !capturedReceiptScope &&
+        current !== input &&
+        !(current instanceof HTMLFormElement) &&
+        !(current instanceof HTMLBodyElement) &&
+        !(current instanceof HTMLHtmlElement) &&
+        input !== null &&
+        explicitlyAssociatesFileInput(current, input) &&
+        current.querySelectorAll('input[type="file"]').length === 1
+      ) {
+        const initialExactTexts = [current, ...Array.from(current.querySelectorAll('*'))]
+          .map(candidate => candidate.textContent?.replace(/\s+/g, ' ').trim() ?? '')
+          .filter(Boolean)
+        receiptScopes.push({ element: current, initialExactTexts })
+        capturedReceiptScope = true
+      }
+      if (current instanceof HTMLFormElement) break
       current = composedParent(current)
     }
 
@@ -3528,6 +3605,7 @@ async function beginFileInputCommitGuard(
     const state: {
       input: HTMLInputElement | null
       initial: FileInputCommitGuardInitialState
+      receiptScopes: Array<{ element: Element; initialExactTexts: string[] }>
       invalidReason: string | null
       observer: MutationObserver
       record: (records: MutationRecord[]) => void
@@ -3535,6 +3613,7 @@ async function beginFileInputCommitGuard(
     } = {
       input,
       initial,
+      receiptScopes,
       invalidReason: null,
       observer: null as unknown as MutationObserver,
       record: () => {},
@@ -3612,6 +3691,128 @@ async function stopFileInputCommitGuard(guard: JSHandle): Promise<void> {
   await guard.evaluate(value => {
     value.observer.disconnect()
   }).catch(() => {})
+}
+
+async function readReactiveFileReceipt(
+  guard: JSHandle,
+  expectedNames: string[],
+): Promise<ReactiveFileReceiptState> {
+  return await guard.evaluate((value, names) => {
+    function visible(element: Element): boolean {
+      const style = getComputedStyle(element)
+      return style.display !== 'none' &&
+        style.visibility !== 'hidden' &&
+        style.visibility !== 'collapse' &&
+        element.getClientRects().length > 0
+    }
+
+    const normalize = (text: string | null | undefined): string =>
+      (text ?? '').replace(/\s+/g, ' ').trim()
+
+    // The guard snapshots at most the exact input's nearest local wrapper.
+    // Never combine its evidence with controls or filenames from an ancestor.
+    const candidate = value.receiptScopes.find(
+      (entry: { element: Element; initialExactTexts: string[] }) => entry.element.isConnected,
+    ) as { element: Element; initialExactTexts: string[] } | undefined
+    if (!candidate) {
+      return { hasScope: false, hasReceipt: false, hasProgress: false, hasError: false }
+    }
+    if (names.some(name => candidate.initialExactTexts.includes(name))) {
+      return { hasScope: true, hasReceipt: false, hasProgress: false, hasError: false }
+    }
+
+    const scope = candidate.element
+    const descendants = [scope, ...Array.from(scope.querySelectorAll('*'))]
+    const expectedCounts = new Map<string, number>()
+    for (const name of names) expectedCounts.set(name, (expectedCounts.get(name) ?? 0) + 1)
+    const observedCounts = new Map<string, number>()
+    for (const element of descendants) {
+      if (!visible(element)) continue
+      const text = normalize(element.textContent)
+      if (!expectedCounts.has(text)) continue
+      // Count only the innermost exact-text element so nested wrappers cannot
+      // manufacture duplicate filename evidence for one rendered receipt.
+      const nestedExactText = Array.from(element.querySelectorAll('*')).some(descendant =>
+        visible(descendant) && normalize(descendant.textContent) === text,
+      )
+      if (!nestedExactText) observedCounts.set(text, (observedCounts.get(text) ?? 0) + 1)
+    }
+    const hasExactNames = Array.from(expectedCounts).every(([name, count]) =>
+      observedCounts.get(name) === count,
+    )
+    const hasRemovalControl = descendants.some((element) => {
+      if (!visible(element) || !element.matches('button, [role="button"], a')) return false
+      const accessibleText = normalize(
+        element.getAttribute('aria-label') ??
+        element.getAttribute('title') ??
+        element.textContent,
+      )
+      const action = /^(remove|delete|clear|replace|change)\b/i.exec(accessibleText)
+      if (!action) return false
+      const remainder = accessibleText.slice(action[0].length).trim()
+      if (!remainder) return true
+      if (names.some(name => remainder.toLowerCase().includes(name.toLowerCase()))) return true
+      return /^(?:(?:this|the|selected|uploaded|current)\s+)?(?:file|attachment|upload|document|resume|cv|cover letter)\b/i.test(remainder)
+    })
+    const hasProgress = descendants.some(element =>
+      visible(element) && element.matches('[role="progressbar"], progress, [aria-busy="true"]'),
+    )
+    const hasError = descendants.some((element) => {
+      if (!visible(element)) return false
+      const role = normalize(element.getAttribute('role')).toLowerCase()
+      if (role === 'alert' || role === 'alertdialog') return true
+      if (element.getAttribute('aria-invalid')?.trim().toLowerCase() === 'true') return true
+      const dataError = element.getAttribute('data-error')
+      if (
+        dataError !== null &&
+        !/^(?:false|0|off|none)$/i.test(dataError.trim())
+      ) return true
+      for (const attribute of ['data-state', 'data-status', 'data-upload-state', 'data-file-state']) {
+        const state = element.getAttribute(attribute)?.trim().toLowerCase()
+        if (state && /^(?:error|invalid|failed|failure|rejected)$/.test(state)) return true
+      }
+      return Array.from(element.classList).some(className =>
+        /(?:^|[-_:])(?:error|errors|invalid|failed|failure)(?:$|[-_:])/i.test(className),
+      )
+    })
+
+    if (hasExactNames && hasRemovalControl && !hasProgress && !hasError) {
+      return { hasScope: true, hasReceipt: true, hasProgress: false, hasError: false }
+    }
+    return { hasScope: true, hasReceipt: false, hasProgress, hasError }
+  }, expectedNames) as ReactiveFileReceiptState
+}
+
+/**
+ * Some reactive uploaders detach the native input while streaming the file,
+ * then render a filename receipt in the same field wrapper. Treat that as
+ * success only when the exact new filenames and a removal control remain
+ * stable after progress completes. A filename in an error message is not a
+ * receipt, and an unbounded form-level match is never considered.
+ */
+async function confirmStableReactiveFileReceipt(
+  guard: JSHandle,
+  paths: string[],
+): Promise<boolean> {
+  const expectedNames = expectedUploadNames(paths)
+  const signalDeadline = Date.now() + 500
+  let completionDeadline: number | null = null
+
+  while (Date.now() < (completionDeadline ?? signalDeadline)) {
+    const state = await readReactiveFileReceipt(guard, expectedNames).catch(() => null)
+    if (!state?.hasScope || state.hasError) return false
+    if (state.hasReceipt) {
+      await delay(100)
+      const stable = await readReactiveFileReceipt(guard, expectedNames).catch(() => null)
+      return Boolean(stable?.hasReceipt && !stable.hasProgress && !stable.hasError)
+    }
+    if (state.hasProgress && completionDeadline === null) {
+      completionDeadline = Date.now() + 15_000
+    }
+    await delay(50)
+  }
+
+  return false
 }
 
 async function clearAmbiguousRetainedFiles(
@@ -3778,6 +3979,12 @@ async function commitFilesToExactInput(
         paths,
         initial,
       )
+    ) return
+
+    if (
+      !operationError &&
+      identityChanged &&
+      await confirmStableReactiveFileReceipt(guard, paths)
     ) return
 
     const cleanupOutcome = await clearAmbiguousRetainedFiles(handle, final.names, initial.names)
