@@ -2575,27 +2575,67 @@ async function readFormLevelInvalidState(
       const form = el.closest('form')
       if (!form) return false
 
-      // Find the field wrapper — the closest ancestor that "contains a label"
-      // and is still inside the form. This is the react-hook-form convention:
-      // every field lives under a wrapper that renders both the control and
-      // the error message as siblings. If we can't find one, use a bounded
-      // walk up to ~6 ancestors and look at each one's siblings.
-      let wrapper: Element | null = el
-      let depth = 0
-      while (wrapper && wrapper !== form && depth < 6) {
-        // A "field wrapper" is anything that contains a <label>, a legend,
-        // or a [class*="field"] class up to 6 ancestors deep.
-        const hasLabel =
-          wrapper.querySelector && (wrapper.querySelector('label') || wrapper.querySelector('legend'))
-        const className = (wrapper.getAttribute('class') ?? '').toLowerCase()
-        const looksLikeField =
-          className.includes('field') ||
-          className.includes('form-group') ||
-          className.includes('form-control') ||
-          className.includes('input-wrapper')
-        if (hasLabel || looksLikeField) break
-        wrapper = wrapper.parentElement
-        depth++
+      function rootScopedElementById(owner: Element, id: string): Element | null {
+        const root = owner.getRootNode()
+        if (root instanceof ShadowRoot) return root.getElementById(id)
+        if (root instanceof Document) return root.getElementById(id)
+        return null
+      }
+
+      function linkedLabels(control: Element): Element[] {
+        const labels = new Set<Element>()
+        for (const id of (control.getAttribute('aria-labelledby') ?? '').split(/\s+/).filter(Boolean)) {
+          const label = rootScopedElementById(control, id)
+          if (label) labels.add(label)
+        }
+        if (control instanceof HTMLInputElement || control instanceof HTMLSelectElement || control instanceof HTMLTextAreaElement) {
+          for (const label of Array.from(control.labels ?? [])) labels.add(label)
+        }
+        return [...labels]
+      }
+
+      function linkedFieldWrapper(control: Element): Element | null {
+        let best: { wrapper: Element; depth: number } | null = null
+        for (const label of linkedLabels(control)) {
+          let candidate: Element | null = control
+          let depth = 0
+          while (candidate && candidate !== form && depth < 12) {
+            if (candidate.contains(label) && (!best || depth < best.depth)) {
+              best = { wrapper: candidate, depth }
+              break
+            }
+            candidate = candidate.parentElement
+            depth++
+          }
+        }
+        return best?.wrapper ?? null
+      }
+
+      // Prefer an ancestor that jointly owns this exact control and its
+      // explicitly linked label. Looking for any descendant <label> can pull
+      // an unrelated required field into the verification scope.
+      let wrapper: Element | null = linkedFieldWrapper(el)
+      if (!wrapper) {
+        const semanticGroup = el.closest('fieldset, [role="group"]')
+        if (semanticGroup && semanticGroup !== form) wrapper = semanticGroup
+      }
+      if (!wrapper) {
+        let candidate: Element | null = el
+        let depth = 0
+        while (candidate && candidate !== form && depth < 8) {
+          const className = (candidate.getAttribute('class') ?? '').toLowerCase()
+          if (
+            className.includes('field') ||
+            className.includes('form-group') ||
+            className.includes('form-control') ||
+            className.includes('input-wrapper')
+          ) {
+            wrapper = candidate
+            break
+          }
+          candidate = candidate.parentElement
+          depth++
+        }
       }
       if (!wrapper || wrapper === form) wrapper = el.parentElement ?? el
 
@@ -3408,6 +3448,7 @@ interface FileInputCommitGuardInitialState {
   validFileInput: boolean
   blockReason: string | null
   accept: string | null
+  multiple: boolean
   names: string[]
 }
 
@@ -3481,6 +3522,7 @@ async function beginFileInputCommitGuard(
       validFileInput: Boolean(input?.isConnected),
       blockReason: input ? mutationBlockReason(input) : 'detached or no longer a file input',
       accept: input?.getAttribute('accept') ?? null,
+      multiple: input?.multiple ?? false,
       names: input ? Array.from(input.files ?? []).map(file => file.name) : [],
     }
     const state: {
@@ -3594,11 +3636,98 @@ async function clearAmbiguousRetainedFiles(
   return 'the changed selection was cleared best-effort without trying another candidate'
 }
 
+async function confirmSameKeyFileInputSuccessor(
+  page: Page,
+  original: ElementHandle<Element>,
+  fieldKey: string,
+  paths: string[],
+  initial: FileInputCommitGuardInitialState,
+): Promise<boolean> {
+  const expectedNames = expectedUploadNames(paths)
+  const deadline = Date.now() + 1_500
+
+  while (Date.now() < deadline) {
+    let successor: Locator | null
+    try {
+      successor = await findAuthoredFieldByKeyInPage(page, fieldKey, 'file')
+    } catch {
+      // Duplicate authored keys are terminal ambiguity, not a reason to pick
+      // one candidate or try another uploader.
+      return false
+    }
+    if (!successor) {
+      await delay(50)
+      continue
+    }
+
+    const state = await successor.evaluate((input, prior) => {
+      if (!(input instanceof HTMLInputElement) || input.type !== 'file' || !input.isConnected) return null
+      return {
+        isSuccessor: input !== prior,
+        accept: input.getAttribute('accept'),
+        multiple: input.multiple,
+        names: Array.from(input.files ?? []).map(file => file.name),
+      }
+    }, original).catch(() => null)
+    if (!state?.isSuccessor) {
+      await delay(50)
+      continue
+    }
+
+    // Only accept a stable successor whose authored contract still permits
+    // this upload and whose exact FileList proves that this upload, rather
+    // than a sibling input, survived.
+    if (state.multiple !== initial.multiple) return false
+    try {
+      assertPathsMatchFileAccept(paths, state.accept)
+    } catch {
+      return false
+    }
+    if (!uploadedNamesMatch(state.names, expectedNames)) {
+      await delay(50)
+      continue
+    }
+
+    await delay(40)
+    let confirmed: Locator | null
+    try {
+      confirmed = await findAuthoredFieldByKeyInPage(page, fieldKey, 'file')
+    } catch {
+      return false
+    }
+    if (!confirmed) return false
+    const stable = await confirmed.evaluate((input, payload) => {
+      if (
+        !(input instanceof HTMLInputElement) ||
+        input.type !== 'file' ||
+        !input.isConnected ||
+        input === payload.prior ||
+      input.getAttribute('accept') !== payload.accept ||
+        input.multiple !== payload.multiple
+      ) return false
+      const names = Array.from(input.files ?? []).map(file => file.name)
+      return names.length === payload.names.length &&
+        names.every((name, index) => name === payload.names[index])
+    }, {
+      prior: original,
+      accept: state.accept,
+      multiple: initial.multiple,
+      names: expectedNames,
+    }).catch(() => false)
+    return stable
+  }
+
+  return false
+}
+
 async function commitFilesToExactInput(
   handle: ElementHandle<Element>,
   paths: string[],
   targetName: 'matched input' | 'chooser input',
-  setFiles: (paths: string[]) => Promise<void> = async selectedPaths => handle.setInputFiles(selectedPaths),
+  opts?: {
+    setFiles?: (paths: string[]) => Promise<void>
+    successor?: { page: Page; fieldKey: string }
+  },
 ): Promise<void> {
   const { guard, initial } = await beginFileInputCommitGuard(handle)
   try {
@@ -3619,7 +3748,7 @@ async function commitFilesToExactInput(
 
     let operationError: unknown
     try {
-      await setFiles(paths)
+      await (opts?.setFiles ?? (async selectedPaths => handle.setInputFiles(selectedPaths)))(paths)
     } catch (error) {
       operationError = error
     }
@@ -3632,7 +3761,24 @@ async function commitFilesToExactInput(
       names: [] as string[],
     }))
     const retained = uploadedNamesMatch(final.names, expectedUploadNames(paths))
-    if (!operationError && !final.invalidReason && retained) return
+    const originalConnected = await handle.evaluate(input => input.isConnected).catch(() => false)
+    if (!operationError && !final.invalidReason && retained && originalConnected) return
+
+    const identityChanged = final.invalidReason === 'the exact target identity changed during commit' ||
+      final.invalidReason === 'the exact target detached during commit' ||
+      (!final.invalidReason && !originalConnected)
+    if (
+      !operationError &&
+      identityChanged &&
+      opts?.successor &&
+      await confirmSameKeyFileInputSuccessor(
+        opts.successor.page,
+        handle,
+        opts.successor.fieldKey,
+        paths,
+        initial,
+      )
+    ) return
 
     const cleanupOutcome = await clearAmbiguousRetainedFiles(handle, final.names, initial.names)
     const operationReason = operationError instanceof Error
@@ -3674,7 +3820,9 @@ async function attachHiddenInAllFrames(
     if (labeled) {
       const handle = await labeled.elementHandle()
       if (!handle) throw new Error('file: matched input detached before upload')
-      await commitFilesToExactInput(handle, paths, 'matched input')
+      await commitFilesToExactInput(handle, paths, 'matched input', {
+        successor: opts?.fieldKey ? { page, fieldKey: opts.fieldKey } : undefined,
+      })
       return true
     }
     return false
@@ -3712,8 +3860,10 @@ async function attachViaChooser(page: Page, paths: string[], clickX: number, cli
   ])
   const input = chooser.element() as ElementHandle<Element>
   try {
-    await commitFilesToExactInput(input, paths, 'chooser input', async selectedPaths => {
-      await chooser.setFiles(selectedPaths)
+    await commitFilesToExactInput(input, paths, 'chooser input', {
+      setFiles: async selectedPaths => {
+        await chooser.setFiles(selectedPaths)
+      },
     })
   } finally {
     // Playwright transfers ownership of this ElementHandle to the file-chooser

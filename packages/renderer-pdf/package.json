@@ -1,6 +1,6 @@
 {
   "name": "@geometra/renderer-pdf",
-  "version": "1.65.3",
+  "version": "1.65.4",
   "description": "PDF renderer for Geometra — consumes computed geometry and produces PDF output",
   "license": "MIT",
   "type": "module",
@@ -33,6 +33,6 @@
     "check": "tsc --noEmit"
   },
   "dependencies": {
-    "@geometra/core": "^1.65.3"
+    "@geometra/core": "^1.65.4"
   }
 }

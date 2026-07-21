@@ -150,6 +150,85 @@ describe('pickListboxOption', () => {
     await page.close()
   })
 
+  it('keeps post-commit invalid checks inside the selected field wrapper', async () => {
+    const page = await browser.newPage({ viewport: { width: 900, height: 700 } })
+    await page.setContent(`
+      <form>
+        <div id="location-field">
+          <div id="location-label">Location</div>
+          <button id="location" type="button" role="combobox" aria-labelledby="location-label" aria-haspopup="listbox">
+            <span class="select__placeholder">Choose...</span>
+          </button>
+          <div id="location-menu" role="listbox" hidden>
+            <button type="button" role="option">New York, NY</button>
+          </div>
+        </div>
+        <div id="unrelated-field">
+          <label for="unrelated-value">Unrelated required field</label>
+          <input id="unrelated-value" type="hidden" required value="" />
+          <div role="alert">Unrelated required value is missing</div>
+        </div>
+      </form>
+      <script>
+        const trigger = document.getElementById('location')
+        const menu = document.getElementById('location-menu')
+        trigger.addEventListener('click', () => { menu.hidden = false })
+        menu.querySelector('[role="option"]').addEventListener('click', event => {
+          event.stopPropagation()
+          trigger.innerHTML = '<span class="select__single-value">New York, NY</span>'
+          menu.hidden = true
+        })
+      </script>
+    `)
+
+    await pickListboxOption(page, 'New York, NY', {
+      fieldKey: 'id:location',
+      fieldLabel: 'Location',
+      exact: true,
+    })
+
+    expect(await page.locator('#location').textContent()).toContain('New York, NY')
+    expect(await page.locator('#unrelated-value').inputValue()).toBe('')
+    await page.close()
+  })
+
+  it('still rejects an empty required backing input inside the selected field wrapper', async () => {
+    const page = await browser.newPage({ viewport: { width: 900, height: 700 } })
+    await page.setContent(`
+      <form>
+        <div id="location-field">
+          <div id="location-label">Location</div>
+          <button id="location" type="button" role="combobox" aria-labelledby="location-label" aria-haspopup="listbox">
+            <span class="select__placeholder">Choose...</span>
+          </button>
+          <input id="location-backing" type="hidden" required value="" />
+          <div id="location-menu" role="listbox" hidden>
+            <button type="button" role="option">New York, NY</button>
+          </div>
+        </div>
+      </form>
+      <script>
+        const trigger = document.getElementById('location')
+        const menu = document.getElementById('location-menu')
+        trigger.addEventListener('click', () => { menu.hidden = false })
+        menu.querySelector('[role="option"]').addEventListener('click', event => {
+          event.stopPropagation()
+          trigger.innerHTML = '<span class="select__single-value">New York, NY</span>'
+          menu.hidden = true
+        })
+      </script>
+    `)
+
+    await expect(pickListboxOption(page, 'New York, NY', {
+      fieldKey: 'id:location',
+      fieldLabel: 'Location',
+      exact: true,
+    })).rejects.toThrow('selection_not_confirmed')
+
+    expect(await page.locator('#location-backing').inputValue()).toBe('')
+    await page.close()
+  })
+
   it('prefers the visible dropdown trigger over a tiny labeled input', async () => {
     const page = await browser.newPage({ viewport: { width: 900, height: 700 } })
     await page.setContent(`
@@ -2173,6 +2252,108 @@ describe('attachFiles', () => {
         clickY: blockedBox.y + blockedBox.height / 2,
       })).rejects.toThrow('chooser input is not mutable')
       expect(await page.locator('#blocked-chooser-input').evaluate((el: HTMLInputElement) => el.files?.length ?? 0)).toBe(0)
+    } finally {
+      await rm(tempFile, { force: true })
+      await page.close()
+    }
+  })
+
+  it('confirms a reactively replaced exact upload only through a stable same-key successor', async () => {
+    const page = await browser.newPage({ viewport: { width: 900, height: 700 } })
+    const tempFile = join(tmpdir(), `geometra-upload-successor-${Date.now()}.txt`)
+    await writeFile(tempFile, 'resume')
+    await page.setContent(`
+      <input id="resume" type="file" accept=".txt" />
+      <script>
+        const original = document.getElementById('resume')
+        original.addEventListener('change', () => {
+          const successor = original.cloneNode()
+          successor.setAttribute('accept', 'text/plain')
+          successor.files = original.files
+          original.replaceWith(successor)
+        })
+      </script>
+    `)
+
+    try {
+      await attachFiles(page, [tempFile], {
+        fieldKey: 'id:resume',
+        strategy: 'hidden',
+      })
+      expect(await page.locator('#resume').evaluate((input: HTMLInputElement) => ({
+        accept: input.getAttribute('accept'),
+        names: Array.from(input.files ?? []).map(file => file.name),
+      }))).toEqual({
+        accept: 'text/plain',
+        names: [tempFile.split('/').pop()],
+      })
+    } finally {
+      await rm(tempFile, { force: true })
+      await page.close()
+    }
+  })
+
+  it('fails closed for duplicate, incompatible, mismatched, or unstable upload successors', async () => {
+    const page = await browser.newPage({ viewport: { width: 900, height: 700 } })
+    const tempFile = join(tmpdir(), `geometra-upload-successor-guard-${Date.now()}.txt`)
+    await writeFile(tempFile, 'resume')
+
+    try {
+      for (const mode of ['duplicate', 'contract', 'filename', 'cleared'] as const) {
+        await page.setContent(`
+          <input id="resume" type="file" accept=".txt" />
+          <input id="alternate" type="file" />
+          <script>
+            (() => {
+            globalThis.__alternateUploadEvents = 0
+            document.getElementById('alternate').addEventListener('input', () => {
+              globalThis.__alternateUploadEvents++
+            })
+            const original = document.getElementById('resume')
+            original.addEventListener('change', () => {
+              const successor = original.cloneNode()
+              if ('${mode}' === 'contract') successor.setAttribute('accept', '.pdf')
+              if ('${mode}' === 'filename') {
+                const transfer = new DataTransfer()
+                transfer.items.add(new File(['wrong'], 'wrong.txt', { type: 'text/plain' }))
+                successor.files = transfer.files
+              } else {
+                successor.files = original.files
+              }
+              if ('${mode}' === 'duplicate') {
+                const duplicate = successor.cloneNode()
+                duplicate.files = original.files
+                original.replaceWith(successor, duplicate)
+              } else {
+                original.replaceWith(successor)
+              }
+              if ('${mode}' === 'cleared') {
+                setTimeout(() => { successor.value = '' }, 70)
+              }
+            })
+            })()
+          </script>
+        `)
+
+        let thrown: Error | null = null
+        try {
+          await attachFiles(page, [tempFile], {
+            fieldKey: 'id:resume',
+            strategy: 'hidden',
+          })
+        } catch (error) {
+          thrown = error as Error
+        }
+        const successorState = await page.locator('#resume').evaluateAll((inputs: HTMLInputElement[]) => inputs.map(input => ({
+          accept: input.getAttribute('accept'),
+          names: Array.from(input.files ?? []).map(file => file.name),
+        })))
+        expect(thrown, `${mode}: ${JSON.stringify(successorState)}`).not.toBeNull()
+        expect(thrown?.message, mode).toMatch(/upload outcome is ambiguous.*Do not retry/i)
+        expect(await page.evaluate(() => (globalThis as unknown as {
+          __alternateUploadEvents: number
+        }).__alternateUploadEvents), mode).toBe(0)
+      }
     } finally {
       await rm(tempFile, { force: true })
       await page.close()
