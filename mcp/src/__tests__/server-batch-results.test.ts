@@ -1,4 +1,5 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest'
+import { TEXT_FIELD_CORRELATED_RESPONSE_TIMEOUT_MS } from '../action-timeouts.js'
 import type { A11yNode } from '../session.js'
 
 function node(
@@ -1300,6 +1301,14 @@ describe('batch MCP result shaping', () => {
       fieldCount: 2,
       verification: { verified: 2, mismatches: [] },
     })
+    expect(mockState.sendFieldText).toHaveBeenNthCalledWith(
+      1,
+      mockState.session,
+      'Full name',
+      'Taylor Applicant',
+      { exact: undefined, fieldId: undefined, imeFriendly: undefined, typingDelayMs: undefined },
+      TEXT_FIELD_CORRELATED_RESPONSE_TIMEOUT_MS,
+    )
   })
 
   it('runs expand_section inside run_actions and returns the section detail inline', async () => {

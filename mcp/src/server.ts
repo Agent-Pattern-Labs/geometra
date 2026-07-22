@@ -2,7 +2,10 @@ import { createHash } from 'node:crypto'
 import { performance } from 'node:perf_hooks'
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js'
 import { z } from 'zod'
-import { LISTBOX_CORRELATED_RESPONSE_TIMEOUT_MS } from './action-timeouts.js'
+import {
+  LISTBOX_CORRELATED_RESPONSE_TIMEOUT_MS,
+  TEXT_FIELD_CORRELATED_RESPONSE_TIMEOUT_MS,
+} from './action-timeouts.js'
 import { formatConnectFailureMessage, isHttpUrl, normalizeConnectTarget } from './connect-utils.js'
 import { REDACTED_STATE_URL, sanitizeUrlToOrigin } from './state-privacy.js'
 import { SERVER_IMPLEMENTATION } from './version.js'
@@ -471,7 +474,12 @@ function capTimeoutMs(timeoutMs: number | undefined, capMs: number, fallbackMs: 
   return Math.max(MIN_ACTION_TIMEOUT_MS, Math.min(timeoutMs ?? fallbackMs, Math.max(MIN_ACTION_TIMEOUT_MS, Math.floor(capMs))))
 }
 
-function capFillFieldTimeout<T extends FillFieldInput | ResolvedFillFieldInput>(field: T, capMs: number, fallbackMs = 5_000): T {
+function capFillFieldTimeout<T extends FillFieldInput | ResolvedFillFieldInput>(field: T, capMs: number): T {
+  const fallbackMs = field.kind === 'text'
+    ? TEXT_FIELD_CORRELATED_RESPONSE_TIMEOUT_MS
+    : field.kind === 'file'
+      ? 8_000
+      : 5_000
   return {
     ...field,
     timeoutMs: capTimeoutMs(field.timeoutMs, capMs, fallbackMs),

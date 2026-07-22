@@ -1,6 +1,6 @@
 {
   "name": "@geometra/server",
-  "version": "1.65.7",
+  "version": "1.65.8",
   "description": "Server-side layout engine with WebSocket geometry streaming",
   "license": "MIT",
   "type": "module",
@@ -34,7 +34,7 @@
     "prepublishOnly": "npm run build"
   },
   "dependencies": {
-    "@geometra/core": "^1.65.7",
+    "@geometra/core": "^1.65.8",
     "ws": "^8.21.0"
   },
   "devDependencies": {

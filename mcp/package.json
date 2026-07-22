@@ -1,6 +1,6 @@
 {
   "name": "@geometra/mcp",
-  "version": "1.65.7",
+  "version": "1.65.8",
   "description": "MCP server for Geometra — interact with running Geometra apps via the geometry protocol, no browser needed",
   "license": "MIT",
   "type": "module",
@@ -32,7 +32,7 @@
     "ui-testing"
   ],
   "dependencies": {
-    "@geometra/proxy": "^1.65.7",
+    "@geometra/proxy": "^1.65.8",
     "@modelcontextprotocol/sdk": "^1.12.1",
     "@razroo/parallel-mcp": "^0.1.0",
     "ws": "^8.21.0",

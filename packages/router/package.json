@@ -1,6 +1,6 @@
 {
   "name": "@geometra/router",
-  "version": "1.65.7",
+  "version": "1.65.8",
   "description": "Routing primitives for Geometra",
   "license": "MIT",
   "type": "module",
@@ -34,6 +34,6 @@
     "check": "tsc --noEmit"
   },
   "dependencies": {
-    "@geometra/core": "^1.65.7"
+    "@geometra/core": "^1.65.8"
   }
 }

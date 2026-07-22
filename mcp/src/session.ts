@@ -5,6 +5,8 @@ import WebSocket from 'ws'
 import {
   LISTBOX_ACK_GRACE_MS,
   LISTBOX_CORRELATED_RESPONSE_TIMEOUT_MS,
+  TEXT_FIELD_ACK_GRACE_MS,
+  TEXT_FIELD_CORRELATED_RESPONSE_TIMEOUT_MS,
 } from './action-timeouts.js'
 import {
   resolveStealthMode,
@@ -916,6 +918,9 @@ function actionTimeoutFor(session: Session, message: Record<string, unknown>, ti
   }
   if (message.type === 'listboxPick') {
     return Math.max(MIN_PROXY_ACTION_TIMEOUT_MS, timeoutMs - LISTBOX_ACK_GRACE_MS)
+  }
+  if (message.type === 'setFieldText') {
+    return Math.max(MIN_PROXY_ACTION_TIMEOUT_MS, timeoutMs - TEXT_FIELD_ACK_GRACE_MS)
   }
   return timeoutMs
 }
@@ -3068,7 +3073,7 @@ export function sendFieldText(
   fieldLabel: string,
   value: string,
   opts?: { exact?: boolean; fieldId?: string; fieldKey?: string; typingDelayMs?: number; imeFriendly?: boolean },
-  timeoutMs?: number,
+  timeoutMs = TEXT_FIELD_CORRELATED_RESPONSE_TIMEOUT_MS,
 ): Promise<UpdateWaitResult> {
   const payload: Record<string, unknown> = {
     type: 'setFieldText',

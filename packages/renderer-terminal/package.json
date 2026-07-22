@@ -1,6 +1,6 @@
 {
   "name": "@geometra/renderer-terminal",
-  "version": "1.65.7",
+  "version": "1.65.8",
   "description": "Terminal/TUI renderer for Geometra — the geometry protocol for UI",
   "license": "MIT",
   "type": "module",
@@ -36,7 +36,7 @@
     "check": "tsc --noEmit"
   },
   "dependencies": {
-    "@geometra/core": "^1.65.7"
+    "@geometra/core": "^1.65.8"
   },
   "devDependencies": {
     "@types/node": "^22.0.0"

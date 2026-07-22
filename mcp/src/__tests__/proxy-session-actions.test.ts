@@ -20,11 +20,15 @@ import {
   sendFileUpload,
   sendFillFields,
   sendKey,
+  sendFieldText,
   sendListboxPick,
   sendNavigate,
   sendType,
 } from '../session.js'
-import { LISTBOX_CORRELATED_RESPONSE_TIMEOUT_MS } from '../action-timeouts.js'
+import {
+  LISTBOX_CORRELATED_RESPONSE_TIMEOUT_MS,
+  TEXT_FIELD_CORRELATED_RESPONSE_TIMEOUT_MS,
+} from '../action-timeouts.js'
 
 const MODERN_PROXY_METADATA = {
   protocolVersion: 2,
@@ -250,6 +254,111 @@ describe('proxy-backed MCP actions', () => {
       expect(retry).toEqual(first)
       expect(listboxMessages).toHaveLength(1)
       expect(listboxMessages[0]).toMatchObject({ actionTimeoutMs: 50 })
+    } finally {
+      disconnect()
+      await new Promise<void>((resolve, reject) => wss.close(err => (err ? reject(err) : resolve())))
+    }
+  })
+
+  it('keeps the default text-field listener alive past 5s with ACK grace', async () => {
+    const wss = new WebSocketServer({ port: 0 })
+    let textMessage: Record<string, unknown> | undefined
+    wss.on('connection', ws => {
+      ws.on('message', raw => {
+        const msg = JSON.parse(String(raw)) as { type?: string; requestId?: string }
+        if (msg.type === 'resize') {
+          ws.send(JSON.stringify({
+            type: 'frame',
+            layout: { x: 0, y: 0, width: 1024, height: 768, children: [] },
+            tree: { kind: 'box', props: {}, semantic: { tag: 'body', role: 'group' }, children: [] },
+            ...MODERN_PROXY_METADATA,
+          }))
+          return
+        }
+        if (msg.type !== 'setFieldText') return
+        textMessage = msg as Record<string, unknown>
+        setTimeout(() => {
+          if (ws.readyState !== ws.OPEN) return
+          ws.send(JSON.stringify({
+            type: 'ack',
+            requestId: msg.requestId,
+            result: { committed: true },
+            ...MODERN_PROXY_METADATA,
+          }))
+        }, 5_100)
+      })
+    })
+    const port = await new Promise<number>((resolve, reject) => {
+      wss.once('listening', () => {
+        const address = wss.address()
+        if (typeof address === 'object' && address) resolve(address.port)
+        else reject(new Error('Failed to resolve ephemeral WebSocket port'))
+      })
+      wss.once('error', reject)
+    })
+
+    try {
+      const session = await connect(`ws://127.0.0.1:${port}`)
+      await expect(sendFieldText(session, 'Phone', '+1 929 608 1737', {
+        fieldId: 'phone-field',
+        imeFriendly: true,
+      })).resolves.toMatchObject({
+        status: 'acknowledged',
+        timeoutMs: TEXT_FIELD_CORRELATED_RESPONSE_TIMEOUT_MS,
+        result: { committed: true },
+      })
+      expect(textMessage).toMatchObject({
+        type: 'setFieldText',
+        actionTimeoutMs: 12_000,
+      })
+    } finally {
+      disconnect()
+      await new Promise<void>((resolve, reject) => wss.close(err => (err ? reject(err) : resolve())))
+    }
+  })
+
+  it('keeps a truly timed-out text-field mutation non-replayable', async () => {
+    const wss = new WebSocketServer({ port: 0 })
+    const textMessages: Array<Record<string, unknown>> = []
+    wss.on('connection', ws => {
+      ws.on('message', raw => {
+        const msg = JSON.parse(String(raw)) as { type?: string; requestId?: string }
+        if (msg.type === 'resize') {
+          ws.send(JSON.stringify({
+            type: 'frame',
+            layout: { x: 0, y: 0, width: 1024, height: 768, children: [] },
+            tree: { kind: 'box', props: {}, semantic: { tag: 'body', role: 'group' }, children: [] },
+            ...MODERN_PROXY_METADATA,
+          }))
+          return
+        }
+        if (msg.type === 'setFieldText') textMessages.push(msg as Record<string, unknown>)
+      })
+    })
+    const port = await new Promise<number>((resolve, reject) => {
+      wss.once('listening', () => {
+        const address = wss.address()
+        if (typeof address === 'object' && address) resolve(address.port)
+        else reject(new Error('Failed to resolve ephemeral WebSocket port'))
+      })
+      wss.once('error', reject)
+    })
+
+    try {
+      const session = await connect(`ws://127.0.0.1:${port}`)
+      const options = { fieldId: 'phone-field', imeFriendly: true }
+      const first = await sendFieldText(session, 'Phone', '+1 929 608 1737', options, 80)
+      expect(first).toMatchObject({
+        status: 'timed_out',
+        timeoutMs: 80,
+        requestId: expect.stringMatching(UUID_PATTERN),
+        actionId: expect.stringMatching(UUID_PATTERN),
+      })
+
+      const retry = await sendFieldText(session, 'Phone', '+1 929 608 1737', options)
+      expect(retry).toEqual(first)
+      expect(textMessages).toHaveLength(1)
+      expect(textMessages[0]).toMatchObject({ actionTimeoutMs: 50 })
     } finally {
       disconnect()
       await new Promise<void>((resolve, reject) => wss.close(err => (err ? reject(err) : resolve())))
