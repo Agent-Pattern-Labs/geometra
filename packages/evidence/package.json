@@ -1,6 +1,6 @@
 {
   "name": "@geometra/evidence",
-  "version": "1.65.6",
+  "version": "1.65.7",
   "description": "Portable evidence packets for Geometra agent-native UI replay",
   "license": "MIT",
   "type": "module",
@@ -35,7 +35,7 @@
     "check": "tsc --noEmit"
   },
   "dependencies": {
-    "@geometra/core": "^1.65.6"
+    "@geometra/core": "^1.65.7"
   },
   "devDependencies": {
     "@types/node": "^22.0.0"

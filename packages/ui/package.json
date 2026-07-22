@@ -1,6 +1,6 @@
 {
   "name": "@geometra/ui",
-  "version": "1.65.6",
+  "version": "1.65.7",
   "description": "Starter UI primitives built on @geometra/core",
   "license": "MIT",
   "type": "module",
@@ -27,6 +27,6 @@
     "check": "tsc --noEmit"
   },
   "dependencies": {
-    "@geometra/core": "^1.65.6"
+    "@geometra/core": "^1.65.7"
   }
 }

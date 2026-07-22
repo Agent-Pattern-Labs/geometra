@@ -61,7 +61,7 @@ const mockState = vi.hoisted(() => ({
     timeoutMs: 6000,
     result: undefined as unknown,
   })),
-  sendListboxPick: vi.fn(async () => ({ status: 'updated' as const, timeoutMs: 4500 })),
+  sendListboxPick: vi.fn(async () => ({ status: 'updated' as const, timeoutMs: 15_000 })),
   sendSelectOption: vi.fn(async () => ({ status: 'updated' as const, timeoutMs: 2000 })),
   sendSetChecked: vi.fn(async () => ({ status: 'updated' as const, timeoutMs: 2000 })),
   sendWheel: vi.fn(async () => ({ status: 'updated' as const, timeoutMs: 2000 })),
@@ -531,7 +531,7 @@ describe('ATS integration patterns', () => {
         expect.objectContaining({
           fieldLabel: 'How did you hear about us?',
         }),
-        undefined,
+        15_000,
       )
     })
 

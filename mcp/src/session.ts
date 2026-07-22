@@ -3,6 +3,10 @@ import { createHash, randomUUID } from 'node:crypto'
 import { performance } from 'node:perf_hooks'
 import WebSocket from 'ws'
 import {
+  LISTBOX_ACK_GRACE_MS,
+  LISTBOX_CORRELATED_RESPONSE_TIMEOUT_MS,
+} from './action-timeouts.js'
+import {
   resolveStealthMode,
   spawnGeometraProxy,
   startEmbeddedGeometraProxy,
@@ -669,7 +673,8 @@ let idleProxyTimer: ReturnType<typeof setInterval> | null = null
 const trackedReusableProxyChildren = new WeakSet<ChildProcess>()
 const embeddedProxyClosePromises = new WeakMap<EmbeddedProxyRuntime, Promise<void>>()
 const ACTION_UPDATE_TIMEOUT_MS = 2000
-const LISTBOX_UPDATE_TIMEOUT_MS = 4500
+const MIN_PROXY_ACTION_TIMEOUT_MS = 50
+const FIELD_CHOICE_UPDATE_TIMEOUT_MS = 4500
 const FILL_BATCH_BASE_TIMEOUT_MS = 2500
 const FILL_BATCH_TEXT_FIELD_TIMEOUT_MS = 275
 const FILL_BATCH_TEXT_LENGTH_TIMEOUT_MS = 120
@@ -908,6 +913,9 @@ function actionTimeoutFor(session: Session, message: Record<string, unknown>, ti
     !isMutatingProxyAction(message)
   ) {
     return undefined
+  }
+  if (message.type === 'listboxPick') {
+    return Math.max(MIN_PROXY_ACTION_TIMEOUT_MS, timeoutMs - LISTBOX_ACK_GRACE_MS)
   }
   return timeoutMs
 }
@@ -3081,7 +3089,7 @@ export function sendFieldChoice(
   fieldLabel: string,
   value: string,
   opts?: { exact?: boolean; query?: string; choiceType?: FormSchemaChoiceType; fieldId?: string; fieldKey?: string; optionIndex?: number },
-  timeoutMs = LISTBOX_UPDATE_TIMEOUT_MS,
+  timeoutMs = FIELD_CHOICE_UPDATE_TIMEOUT_MS,
 ): Promise<UpdateWaitResult> {
   const payload: Record<string, unknown> = {
     type: 'setFieldChoice',
@@ -3134,7 +3142,7 @@ export function sendListboxPick(
   session: Session,
   label: string,
   opts?: { exact?: boolean; fieldLabel?: string; query?: string; fieldId?: string; fieldKey?: string },
-  timeoutMs = LISTBOX_UPDATE_TIMEOUT_MS,
+  timeoutMs = LISTBOX_CORRELATED_RESPONSE_TIMEOUT_MS,
 ): Promise<UpdateWaitResult> {
   const payload: Record<string, unknown> = { type: 'listboxPick', label }
   if (opts?.exact !== undefined) payload.exact = opts.exact

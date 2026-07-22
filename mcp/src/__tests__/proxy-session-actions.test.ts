@@ -24,6 +24,7 @@ import {
   sendNavigate,
   sendType,
 } from '../session.js'
+import { LISTBOX_CORRELATED_RESPONSE_TIMEOUT_MS } from '../action-timeouts.js'
 
 const MODERN_PROXY_METADATA = {
   protocolVersion: 2,
@@ -144,6 +145,111 @@ describe('proxy-backed MCP actions', () => {
           exact: true,
         }),
       ).rejects.toThrow('listboxPick: no visible option matching "Japan"')
+    } finally {
+      disconnect()
+      await new Promise<void>((resolve, reject) => wss.close(err => (err ? reject(err) : resolve())))
+    }
+  })
+
+  it('keeps the default listbox listener alive past 4.5s with ACK grace', async () => {
+    const wss = new WebSocketServer({ port: 0 })
+    let listboxMessage: Record<string, unknown> | undefined
+    wss.on('connection', ws => {
+      ws.on('message', raw => {
+        const msg = JSON.parse(String(raw)) as { type?: string; requestId?: string }
+        if (msg.type === 'resize') {
+          ws.send(JSON.stringify({
+            type: 'frame',
+            layout: { x: 0, y: 0, width: 1024, height: 768, children: [] },
+            tree: { kind: 'box', props: {}, semantic: { tag: 'body', role: 'group' }, children: [] },
+            ...MODERN_PROXY_METADATA,
+          }))
+          return
+        }
+        if (msg.type !== 'listboxPick') return
+        listboxMessage = msg as Record<string, unknown>
+        setTimeout(() => {
+          if (ws.readyState !== ws.OPEN) return
+          ws.send(JSON.stringify({
+            type: 'ack',
+            requestId: msg.requestId,
+            result: { committed: true },
+            ...MODERN_PROXY_METADATA,
+          }))
+        }, 4_600)
+      })
+    })
+    const port = await new Promise<number>((resolve, reject) => {
+      wss.once('listening', () => {
+        const address = wss.address()
+        if (typeof address === 'object' && address) resolve(address.port)
+        else reject(new Error('Failed to resolve ephemeral WebSocket port'))
+      })
+      wss.once('error', reject)
+    })
+
+    try {
+      const session = await connect(`ws://127.0.0.1:${port}`)
+      await expect(sendListboxPick(session, 'United States', {
+        fieldLabel: 'Country',
+        exact: true,
+      })).resolves.toMatchObject({
+        status: 'acknowledged',
+        timeoutMs: LISTBOX_CORRELATED_RESPONSE_TIMEOUT_MS,
+        result: { committed: true },
+      })
+      expect(listboxMessage).toMatchObject({
+        type: 'listboxPick',
+        actionTimeoutMs: 12_000,
+      })
+    } finally {
+      disconnect()
+      await new Promise<void>((resolve, reject) => wss.close(err => (err ? reject(err) : resolve())))
+    }
+  })
+
+  it('keeps a truly timed-out listbox mutation non-replayable', async () => {
+    const wss = new WebSocketServer({ port: 0 })
+    const listboxMessages: Array<Record<string, unknown>> = []
+    wss.on('connection', ws => {
+      ws.on('message', raw => {
+        const msg = JSON.parse(String(raw)) as { type?: string; requestId?: string }
+        if (msg.type === 'resize') {
+          ws.send(JSON.stringify({
+            type: 'frame',
+            layout: { x: 0, y: 0, width: 1024, height: 768, children: [] },
+            tree: { kind: 'box', props: {}, semantic: { tag: 'body', role: 'group' }, children: [] },
+            ...MODERN_PROXY_METADATA,
+          }))
+          return
+        }
+        if (msg.type === 'listboxPick') listboxMessages.push(msg as Record<string, unknown>)
+      })
+    })
+    const port = await new Promise<number>((resolve, reject) => {
+      wss.once('listening', () => {
+        const address = wss.address()
+        if (typeof address === 'object' && address) resolve(address.port)
+        else reject(new Error('Failed to resolve ephemeral WebSocket port'))
+      })
+      wss.once('error', reject)
+    })
+
+    try {
+      const session = await connect(`ws://127.0.0.1:${port}`)
+      const options = { fieldLabel: 'Country', exact: true }
+      const first = await sendListboxPick(session, 'United States', options, 80)
+      expect(first).toMatchObject({
+        status: 'timed_out',
+        timeoutMs: 80,
+        requestId: expect.stringMatching(UUID_PATTERN),
+        actionId: expect.stringMatching(UUID_PATTERN),
+      })
+
+      const retry = await sendListboxPick(session, 'United States', options)
+      expect(retry).toEqual(first)
+      expect(listboxMessages).toHaveLength(1)
+      expect(listboxMessages[0]).toMatchObject({ actionTimeoutMs: 50 })
     } finally {
       disconnect()
       await new Promise<void>((resolve, reject) => wss.close(err => (err ? reject(err) : resolve())))

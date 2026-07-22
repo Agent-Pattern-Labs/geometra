@@ -2,6 +2,7 @@ import { createHash } from 'node:crypto'
 import { performance } from 'node:perf_hooks'
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js'
 import { z } from 'zod'
+import { LISTBOX_CORRELATED_RESPONSE_TIMEOUT_MS } from './action-timeouts.js'
 import { formatConnectFailureMessage, isHttpUrl, normalizeConnectTarget } from './connect-utils.js'
 import { REDACTED_STATE_URL, sanitizeUrlToOrigin } from './state-privacy.js'
 import { SERVER_IMPLEMENTATION } from './version.js'
@@ -495,7 +496,7 @@ function capBatchActionTimeouts(action: BatchAction, capMs: number): BatchAction
     case 'upload_files':
       return { ...action, timeoutMs: capTimeoutMs(action.timeoutMs, capMs, 8_000) }
     case 'pick_listbox_option':
-      return { ...action, timeoutMs: capTimeoutMs(action.timeoutMs, capMs, 4_500) }
+      return { ...action, timeoutMs: capTimeoutMs(action.timeoutMs, capMs, LISTBOX_CORRELATED_RESPONSE_TIMEOUT_MS) }
     case 'wait_for':
       return { ...action, timeoutMs: capTimeoutMs(action.timeoutMs, capMs, 10_000) }
     case 'fill_fields':
@@ -3385,7 +3386,7 @@ fieldLabel is required so Geometra can confirm which control committed the selec
           fieldKey,
           fieldLabel,
           query,
-        }, timeoutMs)
+        }, timeoutMs ?? LISTBOX_CORRELATED_RESPONSE_TIMEOUT_MS)
         const summary = postActionSummary(session, before, wait, detail)
         const fieldSummary = fieldLabel ? summarizeFieldLabelState(session, fieldLabel, fieldKey) : undefined
         const summaryText = [

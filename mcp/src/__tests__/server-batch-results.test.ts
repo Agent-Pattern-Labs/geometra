@@ -65,7 +65,7 @@ const mockState = vi.hoisted(() => ({
     timeoutMs: 6000,
     result: undefined as unknown,
   })),
-  sendListboxPick: vi.fn(async () => ({ status: 'updated' as const, timeoutMs: 4500 })),
+  sendListboxPick: vi.fn(async () => ({ status: 'updated' as const, timeoutMs: 15_000 })),
   sendSelectOption: vi.fn(async () => ({ status: 'updated' as const, timeoutMs: 2000 })),
   sendSetChecked: vi.fn(async () => ({ status: 'updated' as const, timeoutMs: 2000 })),
   sendWheel: vi.fn(async () => ({ status: 'updated' as const, timeoutMs: 2000 })),
@@ -99,7 +99,7 @@ function resetMockActionBehaviors() {
   mockState.sendFieldText.mockReset().mockResolvedValue({ status: 'updated', timeoutMs: 2000 })
   mockState.sendFieldChoice.mockReset().mockResolvedValue({ status: 'updated', timeoutMs: 2000 })
   mockState.sendFillFields.mockReset().mockResolvedValue({ status: 'updated', timeoutMs: 6000, result: undefined })
-  mockState.sendListboxPick.mockReset().mockResolvedValue({ status: 'updated', timeoutMs: 4500 })
+  mockState.sendListboxPick.mockReset().mockResolvedValue({ status: 'updated', timeoutMs: 15_000 })
   mockState.sendSelectOption.mockReset().mockResolvedValue({ status: 'updated', timeoutMs: 2000 })
   mockState.sendSetChecked.mockReset().mockResolvedValue({ status: 'updated', timeoutMs: 2000 })
   mockState.sendWheel.mockReset().mockResolvedValue({ status: 'updated', timeoutMs: 2000 })
@@ -433,7 +433,7 @@ describe('batch MCP result shaping', () => {
         fieldLabel: 'Office',
         query: 'New',
       },
-      undefined,
+      15_000,
     )
   })
 
@@ -508,7 +508,7 @@ describe('batch MCP result shaping', () => {
         fieldLabel: 'Office',
         query: undefined,
       },
-      4500,
+      15_000,
     )
     expect(mockState.sendSetChecked).toHaveBeenCalledWith(
       mockState.session,
